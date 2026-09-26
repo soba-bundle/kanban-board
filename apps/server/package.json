@@ -10,6 +10,8 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@fastify/websocket": "^11.3.1",
     "@kanban-board/shared": "*",
     "better-sqlite3": "^11.9.1",
     "cross-spawn": "^7.0.6",

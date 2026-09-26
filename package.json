@@ -9,6 +9,7 @@
   "scripts": {
     "build": "npm run build --workspace @kanban-board/shared && npm run build --workspace @kanban-board/server && npm run build --workspace @kanban-board/web",
     "typecheck": "npm run typecheck --workspace @kanban-board/shared && npm run typecheck --workspace @kanban-board/server && npm run typecheck --workspace @kanban-board/web",
-    "test": "npm run build && npm test --workspace @kanban-board/shared && npm test --workspace @kanban-board/server"
+    "test": "npm run build && npm test --workspace @kanban-board/shared && npm test --workspace @kanban-board/server",
+    "smoke:pi": "npm run build --workspace @kanban-board/shared && npm run build --workspace @kanban-board/server && node apps/server/smoke/pi-integration.mjs"
   }
 }

@@ -1,4 +1,6 @@
 import { z } from "zod";
+export { LiveEventSchema } from "./live-events.js";
+export type { LiveEvent } from "./live-events.js";
 
 export const WorkflowStateSchema = z.enum([
   "TODO",

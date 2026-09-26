@@ -1,4 +1,7 @@
 /spikes/
+__MACOSX/
+.DS_Store
+**/._*
 **/data/
 **/dist/
 **/node_modules/

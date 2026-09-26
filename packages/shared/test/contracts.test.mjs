@@ -21,6 +21,8 @@ test("project schema validates required project fields", () => {
     id: "p1",
     name: "Demo",
     root_path: "C:/repos/demo",
+    ide_command: null,
+    worktree_root: null,
     created_at: timestamp,
     updated_at: timestamp,
   };

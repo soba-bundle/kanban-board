@@ -3,6 +3,7 @@ import lockfile from "proper-lockfile";
 import { dirname, resolve } from "node:path";
 import { openDatabase } from "./db.js";
 import { installLocalRequestGuards } from "./security.js";
+import { registerProjectRoutes } from "./projects.js";
 
 const databasePath = process.env.KANBAN_DB_PATH ?? "data/kanban.sqlite";
 const db = openDatabase(databasePath);
@@ -15,6 +16,7 @@ const releaseLock = await lockfile.lock(resolve(dirname(databasePath)), {
 });
 const app = Fastify();
 installLocalRequestGuards(app, Number(process.env.PORT ?? 3000));
+registerProjectRoutes(app, db);
 
 app.get("/health", async () => {
   db.prepare("SELECT 1").get();

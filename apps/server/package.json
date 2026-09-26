@@ -6,16 +6,19 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "@kanban-board/shared": "*",
     "better-sqlite3": "^11.9.1",
+    "cross-spawn": "^7.0.6",
     "fastify": "^5.2.1",
     "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.13.10",
     "@types/proper-lockfile": "^4.1.4",
     "typescript": "^5.8.3"

@@ -44,9 +44,19 @@ export const ProjectSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   root_path: z.string().min(1),
+  ide_command: z.string().nullable(),
+  worktree_root: z.string().nullable(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
 });
+export const CreateProjectSchema = z.object({
+  name: z.string().trim().min(1),
+  root_path: z.string().trim().min(1),
+  ide_command: z.string().trim().min(1).optional(),
+  worktree_root: z.string().trim().min(1).optional(),
+});
+export const UpdateProjectSchema = CreateProjectSchema;
+export const ValidateGitRootSchema = z.object({ root_path: z.string().trim().min(1) });
 export type Project = z.infer<typeof ProjectSchema>;
 
 export const TaskSchema = z.object({

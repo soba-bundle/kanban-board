@@ -148,5 +148,16 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const projectSettingsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 2").get();
+  if (!projectSettingsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE projects ADD COLUMN ide_command TEXT;
+        ALTER TABLE projects ADD COLUMN worktree_root TEXT;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

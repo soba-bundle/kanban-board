@@ -7,7 +7,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "build": "npm run build --workspace @kanban-board/shared && npm run build --workspace @kanban-board/server && npm run build --workspace @kanban-board/web",
+    "typecheck": "npm run typecheck --workspace @kanban-board/shared && npm run typecheck --workspace @kanban-board/server && npm run typecheck --workspace @kanban-board/web",
+    "test": "npm run build && npm test --workspace @kanban-board/shared && npm test --workspace @kanban-board/server"
   }
 }

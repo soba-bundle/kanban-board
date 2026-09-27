@@ -41,11 +41,15 @@ function makeFixture(sessionDir) {
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Task', '', 'IN_PROGRESS', ?, ?)`).run(now, now);
   for (const id of ["run-1", "run-2", "run-3"]) {
-    db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
-      VALUES (?, 'task-1', 'INVESTIGATION', ?, 'QUEUED')`).run(id, id === "run-1" ? 1 : 2);
+    // Pre-seeded handover: this fixture exercises session reuse, not handover enforcement.
+    db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, handover_json)
+      VALUES (?, 'task-1', 'INVESTIGATION', ?, 'QUEUED', '{"stage":"INVESTIGATION"}')`)
+      .run(id, id === "run-1" ? 1 : 2);
   }
   const createdSessions = [];
-  const createAgentManager = () => new AgentManager(db, sessionDir, async (_cwd, manager) => {
+  const customToolsSeen = [];
+  const createAgentManager = () => new AgentManager(db, sessionDir, async (_cwd, manager, customTools) => {
+    customToolsSeen.push(customTools);
     const sessionFile = manager.getSessionFile();
     if (sessionFile && !existsSync(sessionFile)) {
       manager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
@@ -59,7 +63,7 @@ function makeFixture(sessionDir) {
     return session;
   });
   const agents = createAgentManager();
-  return { db, agents, createAgentManager, createdSessions };
+  return { db, agents, createAgentManager, createdSessions, customToolsSeen };
 }
 
 async function waitFor(check) {
@@ -72,17 +76,18 @@ async function waitFor(check) {
 
 test("successive runs reuse the persisted task session", async (t) => {
   const sessionDir = mkdtempSync(join(tmpdir(), "kanban-agent-test-"));
-  const { db, agents, createAgentManager, createdSessions } = makeFixture(sessionDir);
+  const { db, agents, createAgentManager, createdSessions, customToolsSeen } = makeFixture(sessionDir);
   t.after(() => { agents.dispose("task-1"); db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
   const runs = new RunManager(db, agents);
 
-  await runs.start("run-1", "investigate");
+  await runs.start("run-1", { text: "investigate", commentIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-1'").get().status === "COMPLETED");
-  await runs.start("run-2", "implement");
+  await runs.start("run-2", { text: "implement", commentIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-2'").get().status === "COMPLETED");
 
   assert.equal(createdSessions.length, 1);
   assert.deepEqual(createdSessions[0].prompts, ["investigate", "implement"]);
+  assert.deepEqual(customToolsSeen.map((tools) => tools.map((tool) => tool.name)), [["submit_handover"]]);
   const sessionId = createdSessions[0].sessionId;
   assert.ok(createdSessions[0].sessionFile);
   assert.ok(existsSync(createdSessions[0].sessionFile));
@@ -91,12 +96,15 @@ test("successive runs reuse the persisted task session", async (t) => {
 
   agents.dispose("task-1");
   const restoredAgents = createAgentManager();
-  await new RunManager(db, restoredAgents).start("run-3", "continue");
+  await new RunManager(db, restoredAgents).start("run-3", { text: "continue", commentIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-3'").get().status !== "RUNNING");
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = 'run-3'").get().status, "COMPLETED", db.prepare("SELECT error_message FROM task_runs WHERE id = 'run-3'").get().error_message);
   assert.equal(createdSessions.length, 2);
   assert.equal(createdSessions[1].sessionId, sessionId);
   assert.deepEqual(createdSessions[1].prompts, ["continue"]);
+  // submit_handover is re-registered on restored sessions too.
+  assert.deepEqual(customToolsSeen.map((tools) => tools.map((tool) => tool.name)),
+    [["submit_handover"], ["submit_handover"]]);
   restoredAgents.dispose("task-1");
 });
 
@@ -127,4 +135,7 @@ test("run WebSocket receives normalized live events from its task session", asyn
   assert.equal(event.type, "message_update");
   assert.match(event.data.delta, /^Investigate this task/);
   socket.terminate();
+  // This run never submits a handover, so let the retry/failure path settle before teardown.
+  await waitFor(() => !["QUEUED", "RUNNING"].includes(
+    db.prepare("SELECT status FROM task_runs WHERE id = ?").get(runId).status));
 });

@@ -9,6 +9,7 @@ import { ProfileMenu } from "./components/ProfileMenu.js";
 import { QueuePanel } from "./components/QueuePanel.js";
 import { StartTaskDialog } from "./components/StartTaskDialog.js";
 import { TaskBoard } from "./components/TaskBoard.js";
+import { TicketPanel } from "./components/TicketPanel.js";
 import { useToast } from "./components/ToastContext.js";
 import { deleteProject, deleteTask, loadBoard, loadProjects, loadQueue, removeQueueJob, reorderQueueJob, stopRun } from "./board-api.js";
 import "./app.css";
@@ -19,6 +20,7 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState("all");
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [openTask, setOpenTask] = useState<Task | null>(null);
   const [creatingTask, setCreatingTask] = useState(false);
   const [addingProject, setAddingProject] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<
@@ -107,9 +109,20 @@ export function App() {
             onRemove={(job) => setDeleteTarget({ kind: "cancel", job })}
             onStop={(job) => setDeleteTarget({ kind: "cancel", job })}
           />
-          {board && <TaskBoard board={board} queue={queue} projects={projects} projectId={selectedProject} onStartTask={setSelectedTask} onCreateTask={() => projects.length === 0 ? setAddingProject(true) : setCreatingTask(true)} onDeleteTask={(task) => setDeleteTarget({ kind: "task", item: task })} onCancelTask={(_task, job) => setDeleteTarget({ kind: "cancel", job })} />}
+          {board && <TaskBoard board={board} queue={queue} projects={projects} projectId={selectedProject} onStartTask={setSelectedTask} onOpenTask={setOpenTask} onCreateTask={() => projects.length === 0 ? setAddingProject(true) : setCreatingTask(true)} onDeleteTask={(task) => setDeleteTarget({ kind: "task", item: task })} onCancelTask={(_task, job) => setDeleteTarget({ kind: "cancel", job })} />}
         </div>
       </main>
+      {openTask && (() => {
+        const current = Object.values(board?.columns ?? {}).flat().find((task) => task.id === openTask.id) ?? openTask;
+        return (
+          <TicketPanel
+            task={current}
+            queue={queue}
+            onClose={() => setOpenTask(null)}
+            onChanged={() => void refreshData()}
+          />
+        );
+      })()}
       {selectedTask && (
         <StartTaskDialog
           task={selectedTask}

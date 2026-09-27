@@ -19,6 +19,7 @@ interface TaskBoardProps {
   projects: Project[];
   projectId: string;
   onStartTask: (task: Task) => void;
+  onOpenTask: (task: Task) => void;
   onCreateTask: () => void;
   onDeleteTask: (task: Task) => void;
   onCancelTask: (task: Task, job: QueueItem) => void;
@@ -32,7 +33,7 @@ function agentFor(task: Task, queue: QueueSnapshot | null): string | null {
   return null;
 }
 
-export function TaskBoard({ board, queue, projects, projectId, onStartTask, onCreateTask, onDeleteTask, onCancelTask }: TaskBoardProps) {
+export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOpenTask, onCreateTask, onDeleteTask, onCancelTask }: TaskBoardProps) {
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
   const projectColors = new Map(projects.map((project, index) => [project.id, index]));
 
@@ -59,7 +60,15 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onCr
                   const agent = agentFor(task, queue);
                   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
                   return (
-                    <article className="task-card" key={task.id}>
+                    <article
+                      className="task-card task-card-clickable"
+                      key={task.id}
+                      role="button"
+                      tabIndex={0}
+                      title="Open ticket"
+                      onClick={() => onOpenTask(task)}
+                      onKeyDown={(event) => { if (event.key === "Enter") onOpenTask(task); }}
+                    >
                       <div className="task-card-topline">
                         <div className="task-project-heading">
                           <ProjectMark name={projectNames.get(task.project_id) ?? "Project"} colorIndex={projectColors.get(task.project_id) ?? 0} />
@@ -77,7 +86,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onCr
                             {activeJob && <span className="pulse-dot pulse-dot-animate" aria-label="Working" title="Agent is working" />}
                           </span>
                         ) : <span className="task-updated">Updated {new Date(task.updated_at).toLocaleDateString()}</span>}
-                        <div className="task-actions">
+                        <div className="task-actions" onClick={(event) => event.stopPropagation()}>
                           {state === "TODO" && (
                             <button className="button-quiet start-button" onClick={() => onStartTask(task)}>
                               <svg className="start-button-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 3.2v9.6l8-4.8-8-4.8Z" /></svg>

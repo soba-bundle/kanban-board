@@ -3,6 +3,14 @@ import test from "node:test";
 import {
   BoardSnapshotSchema,
   CreateTaskSchema,
+  CreateTicketCommentSchema,
+  ImplementationHandoverSchema,
+  InvestigationHandoverSchema,
+  RunReasonCodeSchema,
+  TaskRunSummarySchema,
+  SteerRunSchema,
+  TicketCommentSchema,
+  handoverSchemaForStage,
   ProjectSchema,
   RunStatusSchema,
   TaskSchema,
@@ -57,4 +65,91 @@ test("task schema validates workflow state and required fields", () => {
   assert.equal(BoardSnapshotSchema.safeParse({ columns: {
     TODO: [task], IN_PROGRESS: [], REQUIRES_HUMAN: [], REVIEW: [], DONE: [],
   } }).success, true);
+});
+
+test("run summary rejects unknown reason codes", () => {
+  const run = {
+    id: "r1",
+    stage: "INVESTIGATION",
+    sequence: 1,
+    status: "FAILED",
+    reason_code: "HANDOVER_FAILED",
+    error_message: "Missing handover",
+    started_at: timestamp,
+    completed_at: timestamp,
+    handover: null,
+  };
+  assert.equal(TaskRunSummarySchema.safeParse(run).success, true);
+  assert.equal(TaskRunSummarySchema.safeParse({ ...run, reason_code: "TYPO" }).success, false);
+  assert.equal(TaskRunSummarySchema.safeParse({ ...run, reason_code: null }).success, true);
+});
+
+test("ticket comment schema validates delivery metadata", () => {
+  const comment = {
+    id: "c1",
+    task_id: "t1",
+    run_id: null,
+    author_type: "USER",
+    content: "Please check the retry path.",
+    delivery_status: "PENDING",
+    delivery_type: null,
+    delivered_session_id: null,
+    delivered_run_id: null,
+    delivered_at: null,
+    created_at: timestamp,
+    updated_at: null,
+  };
+  assert.equal(TicketCommentSchema.safeParse(comment).success, true);
+  assert.equal(TicketCommentSchema.safeParse({
+    ...comment,
+    delivery_status: "QUEUED",
+    delivery_type: "STEERING",
+  }).success, true);
+  assert.equal(TicketCommentSchema.safeParse({ ...comment, delivery_status: "SENT" }).success, false);
+  assert.equal(TicketCommentSchema.safeParse({ ...comment, delivery_type: "EMAIL" }).success, false);
+  assert.equal(CreateTicketCommentSchema.safeParse({ content: " note " }).success, true);
+  assert.equal(CreateTicketCommentSchema.safeParse({ content: "   " }).success, false);
+  assert.equal(SteerRunSchema.safeParse({ text: "focus on the parser" }).success, true);
+  assert.equal(SteerRunSchema.safeParse({ text: "" }).success, false);
+  assert.equal(RunReasonCodeSchema.safeParse("HANDOVER_FAILED").success, true);
+  assert.equal(RunReasonCodeSchema.safeParse("GAVE_UP").success, false);
+});
+
+test("handover schemas enforce stage-specific contracts and default lists", () => {
+  const investigation = InvestigationHandoverSchema.safeParse({
+    stage: "INVESTIGATION",
+    summary: "Root cause found",
+    confidence: "HIGH",
+    outcome: "Retry loop drops the abort signal",
+    recommended_next_step: "IMPLEMENT",
+  });
+  assert.equal(investigation.success, true);
+  assert.deepEqual(investigation.data.evidence, []);
+  assert.equal(investigation.data.root_cause, null);
+  assert.equal(investigation.data.human_verification_required, false);
+
+  assert.equal(InvestigationHandoverSchema.safeParse({
+    stage: "INVESTIGATION",
+    summary: "No confidence field",
+    outcome: "x",
+    recommended_next_step: "IMPLEMENT",
+  }).success, false);
+
+  const implementation = ImplementationHandoverSchema.safeParse({
+    stage: "IMPLEMENTATION",
+    summary: "Fixed the abort propagation",
+    files_changed: ["src/run.ts"],
+    recommended_next_step: "CLOSE",
+  });
+  assert.equal(implementation.success, true);
+  assert.deepEqual(implementation.data.key_decisions, []);
+
+  // An implementation payload must not satisfy the investigation contract.
+  assert.equal(InvestigationHandoverSchema.safeParse({
+    stage: "IMPLEMENTATION",
+    summary: "Wrong stage",
+    recommended_next_step: "CLOSE",
+  }).success, false);
+  assert.equal(handoverSchemaForStage.INVESTIGATION, InvestigationHandoverSchema);
+  assert.equal(handoverSchemaForStage.IMPLEMENTATION, ImplementationHandoverSchema);
 });

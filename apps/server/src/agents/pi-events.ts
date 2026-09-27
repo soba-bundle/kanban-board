@@ -34,7 +34,9 @@ export function normalizePiEvent(event: AgentSessionEvent): NormalizedPiEvent {
         data.stopReason = message.stopReason;
         data.usage = message.usage;
       }
-      if (event.type === "message_end" && Array.isArray(message.content)) {
+      // User text is surfaced on message_start so steering delivery can be matched.
+      const wantsText = event.type === "message_end" || (event.type === "message_start" && message.role === "user");
+      if (wantsText && Array.isArray(message.content)) {
         data.text = (message.content as Array<Record<string, unknown>>)
           .filter((part) => part.type === "text")
           .map((part) => part.text)

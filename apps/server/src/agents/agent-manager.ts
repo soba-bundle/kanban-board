@@ -1,7 +1,8 @@
-import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type Database from "better-sqlite3";
 import type { LiveEvent } from "@kanban-board/shared";
 import { normalizePiEvent } from "./pi-events.js";
+import { createHandoverTool } from "./handover-tool.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -13,7 +14,11 @@ export interface WorkingSession {
   subscribe(handler: (event: AgentSessionEvent) => void): () => void;
   dispose(): void;
 }
-type SessionFactory = (cwd: string, manager: SessionManager) => Promise<WorkingSession>;
+type SessionFactory = (
+  cwd: string,
+  manager: SessionManager,
+  customTools: ToolDefinition[],
+) => Promise<WorkingSession>;
 
 interface TaskSessionRow {
   working_session_id: string | null;
@@ -26,14 +31,21 @@ export class AgentManager {
   private readonly sessions = new Map<string, WorkingSession>();
   private readonly activeRuns = new Map<string, string>();
   private readonly listeners = new Map<string, Set<{ runId: string; handler: LiveEventHandler }>>();
+  /**
+   * Recent events per run so a client joining Live mid-run sees prior output.
+   * In-memory only: it does not survive restart, and finished-run history comes
+   * from Pi JSONL reconstruction (Phase 12).
+   */
+  private readonly replayBuffers = new Map<string, LiveEvent[]>();
 
   constructor(
     private readonly db: Database.Database,
     private readonly sessionDir = process.env.KANBAN_SESSION_DIR ?? "data/sessions",
-    private readonly sessionFactory: SessionFactory = async (cwd, manager) => {
-      const { session } = await createAgentSession({ cwd, sessionManager: manager });
+    private readonly sessionFactory: SessionFactory = async (cwd, manager, customTools) => {
+      const { session } = await createAgentSession({ cwd, sessionManager: manager, customTools });
       return session;
     },
+    private readonly replayLimit = Number(process.env.KANBAN_LIVE_REPLAY_LIMIT ?? 2000),
   ) {}
 
   async createWorkingSession(taskId: string): Promise<WorkingSession> {
@@ -73,6 +85,35 @@ export class AgentManager {
     await this.requireSession(taskId).steer(text);
   }
 
+  /** Publish a backend-originated event to a run's live subscribers. */
+  publish(taskId: string, runId: string, type: string, data: Record<string, unknown>): void {
+    this.emit({ taskId, runId, type, timestamp: new Date().toISOString(), data });
+  }
+
+  /** Events already seen for this run, oldest first. */
+  replay(runId: string): LiveEvent[] {
+    return [...(this.replayBuffers.get(runId) ?? [])];
+  }
+
+  /** Drops a run's buffer once its output is no longer needed live. */
+  clearReplay(runId: string): void {
+    this.replayBuffers.delete(runId);
+  }
+
+  private emit(event: LiveEvent): void {
+    const buffer = this.replayBuffers.get(event.runId) ?? [];
+    buffer.push(event);
+    if (buffer.length > this.replayLimit) buffer.splice(0, buffer.length - this.replayLimit);
+    this.replayBuffers.set(event.runId, buffer);
+    for (const subscription of this.listeners.get(event.taskId) ?? []) {
+      if (subscription.runId === event.runId) subscription.handler(event);
+    }
+  }
+
+  activeRunId(taskId: string): string | undefined {
+    return this.activeRuns.get(taskId);
+  }
+
   subscribe(taskId: string, runId: string, handler: LiveEventHandler): () => void {
     const subscriptions = this.listeners.get(taskId) ?? new Set();
     const subscription = { runId, handler };
@@ -100,7 +141,9 @@ export class AgentManager {
 
   private async openSession(taskId: string, row: TaskSessionRow, manager: SessionManager): Promise<WorkingSession> {
     this.sessions.get(taskId)?.dispose();
-    const session = await this.sessionFactory(this.cwd(row), manager);
+    const session = await this.sessionFactory(this.cwd(row), manager, [
+      createHandoverTool(this.db, { activeRunId: () => this.activeRuns.get(taskId) }),
+    ]);
     this.sessions.set(taskId, session);
     this.db.prepare(`UPDATE tasks SET working_session_id = ?, working_session_file = ?, updated_at = ? WHERE id = ?`)
       .run(session.sessionId, session.sessionFile ?? null, new Date().toISOString(), taskId);
@@ -108,16 +151,13 @@ export class AgentManager {
       const runId = this.activeRuns.get(taskId);
       if (!runId) return;
       const normalized = normalizePiEvent(event);
-      const liveEvent: LiveEvent = {
+      this.emit({
         taskId,
         runId,
         type: normalized.type,
         timestamp: new Date().toISOString(),
         data: normalized.data,
-      };
-      for (const subscription of this.listeners.get(taskId) ?? []) {
-        if (subscription.runId === runId) subscription.handler(liveEvent);
-      }
+      });
     });
     return session;
   }

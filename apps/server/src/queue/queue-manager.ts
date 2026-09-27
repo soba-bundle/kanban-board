@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { QueueItem, QueueSnapshot, WorkingPhase } from "@kanban-board/shared";
 import { RunManager } from "../agents/run-manager.js";
+import { buildRunPrompt } from "../agents/prompt-builder.js";
 import { WorktreeManager } from "../git/worktree-manager.js";
 
 type WorkingRunPhase = Exclude<WorkingPhase, "VALIDATION_REVIEW">;
@@ -184,16 +185,10 @@ export class QueueManager {
 
   private async execute(job: ClaimedJob): Promise<void> {
     try {
-      let task = this.db.prepare("SELECT title, description, worktree_path FROM tasks WHERE id = ?").get(job.task_id) as
-        { title: string; description: string; worktree_path: string | null };
-      if (!task.worktree_path && this.worktrees) {
-        await this.worktrees.createTaskWorktree(job.task_id);
-        task = this.db.prepare("SELECT title, description, worktree_path FROM tasks WHERE id = ?").get(job.task_id) as
-          { title: string; description: string; worktree_path: string | null };
-      }
-      const run = this.db.prepare("SELECT stage FROM task_runs WHERE id = ?").get(job.run_id) as { stage: WorkingPhase };
-      const prompt = `${run.stage === "INVESTIGATION" ? "Investigate" : "Implement"} this task.\n\nTitle: ${task.title}\n\nDescription:\n${task.description}`;
-      await this.runs.start(job.run_id, prompt);
+      const worktreePath = (this.db.prepare("SELECT worktree_path FROM tasks WHERE id = ?").get(job.task_id) as
+        { worktree_path: string | null }).worktree_path;
+      if (!worktreePath && this.worktrees) await this.worktrees.createTaskWorktree(job.task_id);
+      await this.runs.start(job.run_id, buildRunPrompt(this.db, job.run_id));
     } catch (error) {
       const now = new Date().toISOString();
       this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ?

@@ -555,8 +555,11 @@ This gives an authoritative delivered signal distinct from accepted.
 ```text
 PENDING    ordinary comment awaiting the next working-session prompt
 QUEUED     steering accepted by Pi, waiting at a turn boundary
-DELIVERED  present in conversation history / JSONL
+DELIVERED  sent to the working session
 ```
+
+`DELIVERED` is normally permanent. It may only be reset when the comment turns
+out never to have entered conversation history; see 13.1.
 
 ```text
 delivery_type = NEXT_PROMPT | STEERING
@@ -573,6 +576,33 @@ DELIVERED  lock icon
 A run that aborts or ends with steering still `QUEUED` leaves those comments
 `QUEUED`. They are never retroactively marked delivered, because Pi's in-memory
 queue is lost.
+
+Such comments are stranded: not resent and not editable. See 13.1, where Phase
+11 must resolve them.
+
+### Comment mutability rule
+
+A comment may be edited or deleted only when all of the following hold:
+
+```text
+author_type     = USER
+delivery_status = PENDING
+workflow_state  IN (TODO, REVIEW)
+```
+
+The workflow-state condition is the important one. Steering is only possible
+while a run streams, so restricting mutation to Todo/Review makes a `QUEUED`
+comment structurally unreachable for editing. The backend therefore never has
+to mutate Pi's live steering queue, and `clearQueue()` / re-steer ordering /
+delivery-race handling are all avoided.
+
+Mutability is driven by delivery state, not by whether the task has ever run.
+An undelivered comment written during Investigation #1 remains editable once
+the task returns to Review, because it has not yet reached the model. Only
+historical (delivered) comments are immutable.
+
+`REQUIRES_HUMAN` is excluded because a live session is parked inside a pending
+tool call. `DONE` is excluded because nothing further will be sent.
 
 ---
 
@@ -908,6 +938,86 @@ unexpected rebase/cherry-pick/revert
 ```
 
 UI reconnect always begins with REST snapshot, then WebSocket.
+
+## 13.1 Open Issue — Stranded QUEUED Steering Comments
+
+Introduced by Phase 5 and must be addressed here.
+
+Pi's steering queue is in-memory only. A steering comment is recorded as
+`QUEUED` when `steer()` is accepted and only becomes `DELIVERED` when Pi emits
+the matching user `message_start`. If the backend crashes, the run is stopped,
+or the run otherwise ends between those two points, the comment is stranded:
+
+```text
+never delivered to the model
+not resent, because prompt composition only selects PENDING
+not editable, because mutation requires PENDING
+```
+
+The human guidance is therefore silently lost while the ticket still shows it
+as queued. This includes user-initiated Stop: the Phase 5 implementation
+currently leaves the comment `QUEUED`; it does not yet decide whether Stop
+should discard that guidance or make it eligible for resend.
+
+Recovery must handle this. The likely fix is to treat `QUEUED` as an
+undelivered state at startup and on run termination, and reset it so the text
+is resent:
+
+```text
+run ended or backend restarted
+→ steering comment still QUEUED
+→ reset to PENDING (clear delivery metadata)
+→ included in the next working-session prompt as NEXT_PROMPT
+```
+
+### Delivery lifecycle invariant
+
+The delivery lifecycle is one-way, and the authoritative test is whether the
+comment exists in Pi conversation history, not which status column it currently
+carries:
+
+```text
+in conversation history      -> permanent, never reset, resent, or edited
+not in conversation history  -> may be returned to PENDING and sent again
+```
+
+`delivery_status` is a record of intent that can run slightly ahead of reality,
+so two resets are legitimate. Both restore guidance that never reached the
+model:
+
+```text
+QUEUED -> PENDING
+  accepted into Pi's in-memory steering queue, but the run ended before Pi
+  replayed it as a user message
+  (this section; Phase 11)
+
+DELIVERED -> PENDING
+  NEXT_PROMPT comments are stamped delivered immediately before prompt() is
+  awaited; if prompt() throws before the user message is appended, the stamp
+  was premature
+  (implemented in Phase 5, revertCommentsToPending)
+```
+
+The second reset is deliberately narrow: only `NEXT_PROMPT` comments, only
+those stamped by the failing run, and only when no user `message_start` was
+observed for that run. A comment the model actually saw is never reset, even if
+the run later fails.
+
+Related future capability: the user should be able to **delete** a steering
+comment that is still undelivered. Deletion is currently blocked because
+mutation requires `PENDING` and a live steer is `QUEUED`. Once queued steering
+is resolvable (reset to `PENDING`, or made safely cancellable), retracting an
+undelivered steering message should be allowed. A `DELIVERED` steering comment
+remains permanent.
+
+Decisions still required:
+
+- whether the resend is automatic or surfaced to the user for confirmation;
+- whether the timeline preserves the original queued attempt for audit rather
+  than mutating the row in place;
+- whether a user-initiated Stop should discard the queued guidance instead,
+  since the user may have stopped the run precisely because that steer was
+  wrong.
 
 ---
 

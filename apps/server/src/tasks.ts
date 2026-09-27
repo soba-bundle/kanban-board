@@ -12,6 +12,11 @@ import {
 
 const taskFields = `t.id, t.project_id, t.title, t.description, t.workflow_state, t.review_tag, t.created_at, t.updated_at`;
 
+export function hasAgentWorkStarted(db: Database.Database, taskId: string): boolean {
+  return Boolean(db.prepare(`SELECT 1 FROM task_runs WHERE task_id = ? AND
+    (started_at IS NOT NULL OR status NOT IN ('QUEUED', 'CANCELLED')) LIMIT 1`).get(taskId));
+}
+
 function listTasks(db: Database.Database, projectId?: string): Task[] {
   const scope = `FROM tasks t JOIN projects p ON p.id = t.project_id
     WHERE t.is_active = 1 AND p.is_active = 1${projectId ? " AND t.project_id = ?" : ""}
@@ -54,9 +59,9 @@ export function registerTaskRoutes(app: FastifyInstance, db: Database.Database, 
       WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(request.params.id) as Task | undefined;
     if (!current) return reply.code(404).send({ error: "Task not found." });
 
-    const agentWorkStarted = db.prepare(`SELECT 1 FROM task_runs WHERE task_id = ? AND
-      (started_at IS NOT NULL OR status NOT IN ('QUEUED', 'CANCELLED')) LIMIT 1`).get(request.params.id);
-    if (agentWorkStarted) return reply.code(409).send({ error: "Task details cannot be edited after agent work has started." });
+    if (hasAgentWorkStarted(db, request.params.id)) {
+      return reply.code(409).send({ error: "Task details cannot be edited after agent work has started." });
+    }
 
     const updated: Task = {
       ...current,

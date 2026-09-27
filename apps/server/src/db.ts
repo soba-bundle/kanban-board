@@ -159,5 +159,16 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const softDeleteApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 3").get();
+  if (!softDeleteApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE projects ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE tasks ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

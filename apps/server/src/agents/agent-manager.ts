@@ -9,7 +9,7 @@ export interface WorkingSession {
   sessionFile?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
-  abort(): void;
+  abort(): Promise<void>;
   subscribe(handler: (event: AgentSessionEvent) => void): () => void;
   dispose(): void;
 }
@@ -84,8 +84,11 @@ export class AgentManager {
     };
   }
 
-  abort(taskId: string): void {
-    this.requireSession(taskId).abort();
+  async abort(taskId: string): Promise<boolean> {
+    const session = this.sessions.get(taskId);
+    if (!session) return false;
+    await session.abort();
+    return true;
   }
 
   dispose(taskId: string): void {

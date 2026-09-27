@@ -25,13 +25,13 @@ function normalizePath(path: string): string {
 }
 
 function isDuplicateRoot(db: Database.Database, rootPath: string, exceptId?: string): boolean {
-  const projects = db.prepare("SELECT id, root_path FROM projects").all() as Array<{ id: string; root_path: string }>;
+  const projects = db.prepare("SELECT id, root_path FROM projects WHERE is_active = 1").all() as Array<{ id: string; root_path: string }>;
   return projects.some((project) => project.id !== exceptId && normalizePath(project.root_path) === normalizePath(rootPath));
 }
 
 export function registerProjectRoutes(app: FastifyInstance, db: Database.Database) {
   app.get("/api/projects", async () => {
-    return db.prepare("SELECT * FROM projects ORDER BY name COLLATE NOCASE").all();
+    return db.prepare("SELECT * FROM projects WHERE is_active = 1 ORDER BY name COLLATE NOCASE").all();
   });
 
   app.post("/api/projects/validate-git-root", async (request, reply) => {
@@ -79,7 +79,7 @@ export function registerProjectRoutes(app: FastifyInstance, db: Database.Databas
     const parsed = UpdateProjectSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-    const current = db.prepare("SELECT id FROM projects WHERE id = ?").get(request.params.id);
+    const current = db.prepare("SELECT id FROM projects WHERE id = ? AND is_active = 1").get(request.params.id);
     if (!current) return reply.code(404).send({ error: "Project not found." });
 
     let rootPath: string;
@@ -108,11 +108,21 @@ export function registerProjectRoutes(app: FastifyInstance, db: Database.Databas
   });
 
   app.delete<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => {
-    const project = db.prepare("SELECT id FROM projects WHERE id = ?").get(request.params.id);
+    const project = db.prepare("SELECT id FROM projects WHERE id = ? AND is_active = 1").get(request.params.id);
     if (!project) return reply.code(404).send({ error: "Project not found." });
-    const tasks = db.prepare("SELECT 1 FROM tasks WHERE project_id = ? LIMIT 1").get(request.params.id);
-    if (tasks) return reply.code(409).send({ error: "Project has tasks; remove or move them before unregistering it." });
-    db.prepare("DELETE FROM projects WHERE id = ?").run(request.params.id);
+    const activeWork = db.prepare(`SELECT 1 FROM tasks t WHERE t.project_id = ? AND t.is_active = 1 AND (
+      EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id
+        AND r.status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_HUMAN', 'WAITING_FOR_INFERENCE')) OR
+      EXISTS (SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+        WHERE r.task_id = t.id AND j.status IN ('QUEUED', 'CLAIMED'))
+      ) LIMIT 1`).get(request.params.id);
+    if (activeWork) return reply.code(409).send({ error: "Remove queued work or stop active runs before deleting this project." });
+
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare("UPDATE tasks SET is_active = 0, updated_at = ? WHERE project_id = ? AND is_active = 1").run(now, request.params.id);
+      db.prepare("UPDATE projects SET is_active = 0, updated_at = ? WHERE id = ? AND is_active = 1").run(now, request.params.id);
+    })();
     return reply.code(204).send();
   });
 }

@@ -7,7 +7,8 @@ import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../dist/agents/agent-manager.js";
 import { registerLiveEventRoutes } from "../dist/agents/live-event-routes.js";
 import { RunManager } from "../dist/agents/run-manager.js";
-import { registerRunRoutes } from "../dist/agents/run-routes.js";
+import { QueueManager } from "../dist/queue/queue-manager.js";
+import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
 import { openDatabase } from "../dist/db.js";
 
 const marker = "maple-914";
@@ -48,7 +49,6 @@ function seedDatabase() {
   insertRun.run("smoke-implementation-1", "IMPLEMENTATION", 2);
   insertRun.run("smoke-investigation-2", "INVESTIGATION", 3);
   insertRun.run("smoke-restore", "INVESTIGATION", 4);
-  insertRun.run("smoke-websocket", "IMPLEMENTATION", 5);
 }
 
 function readAssistantText(sessionFile) {
@@ -103,11 +103,14 @@ async function verifyRepeatedSessionAndRestore() {
 }
 
 async function verifyWebSocketSteeringAndAbort() {
+  db.prepare(`UPDATE tasks SET workflow_state = 'TODO', description = ? WHERE id = 'smoke-task'`)
+    .run("Write a long explanation (about 700 words) of why persistent working sessions are useful.");
   const app = Fastify();
+  const queue = new QueueManager(db, new RunManager(db, agents));
+  queue.initialize();
   await registerLiveEventRoutes(app, db, agents);
-  registerRunRoutes(app, new RunManager(db, agents));
+  registerQueueRoutes(app, queue);
   await app.ready();
-  const socket = await app.injectWS("/api/runs/smoke-websocket/events");
   const socketEvents = [];
   socket.on("message", (data) => socketEvents.push(JSON.parse(data.toString())));
 
@@ -120,11 +123,13 @@ async function verifyWebSocketSteeringAndAbort() {
   });
   const response = await app.inject({
     method: "POST",
-    url: "/api/runs/smoke-websocket/start",
-    payload: { prompt: "Write a long explanation (about 700 words) of why persistent working sessions are useful." },
+    url: "/api/tasks/smoke-task/queue",
+    payload: { stage: "IMPLEMENTATION" },
   });
-  assert.equal(response.statusCode, 202);
-  await waitForRun("smoke-websocket");
+  assert.equal(response.statusCode, 201);
+  const runId = response.json().run_id;
+  const socket = await app.injectWS(`/api/runs/${runId}/events`);
+  await waitForRun(runId);
   await steering;
   unsubscribe();
   socket.terminate();
@@ -138,10 +143,11 @@ async function verifyWebSocketSteeringAndAbort() {
 
   let abortIssued = false;
   let abortSettled = false;
+  let abortError;
   const unsubscribeAbort = agents.subscribe("smoke-task", "smoke-abort", (event) => {
     if (!abortIssued && event.type === "message_update" && event.data.subtype === "text_delta") {
       abortIssued = true;
-      agents.abort("smoke-task");
+      void agents.abort("smoke-task").catch((error) => { abortError = error; });
     }
     if (event.type === "agent_settled") abortSettled = true;
   });
@@ -152,6 +158,7 @@ async function verifyWebSocketSteeringAndAbort() {
   unsubscribeAbort();
   assert.ok(abortIssued, "abort should be requested during streamed generation");
   assert.ok(abortSettled, "Pi should report the aborted turn settled");
+  assert.equal(abortError, undefined, "Pi abort should complete successfully");
   console.log("PASS abort during real Pi streaming settles the working session");
 }
 

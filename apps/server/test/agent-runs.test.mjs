@@ -8,7 +8,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { AgentManager } from "../dist/agents/agent-manager.js";
 import { registerLiveEventRoutes } from "../dist/agents/live-event-routes.js";
 import { RunManager } from "../dist/agents/run-manager.js";
-import { registerRunRoutes } from "../dist/agents/run-routes.js";
+import { QueueManager } from "../dist/queue/queue-manager.js";
+import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
 import { openDatabase } from "../dist/db.js";
 
 class FakeSession {
@@ -21,6 +22,7 @@ class FakeSession {
 
   subscribe(handler) { this.listeners.add(handler); return () => this.listeners.delete(handler); }
   async prompt(text) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
     this.prompts.push(text);
     for (const handler of this.listeners) {
       handler({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: text } });
@@ -100,25 +102,29 @@ test("successive runs reuse the persisted task session", async (t) => {
 
 test("run WebSocket receives normalized live events from its task session", async (t) => {
   const { db, agents } = makeFixture();
+  db.prepare("UPDATE tasks SET workflow_state = 'TODO' WHERE id = 'task-1'").run();
   const app = Fastify();
-  const runs = new RunManager(db, agents);
+  const queue = new QueueManager(db, new RunManager(db, agents));
+  queue.initialize();
   await registerLiveEventRoutes(app, db, agents);
-  registerRunRoutes(app, runs);
-  t.after(async () => { await app.close(); agents.dispose("task-1"); db.close(); });
+  registerQueueRoutes(app, queue);
+  let socket;
+  t.after(async () => { socket?.terminate(); await app.close(); agents.dispose("task-1"); db.close(); });
 
   await app.ready();
-  const socket = await app.injectWS("/api/runs/run-1/events");
+  const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: { stage: "INVESTIGATION" } });
+  assert.equal(response.statusCode, 201);
+  const runId = response.json().run_id;
+  socket = await app.injectWS(`/api/runs/${runId}/events`);
   const received = new Promise((resolve, reject) => {
     socket.once("message", (data) => resolve(JSON.parse(data.toString())));
     socket.once("error", reject);
   });
-  const response = await app.inject({ method: "POST", url: "/api/runs/run-1/start", payload: { prompt: "hello" } });
-  assert.equal(response.statusCode, 202);
   const event = await received;
 
   assert.equal(event.taskId, "task-1");
-  assert.equal(event.runId, "run-1");
+  assert.equal(event.runId, runId);
   assert.equal(event.type, "message_update");
-  assert.equal(event.data.delta, "hello");
+  assert.match(event.data.delta, /^Investigate this task/);
   socket.terminate();
 });

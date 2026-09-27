@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  BoardSnapshotSchema,
+  CreateTaskSchema,
   ProjectSchema,
   RunStatusSchema,
   TaskSchema,
+  UpdateTaskSchema,
   WorkflowStateSchema,
 } from "../dist/index.js";
 
@@ -30,6 +33,14 @@ test("project schema validates required project fields", () => {
   assert.equal(ProjectSchema.safeParse({ ...project, root_path: "" }).success, false);
 });
 
+test("task create and update schemas validate task fields", () => {
+  assert.equal(CreateTaskSchema.safeParse({ project_id: "p1", title: " New task ", description: " Useful context " }).success, true);
+  assert.equal(CreateTaskSchema.safeParse({ project_id: "p1", title: "  ", description: "Details" }).success, false);
+  assert.equal(CreateTaskSchema.safeParse({ project_id: "p1", title: "Task", description: "  " }).success, false);
+  assert.equal(UpdateTaskSchema.safeParse({ title: "Renamed" }).success, true);
+  assert.equal(UpdateTaskSchema.safeParse({}).success, false);
+});
+
 test("task schema validates workflow state and required fields", () => {
   const task = {
     id: "t1",
@@ -43,4 +54,7 @@ test("task schema validates workflow state and required fields", () => {
   };
   assert.equal(TaskSchema.safeParse(task).success, true);
   assert.equal(TaskSchema.safeParse({ ...task, workflow_state: "ARCHIVED" }).success, false);
+  assert.equal(BoardSnapshotSchema.safeParse({ columns: {
+    TODO: [task], IN_PROGRESS: [], REQUIRES_HUMAN: [], REVIEW: [], DONE: [],
+  } }).success, true);
 });

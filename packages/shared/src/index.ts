@@ -30,6 +30,9 @@ export const RunStatusSchema = z.enum([
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
+export const AgentJobStatusSchema = z.enum(["QUEUED", "CLAIMED", "FINISHED", "CANCELLED"]);
+export type AgentJobStatus = z.infer<typeof AgentJobStatusSchema>;
+
 export const ReviewTagSchema = z.enum([
   "INVESTIGATION_COMPLETE",
   "IMPLEMENTATION_COMPLETE",
@@ -72,3 +75,45 @@ export const TaskSchema = z.object({
   updated_at: z.string().datetime(),
 });
 export type Task = z.infer<typeof TaskSchema>;
+
+export const CreateTaskSchema = z.object({
+  project_id: z.string().min(1),
+  title: z.string().trim().min(1),
+  description: z.string().trim().min(1),
+});
+export const UpdateTaskSchema = z.object({
+  title: z.string().trim().min(1).optional(),
+  description: z.string().optional(),
+}).refine((task) => task.title !== undefined || task.description !== undefined, {
+  message: "At least one task field must be provided.",
+});
+export const BoardSnapshotSchema = z.object({
+  columns: z.object({
+    TODO: z.array(TaskSchema),
+    IN_PROGRESS: z.array(TaskSchema),
+    REQUIRES_HUMAN: z.array(TaskSchema),
+    REVIEW: z.array(TaskSchema),
+    DONE: z.array(TaskSchema),
+  }),
+});
+export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
+
+export const QueueItemSchema = z.object({
+  job_id: z.string().min(1),
+  run_id: z.string().min(1),
+  task_id: z.string().min(1),
+  title: z.string().min(1),
+  stage: WorkingPhaseSchema,
+  queue_position: z.number().int().positive().nullable(),
+  job_status: AgentJobStatusSchema,
+  run_status: RunStatusSchema,
+});
+export const QueueSnapshotSchema = z.object({
+  max_concurrent_agents: z.number().int().positive(),
+  active_count: z.number().int().nonnegative(),
+  jobs: z.array(QueueItemSchema),
+});
+export type QueueItem = z.infer<typeof QueueItemSchema>;
+export type QueueSnapshot = z.infer<typeof QueueSnapshotSchema>;
+export const EnqueueTaskSchema = z.object({ stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]) });
+export const ReorderQueueJobSchema = z.object({ position: z.number().int().positive() });

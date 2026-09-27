@@ -15,7 +15,7 @@ function makeGitRepo(path) {
   execFileSync("git", ["-C", path, "commit", "--allow-empty", "-m", "initial"], { stdio: "ignore" });
 }
 
-test("project API validates and persists Git projects, rejects duplicate roots, and protects referenced projects", async (t) => {
+test("project API validates, rejects duplicate roots, and soft-deletes projects with their tasks", async (t) => {
   const temp = mkdtempSync(join(tmpdir(), "kanban-project-test-"));
   const repo = join(temp, "repo");
   makeGitRepo(repo);
@@ -61,6 +61,8 @@ test("project API validates and persists Git projects, rejects duplicate roots, 
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', ?, 'Task', '', 'TODO', ?, ?)`)
     .run(project.id, new Date().toISOString(), new Date().toISOString());
+  db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, started_at)
+    VALUES ('run-1', 'task-1', 'INVESTIGATION', 1, 'RUNNING', ?)`).run(new Date().toISOString());
   const blockedDelete = await app.inject({ method: "DELETE", url: `/api/projects/${project.id}` });
   assert.equal(blockedDelete.statusCode, 409);
 
@@ -80,6 +82,13 @@ test("project API validates and persists Git projects, rejects duplicate roots, 
   assert.equal(updated.json().name, "Renamed");
   assert.equal(updated.json().ide_command, "code");
   assert.equal(db.prepare("SELECT name FROM projects WHERE id = ?").get(project.id).name, "Renamed");
+
+  db.prepare("UPDATE task_runs SET status = 'COMPLETED' WHERE id = 'run-1'").run();
+  const deleted = await app.inject({ method: "DELETE", url: `/api/projects/${project.id}` });
+  assert.equal(deleted.statusCode, 204);
+  assert.equal((await app.inject({ method: "GET", url: "/api/projects" })).json().length, 0);
+  assert.equal(db.prepare("SELECT is_active FROM projects WHERE id = ?").get(project.id).is_active, 0);
+  assert.equal(db.prepare("SELECT is_active FROM tasks WHERE id = 'task-1'").get().is_active, 0);
 
   const secondRepo = join(temp, "second-repo");
   makeGitRepo(secondRepo);

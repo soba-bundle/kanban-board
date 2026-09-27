@@ -502,6 +502,125 @@ Review / RUN_FAILED
 
 ---
 
+## 7.1 Pi SDK Constraints Established Before Implementation
+
+### Tools cannot be swapped on a live session
+
+`customTools` is captured once at session construction and only re-read from that
+same private array by the internal tool-registry refresh. There is no public
+API to add/replace tools on an open `AgentSession`.
+
+A task owns one long-lived working session across
+Investigation -> Implementation -> Investigation, so recreating the session to
+change tools is not acceptable.
+
+Therefore `submit_handover` is registered once per session with a permissive
+TypeBox parameter schema, and the stage-specific contract is enforced by strict
+validation inside the tool execution:
+
+```text
+Layer 1  TypeBox (permissive)   what the model sees; union of both variants
+Layer 2  Zod (strict)           selected from the active run stage at call time
+```
+
+Invalid payloads return a tool error containing field-level messages so the
+agent can correct and retry the call itself.
+
+### Steering may be sent directly
+
+`AgentSession.steer()` performs no state check. It expands prompt/skill
+templates, pushes onto the internal steering queue, emits `queue_update`, and
+forwards to the agent. Delivery happens after the current assistant turn
+finishes its tool calls, before the next LLM call.
+
+Consequences:
+
+- while a run is `RUNNING`, steering is sent directly to the session;
+- while idle, the queue is in-memory only and triggers no turn, so steering
+  must be rejected and the next-prompt path used instead;
+- `steer()` resolving means accepted, not obeyed, and not yet delivered.
+
+### Actual delivery is observable
+
+Pi removes a queued steering message from its queue when `message_start` fires
+with `role: "user"` and matching text. That is the moment the message enters
+conversation history and the JSONL.
+
+This gives an authoritative delivered signal distinct from accepted.
+
+---
+
+## 7.2 Comment Delivery States
+
+```text
+PENDING    ordinary comment awaiting the next working-session prompt
+QUEUED     steering accepted by Pi, waiting at a turn boundary
+DELIVERED  present in conversation history / JSONL
+```
+
+```text
+delivery_type = NEXT_PROMPT | STEERING
+```
+
+UI representation:
+
+```text
+PENDING    plain
+QUEUED     clock icon
+DELIVERED  lock icon
+```
+
+A run that aborts or ends with steering still `QUEUED` leaves those comments
+`QUEUED`. They are never retroactively marked delivered, because Pi's in-memory
+queue is lost.
+
+---
+
+## 7.3 Implementation Steps
+
+```text
+1. Shared schemas
+   ticket comment, delivery status/type, author type,
+   Investigation/Implementation handover, HANDOVER_FAILED reason code
+   verify: typecheck
+
+2. Comments API + immutability
+   GET/POST /api/tasks/:id/comments, PATCH/DELETE /api/comments/:id
+   reuse the existing agent-work-started gate used by task editing
+   verify: pre-run edit/delete allowed, post-run 409, append always allowed
+
+3. Prompt composition
+   extract prompt building out of the queue manager
+   include PENDING comments, mark DELIVERED / NEXT_PROMPT at send
+   verify: prompt contains pending comments, rows flip, no resend on next run
+
+4. Live steering
+   POST /api/runs/:runId/steer, 409 unless a run is RUNNING
+   insert comment QUEUED / STEERING when steer() resolves
+   flip to DELIVERED on matching user message_start, emit comment_delivered
+   verify: idle 409, queued -> delivered transition, abort leaves QUEUED
+
+5. submit_handover tool
+   permissive TypeBox params, strict per-stage validation in execute
+   persist task_runs.handover_json
+   verify: valid persists, invalid returns tool error with field messages
+
+6. Missing handover handling
+   re-request once, then Review / RUN_FAILED with HANDOVER_FAILED
+   verify: single retry then failure routing
+
+7. Baseline UI
+   task detail panel: description, comment timeline with delivery icons,
+   composer, handover summary, steering input enabled only while RUNNING,
+   live event log over the existing run events WebSocket
+   verify: manual end-to-end comment + steer + handover preview
+```
+
+The UI here is intentionally minimal; Phase 12 replaces it with the full
+session viewer.
+
+---
+
 # 8. Phase 6 — Checkpoint Commit Model
 
 On successful Implementation handover:

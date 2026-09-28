@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../dist/agents/agent-manager.js";
 import { registerLiveEventRoutes } from "../dist/agents/live-event-routes.js";
+import { registerRunRoutes } from "../dist/agents/run-routes.js";
 import { RunManager } from "../dist/agents/run-manager.js";
 import { QueueManager } from "../dist/queue/queue-manager.js";
 import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
@@ -20,8 +21,8 @@ const timeoutMs = 120_000;
 let agents;
 
 function createAgentManager() {
-  return new AgentManager(db, sessionDir, async (cwd, sessionManager) => {
-    const { session } = await createAgentSession({ cwd, sessionManager, noTools: "all" });
+  return new AgentManager(db, sessionDir, async (cwd, sessionManager, customTools) => {
+    const { session } = await createAgentSession({ cwd, sessionManager, customTools, noTools: "builtin" });
     return session;
   });
 }
@@ -81,7 +82,7 @@ async function verifyRepeatedSessionAndRestore() {
   let expectedSessionId;
   let expectedSessionFile;
   for (const [runId, prompt] of prompts) {
-    await runs.start(runId, prompt);
+    await runs.start(runId, { text: prompt, commentIds: [], inputIds: [] });
     await waitForRun(runId);
     const run = db.prepare("SELECT session_id, session_file FROM task_runs WHERE id = ?").get(runId);
     expectedSessionId ??= run.session_id;
@@ -93,44 +94,71 @@ async function verifyRepeatedSessionAndRestore() {
   agents.dispose("smoke-task");
 
   agents = createAgentManager();
-  await new RunManager(db, agents).start("smoke-restore", "After restarting, what exact marker did I ask you to remember? Reply with only the marker.");
+  await new RunManager(db, agents).start("smoke-restore", {
+    text: "After restarting, what exact marker did I ask you to remember? Reply with only the marker.",
+    commentIds: [], inputIds: [],
+  });
   await waitForRun("smoke-restore");
   const restoredRun = db.prepare("SELECT session_id, session_file FROM task_runs WHERE id = 'smoke-restore'").get();
   assert.equal(restoredRun.session_id, expectedSessionId, "restored session should keep the same ID");
   assert.equal(restoredRun.session_file, expectedSessionFile, "restored session should keep the same file");
   assert.ok(readAssistantText(expectedSessionFile).some((text) => text.trim() === marker), "restored session should recall prior context");
-  console.log("PASS successive runs and fresh-manager restore reused one persistent session and retained context");
+  const history = agents.historySnapshot("smoke-task");
+  assert.ok(history.entries.some((entry) => entry.message.content?.some((part) => part.text?.includes(marker))),
+    "restored Live history should reconstruct the real Pi transcript");
+  assert.ok(history.entries.some((entry) => entry.run_id === "smoke-restore"),
+    "reconstructed transcript entries should retain run ownership");
+  console.log("PASS successive runs and fresh-manager restore reused one persistent session and reconstructed Live history");
 }
 
 async function verifyWebSocketSteeringAndAbort() {
   db.prepare(`UPDATE tasks SET workflow_state = 'TODO', description = ? WHERE id = 'smoke-task'`)
     .run("Write a long explanation (about 700 words) of why persistent working sessions are useful.");
   const app = Fastify();
-  const queue = new QueueManager(db, new RunManager(db, agents));
+  const runs = new RunManager(db, agents);
+  const queue = new QueueManager(db, runs);
   queue.initialize();
   await registerLiveEventRoutes(app, db, agents);
   registerQueueRoutes(app, queue);
+  registerRunRoutes(app, runs);
   await app.ready();
   const socketEvents = [];
-  socket.on("message", (data) => socketEvents.push(JSON.parse(data.toString())));
 
+  let runId;
   let steering;
+  const steeringInputId = "smoke-steering-input";
   const steeringText = "Steering smoke instruction: after your current response, reply exactly STEERING_RECEIVED.";
-  const unsubscribe = agents.subscribe("smoke-task", "smoke-websocket", (event) => {
-    if (!steering && event.type === "message_update" && event.data.subtype === "text_delta") {
-      steering = agents.steer("smoke-task", steeringText);
-    }
-  });
   const response = await app.inject({
     method: "POST",
     url: "/api/tasks/smoke-task/queue",
-    payload: { stage: "IMPLEMENTATION" },
+    payload: {
+      task_id: "smoke-task", stage: "IMPLEMENTATION", prompt: "Explain why persistent working sessions are useful.",
+      idempotency_key: "smoke-websocket-start",
+    },
   });
   assert.equal(response.statusCode, 201);
-  const runId = response.json().run_id;
-  const socket = await app.injectWS(`/api/runs/${runId}/events`);
+  runId = response.json().run_id;
+  const unsubscribe = agents.subscribe("smoke-task", runId, (event) => {
+    if (!steering && event.type === "message_update" && event.data.subtype === "text_delta") {
+      steering = runs.steer(runId, steeringInputId, steeringText);
+    }
+  });
+  const socket = await app.injectWS(`/api/tasks/smoke-task/runs/${runId}/events`);
+  socket.on("message", (data) => socketEvents.push(JSON.parse(data.toString())));
   await waitForRun(runId);
   await steering;
+  const inputDeadline = Date.now() + timeoutMs;
+  while (Date.now() < inputDeadline && db.prepare("SELECT delivery_status FROM run_inputs WHERE id = ?")
+    .get(steeringInputId)?.delivery_status !== "DELIVERED") await new Promise((resolve) => setTimeout(resolve, 100));
+  const steeringInput = db.prepare("SELECT delivery_status, transcript_entry_id FROM run_inputs WHERE id = ?")
+    .get(steeringInputId);
+  assert.equal(steeringInput?.delivery_status, "DELIVERED");
+  assert.ok(steeringInput.transcript_entry_id, "steering should correlate to a unique Pi transcript entry");
+  const refreshedHistory = await app.inject({ method: "GET", url: "/api/tasks/smoke-task/live/history" });
+  assert.equal(refreshedHistory.statusCode, 200);
+  assert.ok(refreshedHistory.json().entries.some((entry) =>
+    entry.entry_id === steeringInput.transcript_entry_id && entry.run_id === runId),
+  "refreshed history should expose the delivered steering entry under its run");
   unsubscribe();
   socket.terminate();
   await app.close();

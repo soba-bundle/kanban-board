@@ -2,7 +2,9 @@ import type Database from "better-sqlite3";
 
 export interface RunPrompt {
   text: string;
-  /** Pending comments folded into this prompt, marked delivered once it is sent. */
+  /** Run inputs that will be included in the initial Pi user message. */
+  inputIds: string[];
+  /** Legacy comments are never injected into a new run. */
   commentIds: string[];
 }
 
@@ -17,30 +19,27 @@ export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt 
     JOIN tasks t ON t.id = r.task_id WHERE r.id = ?`).get(runId) as PromptRow | undefined;
   if (!row) throw new Error(`Run ${runId} not found.`);
 
-  const pending = db.prepare(`SELECT c.id, c.content FROM ticket_comments c
-    JOIN task_runs r ON r.task_id = c.task_id
-    WHERE r.id = ? AND c.author_type = 'USER' AND c.delivery_status = 'PENDING'
-    ORDER BY c.created_at, c.id`).all(runId) as Array<{ id: string; content: string }>;
+  const inputs = db.prepare(`SELECT id, content, delivery_type FROM run_inputs
+    WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')
+      AND delivery_type IN ('INITIAL_PROMPT', 'QUEUED_INPUT')
+    ORDER BY sequence`).all(runId) as Array<{ id: string; content: string; delivery_type: string }>;
+  const initialPrompt = inputs.find((input) => input.delivery_type === "INITIAL_PROMPT");
+  if (!initialPrompt) throw new Error(`Run ${runId} has no initial prompt.`);
+  const queuedInputs = inputs.filter((input) => input.delivery_type === "QUEUED_INPUT");
 
   const sections = [
     `${row.stage === "INVESTIGATION" ? "Investigate" : "Implement"} this task.`,
     `Title: ${row.title}`,
-    `Description:\n${row.description}`,
+    `User's initial instructions:\n${initialPrompt.content}`,
+    `Task description:\n${row.description}`,
   ];
-  if (pending.length > 0) {
-    sections.push(`New comments from the user:\n${pending.map((c) => `- ${c.content}`).join("\n")}`);
+  if (queuedInputs.length > 0) {
+    sections.push(`Additional queued guidance:\n${queuedInputs.map((input) => `- ${input.content}`).join("\n")}`);
   }
 
-  return { text: sections.join("\n\n"), commentIds: pending.map((comment) => comment.id) };
+  return { text: sections.join("\n\n"), inputIds: inputs.map((input) => input.id), commentIds: [] };
 }
 
-/**
- * Returns comments to PENDING when they never entered conversation history, so the
- * guidance is included in the next run instead of being silently consumed. Delivery
- * is stamped before prompt() is awaited, so a prompt that throws early leaves a
- * premature stamp. Only NEXT_PROMPT comments stamped by this run are reset; anything
- * the model actually saw is permanent.
- */
 export function revertCommentsToPending(db: Database.Database, commentIds: string[], runId: string): void {
   if (commentIds.length === 0) return;
   const update = db.prepare(`UPDATE ticket_comments SET delivery_status = 'PENDING', delivery_type = NULL,

@@ -97,7 +97,8 @@ test("checkpoint commit stages tracked and untracked task changes only in the ta
   git(repo, "config", "user.name", "Checkpoint Test");
   git(repo, "config", "user.email", "checkpoint@example.invalid");
   writeFileSync(join(repo, "file.txt"), "base\n");
-  git(repo, "add", "file.txt");
+  writeFileSync(join(repo, ".gitignore"), "ignored.txt\n");
+  git(repo, "add", "file.txt", ".gitignore");
   git(repo, "commit", "-m", "base");
   const db = openDatabase(join(temp, "app.sqlite"));
   const now = new Date().toISOString();
@@ -110,6 +111,7 @@ test("checkpoint commit stages tracked and untracked task changes only in the ta
   const worktree = await manager.createTaskWorktree("t");
   writeFileSync(join(worktree.worktreePath, "file.txt"), "updated\n");
   writeFileSync(join(worktree.worktreePath, "new.txt"), "new file\n");
+  writeFileSync(join(worktree.worktreePath, "ignored.txt"), "do not checkpoint\n");
   const preview = await manager.previewCheckpoint("t");
   assert.deepEqual(preview.trackedChanges, ["file.txt"]);
   assert.deepEqual(preview.untrackedFiles, ["new.txt"]);
@@ -117,8 +119,67 @@ test("checkpoint commit stages tracked and untracked task changes only in the ta
   assert.match(sha, /^[0-9a-f]{40}$/i);
   assert.equal(await getHeadSha(worktree.worktreePath), sha);
   assert.deepEqual(await manager.getStatus("t"), []);
+  await assert.rejects(manager.createCheckpoint("t"), /no changes to checkpoint/);
   assert.deepEqual(await getStatus(repo), []);
   assert.deepEqual(git(worktree.worktreePath, "show", "--pretty=format:", "--name-only").split("\n").sort(), ["file.txt", "new.txt"]);
+  assert.equal(existsSync(join(worktree.worktreePath, "ignored.txt")), true);
+  assert.doesNotMatch(git(worktree.worktreePath, "show", "--pretty=format:", "--name-only"), /ignored\.txt/);
+});
+
+test("checkpoint failure preserves the existing index and worktree files", async (t) => {
+  const temp = mkdtempSync(join(tmpdir(), "kanban-checkpoint-failure-"));
+  const repo = join(temp, "repo");
+  const worktreeRoot = join(temp, "worktrees");
+  const hooks = join(temp, "hooks");
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(hooks, { recursive: true });
+  execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "Checkpoint Failure Test");
+  git(repo, "config", "user.email", "checkpoint-failure@example.invalid");
+  writeFileSync(join(repo, "tracked.txt"), "base\n");
+  writeFileSync(join(repo, ".gitignore"), "ignored.txt\n");
+  git(repo, "add", "tracked.txt", ".gitignore");
+  git(repo, "commit", "-m", "base");
+  const db = openDatabase(join(temp, "app.sqlite"));
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO projects (id, name, root_path, worktree_root, created_at, updated_at)
+    VALUES ('p', 'P', ?, ?, ?, ?)`).run(repo, worktreeRoot, now, now);
+  db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
+    VALUES ('t', 'p', 'Task', '', 'REVIEW', ?, ?)`).run(now, now);
+  t.after(() => { db.close(); rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  const manager = new WorktreeManager(db);
+  const worktree = await manager.createTaskWorktree("t");
+  writeFileSync(join(worktree.worktreePath, "tracked.txt"), "staged content\n");
+  git(worktree.worktreePath, "add", "tracked.txt");
+  writeFileSync(join(worktree.worktreePath, "tracked.txt"), "working content\n");
+  writeFileSync(join(worktree.worktreePath, "new.txt"), "untracked content\n");
+  writeFileSync(join(worktree.worktreePath, "ignored.txt"), "ignored content\n");
+  const originalHead = await getHeadSha(worktree.worktreePath);
+  const originalIndexTree = git(worktree.worktreePath, "write-tree");
+  const originalStatus = git(worktree.worktreePath, "status", "--porcelain");
+  writeFileSync(join(hooks, "pre-commit"), "#!/bin/sh\nexit 1\n");
+  git(worktree.worktreePath, "config", "core.hooksPath", hooks);
+
+  await assert.rejects(manager.createCheckpoint("t"), /commit/i);
+  assert.equal(await getHeadSha(worktree.worktreePath), originalHead);
+  assert.equal(git(worktree.worktreePath, "write-tree"), originalIndexTree);
+  assert.equal(git(worktree.worktreePath, "status", "--porcelain"), originalStatus);
+  assert.equal(git(worktree.worktreePath, "show", "HEAD:tracked.txt"), "base");
+  assert.equal(git(worktree.worktreePath, "show", ":tracked.txt"), "staged content");
+  assert.equal(git(worktree.worktreePath, "check-ignore", "ignored.txt"), "ignored.txt");
+  writeFileSync(join(hooks, "pre-commit"), "#!/bin/sh\nenv -u GIT_INDEX_FILE git add -f ignored.txt\nexit 1\n");
+  await assert.rejects(manager.createCheckpoint("t"), /index changed concurrently and was preserved/i);
+  assert.equal(await getHeadSha(worktree.worktreePath), originalHead);
+  assert.equal(git(worktree.worktreePath, "show", ":ignored.txt"), "ignored content");
+  assert.match(git(worktree.worktreePath, "status", "--porcelain"), /A  ignored\.txt/);
+  assert.equal(git(repo, "status", "--porcelain"), "");
+
+  writeFileSync(join(hooks, "pre-commit"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(join(hooks, "post-commit"), "#!/bin/sh\nif [ ! -f concurrent.txt ]; then printf 'concurrent change\\n' > concurrent.txt; git add concurrent.txt; git commit -m concurrent; fi\n");
+  await assert.rejects(manager.createCheckpoint("t"), /outcome is ambiguous|branch tip changed/i);
+  assert.equal(db.prepare("SELECT latest_task_commit_sha FROM tasks WHERE id = 't'").get().latest_task_commit_sha, null);
+  assert.deepEqual(git(worktree.worktreePath, "log", "-2", "--format=%s").split("\n"), ["concurrent", "Checkpoint task t"]);
 });
 
 test("task worktree creation requires a configured root outside the repository", async (t) => {

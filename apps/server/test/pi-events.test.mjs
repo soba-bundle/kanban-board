@@ -2,6 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizePiEvent } from "../dist/agents/pi-events.js";
 
+test("normalizes appended transcript entry identity and user text", () => {
+  const result = normalizePiEvent({
+    type: "entry_appended",
+    entry: { type: "message", id: "entry-7", parentId: "entry-6", message: {
+      role: "user", content: [{ type: "text", text: "steering guidance" }],
+    } },
+  });
+  assert.deepEqual(result, {
+    type: "entry_appended",
+    data: { entryId: "entry-7", parentId: "entry-6", entryType: "message", role: "user", text: "steering guidance" },
+  });
+});
+
 test("normalizes Pi text deltas without exposing the raw event", () => {
   const normalized = normalizePiEvent({
     type: "message_update",

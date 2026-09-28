@@ -8,6 +8,8 @@ import {
   getChangedFiles,
   getCurrentBranch,
   getDiff,
+  getGitOperationState,
+  getCheckpointStateToken,
   createCheckpointCommit,
   getHeadSha,
   getStatus,
@@ -18,6 +20,7 @@ interface TaskProjectRow {
   task_id: string;
   project_id: string;
   worktree_path: string | null;
+  agent_branch: string | null;
   root_path: string;
   worktree_root: string | null;
   ide_command: string | null;
@@ -30,6 +33,20 @@ export interface TaskWorktree {
   baseCommitSha: string;
   agentBranch: string;
   worktreePath: string;
+}
+
+export interface CheckpointPreview {
+  trackedChanges: string[];
+  untrackedFiles: string[];
+  branch: string;
+  commitSha: string;
+  stateToken: string;
+}
+
+function sameCheckpointPreview(left: CheckpointPreview, right: CheckpointPreview): boolean {
+  return JSON.stringify(left.trackedChanges) === JSON.stringify(right.trackedChanges) &&
+    JSON.stringify(left.untrackedFiles) === JSON.stringify(right.untrackedFiles) &&
+    left.branch === right.branch && left.commitSha === right.commitSha && left.stateToken === right.stateToken;
 }
 
 function isWithin(parent: string, candidate: string): boolean {
@@ -53,6 +70,7 @@ export class WorktreeManager {
       tasks.id AS task_id,
       tasks.project_id AS project_id,
       tasks.worktree_path AS worktree_path,
+      tasks.agent_branch AS agent_branch,
       projects.root_path AS root_path,
       projects.worktree_root AS worktree_root,
       projects.ide_command AS ide_command
@@ -130,18 +148,35 @@ export class WorktreeManager {
     return getStatus(path);
   }
 
-  async createCheckpoint(taskId: string): Promise<string> {
+  async createCheckpoint(taskId: string, expected?: CheckpointPreview): Promise<string> {
+    const current = await this.previewCheckpoint(taskId);
+    if (expected && !sameCheckpointPreview(current, expected)) {
+      throw new Error("Task worktree changed; review the checkpoint contents again.");
+    }
+    if (current.trackedChanges.length === 0 && current.untrackedFiles.length === 0) {
+      throw new Error("There are no changes to checkpoint.");
+    }
     const { path } = this.getTaskWorktreePath(taskId);
-    return createCheckpointCommit(path, `Checkpoint task ${taskId}`);
+    return createCheckpointCommit(path, `Checkpoint task ${taskId}`, current.branch);
   }
 
-  async previewCheckpoint(taskId: string): Promise<{ trackedChanges: string[]; untrackedFiles: string[]; commitSha: string }> {
-    const { path } = this.getTaskWorktreePath(taskId);
+  async previewCheckpoint(taskId: string): Promise<CheckpointPreview> {
+    const { row, path } = this.getTaskWorktreePath(taskId);
+    const branch = await getCurrentBranch(path);
+    if (!row.agent_branch || branch !== row.agent_branch) {
+      throw new Error(`Task worktree branch changed; expected ${row.agent_branch ?? "the configured task branch"}.`);
+    }
+    const operation = await getGitOperationState(path);
+    if (operation.operation) throw new Error(`Cannot checkpoint while a Git ${operation.operation.toLowerCase()} operation is in progress.`);
     const status = await getStatus(path);
+    const commitSha = await getHeadSha(path);
+    const stateToken = await getCheckpointStateToken(path);
     return {
       trackedChanges: status.filter((file) => !file.untracked).map((file) => file.path),
       untrackedFiles: status.filter((file) => file.untracked).map((file) => file.path),
-      commitSha: await getHeadSha(path),
+      branch,
+      commitSha,
+      stateToken,
     };
   }
 

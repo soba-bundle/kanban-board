@@ -6,9 +6,13 @@ import {
   CreateTicketCommentSchema,
   ImplementationHandoverSchema,
   InvestigationHandoverSchema,
+  LiveEventSchema,
+  LiveHistorySnapshotSchema,
   RunReasonCodeSchema,
+  RunInputSchema,
+  RunMessageSchema,
+  StartRunSchema,
   TaskRunSummarySchema,
-  SteerRunSchema,
   TicketCommentSchema,
   handoverSchemaForStage,
   ProjectSchema,
@@ -57,6 +61,7 @@ test("task schema validates workflow state and required fields", () => {
     description: "Details",
     workflow_state: "TODO",
     review_tag: null,
+    latest_task_commit_sha: null,
     created_at: timestamp,
     updated_at: timestamp,
   };
@@ -109,10 +114,61 @@ test("ticket comment schema validates delivery metadata", () => {
   assert.equal(TicketCommentSchema.safeParse({ ...comment, delivery_type: "EMAIL" }).success, false);
   assert.equal(CreateTicketCommentSchema.safeParse({ content: " note " }).success, true);
   assert.equal(CreateTicketCommentSchema.safeParse({ content: "   " }).success, false);
-  assert.equal(SteerRunSchema.safeParse({ text: "focus on the parser" }).success, true);
-  assert.equal(SteerRunSchema.safeParse({ text: "" }).success, false);
+
   assert.equal(RunReasonCodeSchema.safeParse("HANDOVER_FAILED").success, true);
   assert.equal(RunReasonCodeSchema.safeParse("GAVE_UP").success, false);
+});
+
+test("Phase 6A run contracts require explicit prompts and stable input identities", () => {
+  const start = {
+    task_id: "t1",
+    stage: "INVESTIGATION",
+    prompt: "  Inspect the retry behavior  ",
+    idempotency_key: "start-1",
+  };
+  assert.equal(StartRunSchema.safeParse(start).success, true);
+  assert.equal(StartRunSchema.safeParse({ ...start, reused_from_input_id: "prior-input" }).success, true);
+  assert.equal(StartRunSchema.safeParse({ ...start, reused_from_input_id: "  " }).success, false);
+  assert.equal(StartRunSchema.safeParse({ ...start, prompt: "  " }).success, false);
+  assert.equal(StartRunSchema.safeParse({ ...start, stage: "VALIDATION_REVIEW" }).success, false);
+  assert.equal(StartRunSchema.safeParse({ ...start, idempotency_key: "" }).success, false);
+
+  assert.equal(RunMessageSchema.safeParse({ input_id: "input-1", text: " Check edge cases " }).success, true);
+  assert.equal(RunMessageSchema.safeParse({ input_id: "input-1", text: "  " }).success, false);
+  assert.equal(RunMessageSchema.safeParse({ input_id: "", text: "valid" }).success, false);
+  assert.equal(RunMessageSchema.safeParse({
+    input_id: "input-2", text: "Reuse guidance", reused_from_input_id: "input-1",
+  }).success, true);
+
+  const input = {
+    id: "input-1", task_id: "t1", run_id: "r1", sequence: 1, idempotency_key: "start-1",
+    content: "Inspect the retry behavior", delivery_type: "INITIAL_PROMPT", delivery_status: "PENDING",
+    accepted_at: timestamp, delivered_at: null, session_id: null, session_sequence: null,
+    transcript_boundary_entry_id: null, transcript_entry_id: null,
+    failure_reason: null, reused_from_input_id: null,
+  };
+  assert.equal(RunInputSchema.safeParse(input).success, true);
+  assert.equal(RunInputSchema.safeParse({ ...input, delivery_status: "SENT" }).success, false);
+  assert.equal(RunInputSchema.safeParse({ ...input, delivery_type: "COMMENT" }).success, false);
+});
+
+test("Live history contracts carry stable transcript identities and sequenced cursors", () => {
+  const event = {
+    eventId: "run-1:4", sequence: 4, taskId: "t1", runId: "r1", type: "message_update",
+    timestamp, data: { delta: "text" },
+  };
+  assert.equal(LiveEventSchema.safeParse(event).success, true);
+  assert.equal(LiveEventSchema.safeParse({ ...event, sequence: 0 }).success, false);
+  const snapshot = {
+    task_id: "t1", session_id: "s1", active_run_id: "r1", cursor: 4, provisional_truncated: false,
+    entries: [{
+      id: "s1:e1", entry_id: "e1", session_id: "s1", run_id: "r1", timestamp, role: "user",
+      message: { role: "user", content: [{ type: "text", text: "hello" }] },
+    }],
+    inputs: [], provisional_events: [event],
+  };
+  assert.equal(LiveHistorySnapshotSchema.safeParse(snapshot).success, true);
+  assert.equal(LiveHistorySnapshotSchema.safeParse({ ...snapshot, cursor: -1 }).success, false);
 });
 
 test("handover schemas enforce stage-specific contracts and default lists", () => {

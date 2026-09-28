@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LiveEventSchema } from "./live-events.js";
 export { LiveEventSchema } from "./live-events.js";
 export type { LiveEvent } from "./live-events.js";
 export {
@@ -51,6 +52,7 @@ export const RunReasonCodeSchema = z.enum([
   "USER_STOPPED",
   "BACKEND_INTERRUPTED",
   "HANDOVER_FAILED",
+  "INPUT_DELIVERY_FAILED",
 ]);
 export type RunReasonCode = z.infer<typeof RunReasonCodeSchema>;
 
@@ -92,6 +94,7 @@ export const TaskSchema = z.object({
   description: z.string(),
   workflow_state: WorkflowStateSchema,
   review_tag: ReviewTagSchema.nullable(),
+  latest_task_commit_sha: z.string().nullable(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
 });
@@ -146,7 +149,6 @@ export type TicketComment = z.infer<typeof TicketCommentSchema>;
 
 export const CreateTicketCommentSchema = z.object({ content: z.string().trim().min(1) });
 export const UpdateTicketCommentSchema = CreateTicketCommentSchema;
-export const SteerRunSchema = z.object({ text: z.string().trim().min(1) });
 
 export const TaskRunSummarySchema = z.object({
   id: z.string().min(1),
@@ -179,11 +181,85 @@ export const QueueSnapshotSchema = z.object({
 export type QueueItem = z.infer<typeof QueueItemSchema>;
 export type QueueSnapshot = z.infer<typeof QueueSnapshotSchema>;
 export const EnqueueTaskSchema = z.object({ stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]) });
-export const CheckpointConfirmationSchema = z.object({ include_untracked_files: z.array(z.string()).optional() });
+export const StartRunSchema = z.object({
+  task_id: z.string().trim().min(1),
+  stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]),
+  prompt: z.string().trim().min(1),
+  idempotency_key: z.string().trim().min(1),
+  reused_from_input_id: z.string().trim().min(1).optional(),
+});
+export const RunMessageSchema = z.object({
+  input_id: z.string().trim().min(1),
+  text: z.string().trim().min(1),
+  reused_from_input_id: z.string().trim().min(1).optional(),
+});
+export const RunInputDeliveryTypeSchema = z.enum(["INITIAL_PROMPT", "QUEUED_INPUT", "STEERING"]);
+export const RunInputDeliveryStatusSchema = z.enum([
+  "PENDING",
+  "ACCEPTED",
+  "DELIVERED",
+  "UNDELIVERED",
+  "DELIVERY_UNKNOWN",
+  "CANCELLED",
+]);
+export const RunInputSchema = z.object({
+  id: z.string().min(1),
+  task_id: z.string().min(1),
+  run_id: z.string().min(1),
+  sequence: z.number().int().positive(),
+  idempotency_key: z.string().min(1),
+  content: z.string().min(1),
+  delivery_type: RunInputDeliveryTypeSchema,
+  delivery_status: RunInputDeliveryStatusSchema,
+  accepted_at: z.string().datetime(),
+  delivered_at: z.string().datetime().nullable(),
+  session_id: z.string().min(1).nullable(),
+  session_sequence: z.number().int().positive().nullable(),
+  transcript_boundary_entry_id: z.string().min(1).nullable(),
+  transcript_entry_id: z.string().min(1).nullable(),
+  failure_reason: z.string().nullable(),
+  reused_from_input_id: z.string().min(1).nullable(),
+});
+export type StartRun = z.infer<typeof StartRunSchema>;
+export type RunMessage = z.infer<typeof RunMessageSchema>;
+export type RunInput = z.infer<typeof RunInputSchema>;
+
+export const LiveHistoryEntrySchema = z.object({
+  id: z.string().min(1),
+  entry_id: z.string().min(1),
+  session_id: z.string().min(1),
+  run_id: z.string().min(1).nullable(),
+  timestamp: z.string().datetime(),
+  role: z.string().min(1),
+  message: z.record(z.unknown()),
+});
+export const LiveHistorySnapshotSchema = z.object({
+  task_id: z.string().min(1),
+  session_id: z.string().min(1).nullable(),
+  active_run_id: z.string().min(1).nullable(),
+  cursor: z.number().int().nonnegative(),
+  provisional_truncated: z.boolean(),
+  entries: z.array(LiveHistoryEntrySchema),
+  inputs: z.array(RunInputSchema),
+  provisional_events: z.array(LiveEventSchema),
+});
+export type LiveHistoryEntry = z.infer<typeof LiveHistoryEntrySchema>;
+export type LiveHistorySnapshot = z.infer<typeof LiveHistorySnapshotSchema>;
+
+export const CheckpointConfirmationSchema = z.object({
+  tracked_changes: z.array(z.string()),
+  include_untracked_files: z.array(z.string()),
+  branch: z.string().min(1),
+  commit_sha: z.string().min(1),
+  state_token: z.string().min(1),
+});
+export type CheckpointConfirmation = z.infer<typeof CheckpointConfirmationSchema>;
 export const CheckpointPreviewSchema = z.object({
   tracked_changes: z.array(z.string()),
   untracked_files: z.array(z.string()),
-  commit_sha: z.string().nullable(),
+  branch: z.string().min(1),
+  commit_sha: z.string().min(1),
+  state_token: z.string().min(1),
 });
 export type CheckpointPreview = z.infer<typeof CheckpointPreviewSchema>;
 export const CheckpointDiffSchema = z.object({

@@ -120,10 +120,12 @@ test("run WebSocket receives normalized live events from its task session", asyn
   t.after(async () => { socket?.terminate(); await app.close(); agents.dispose("task-1"); db.close(); });
 
   await app.ready();
-  const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: { stage: "INVESTIGATION" } });
+  const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
+    task_id: "task-1", stage: "INVESTIGATION", prompt: "Investigate the issue", idempotency_key: "start-run-1",
+  } });
   assert.equal(response.statusCode, 201);
   const runId = response.json().run_id;
-  socket = await app.injectWS(`/api/runs/${runId}/events`);
+  socket = await app.injectWS(`/api/tasks/task-1/runs/${runId}/events`);
   const received = new Promise((resolve, reject) => {
     socket.once("message", (data) => resolve(JSON.parse(data.toString())));
     socket.once("error", reject);

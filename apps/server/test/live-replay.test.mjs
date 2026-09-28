@@ -81,15 +81,69 @@ test("joining Live mid-run replays earlier output before streaming new events", 
   getSession().emitDelta("first ");
   getSession().emitDelta("second ");
 
-  const socket = await app.injectWS("/api/runs/run-1/events");
+  const socket = await app.injectWS("/api/tasks/task-1/runs/run-1/events");
   const incoming = collect(socket, 3);
   getSession().emitDelta("third");
   const events = await incoming;
 
   assert.deepEqual(events.map((event) => event.data.delta), ["first ", "second ", "third"]);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3]);
+  assert.deepEqual(events.map((event) => event.eventId), ["run-1:1", "run-1:2", "run-1:3"]);
   assert.deepEqual([...new Set(events.map((event) => event.runId))], ["run-1"]);
   socket.terminate();
   getSession().finishPrompt();
+});
+
+test("reconnect replays only events after the supplied sequence cursor", async (t) => {
+  const { db, agents, runs, getSession } = makeFixture(t);
+  const app = await startApp(t, db, agents);
+  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  await waitFor(() => getSession()?.promptStarted === true);
+  getSession().emitDelta("one");
+  getSession().emitDelta("two");
+  getSession().emitDelta("three");
+
+  const socket = await app.injectWS("/api/tasks/task-1/runs/run-1/events?after=2");
+  const events = await collect(socket, 1);
+  assert.deepEqual(events.map((event) => [event.sequence, event.data.delta]), [[3, "three"]]);
+  socket.terminate();
+  getSession().finishPrompt();
+});
+
+test("an expired replay cursor signals a gap and sends the bounded tail", async (t) => {
+  const { db, agents, runs, getSession } = makeFixture(t, 2);
+  const app = await startApp(t, db, agents);
+  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  await waitFor(() => getSession()?.promptStarted === true);
+  for (const text of ["a", "b", "c", "d"]) getSession().emitDelta(text);
+
+  const socket = await app.injectWS("/api/tasks/task-1/runs/run-1/events?after=0");
+  const events = await collect(socket, 3);
+  assert.equal(events[0].type, "replay_gap");
+  assert.deepEqual(events.slice(1).map((event) => [event.sequence, event.data.delta]), [[3, "c"], [4, "d"]]);
+  socket.terminate();
+  getSession().finishPrompt();
+});
+
+test("a run socket receives only events scoped to its task and run", async (t) => {
+  const { db, agents } = makeFixture(t);
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
+    VALUES ('task-2', 'project-1', 'Other Task', '', 'IN_PROGRESS', ?, ?)`).run(now, now);
+  db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
+    VALUES ('run-2', 'task-2', 'INVESTIGATION', 1, 'RUNNING')`).run();
+  const app = await startApp(t, db, agents);
+  const socket1 = await app.injectWS("/api/tasks/task-1/runs/run-1/events");
+  const socket2 = await app.injectWS("/api/tasks/task-2/runs/run-2/events");
+  const event1 = collect(socket1, 1);
+  const event2 = collect(socket2, 1);
+  agents.publish("task-1", "run-1", "test_event", { value: "one" });
+  agents.publish("task-2", "run-2", "test_event", { value: "two" });
+  const [received1, received2] = await Promise.all([event1, event2]);
+  assert.deepEqual(received1.map((event) => [event.taskId, event.runId, event.data.value]), [["task-1", "run-1", "one"]]);
+  assert.deepEqual(received2.map((event) => [event.taskId, event.runId, event.data.value]), [["task-2", "run-2", "two"]]);
+  socket1.terminate();
+  socket2.terminate();
 });
 
 test("replay is bounded and dropped once the run finishes", async (t) => {

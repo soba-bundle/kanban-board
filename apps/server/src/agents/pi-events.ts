@@ -43,6 +43,23 @@ export function normalizePiEvent(event: AgentSessionEvent): NormalizedPiEvent {
           .join("");
       }
     }
+  } else if (event.type === "entry_appended") {
+    const entry = source.entry as Record<string, unknown> | undefined;
+    if (entry) {
+      data.entryId = entry.id;
+      data.parentId = entry.parentId;
+      data.entryType = entry.type;
+      const message = entry.message as Record<string, unknown> | undefined;
+      if (entry.type === "message" && message) {
+        data.role = message.role;
+        if (Array.isArray(message.content)) {
+          data.text = (message.content as Array<Record<string, unknown>>)
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("");
+        }
+      }
+    }
   } else if (event.type === "queue_update") {
     data.steeringCount = (source.steering as unknown[] | undefined)?.length ?? 0;
     data.followUpCount = (source.followUp as unknown[] | undefined)?.length ?? 0;

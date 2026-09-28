@@ -19,6 +19,12 @@ function makeDb(taskCount = 3) {
   return db;
 }
 
+let inputSequence = 0;
+function enqueue(queue, taskId, stage, prompt = `Explicit prompt ${inputSequence + 1}`) {
+  inputSequence++;
+  return queue.enqueueTask(taskId, stage, prompt, `request-${inputSequence}`);
+}
+
 function makeFakeRuns(db) {
   const active = new Set();
   const started = [];
@@ -60,9 +66,9 @@ test("global queue preserves order, supports reorder/remove, and respects concur
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
 
-  const first = queue.enqueueTask("task-1", "INVESTIGATION");
-  const second = queue.enqueueTask("task-2", "IMPLEMENTATION");
-  const third = queue.enqueueTask("task-3", "INVESTIGATION");
+  const first = enqueue(queue, "task-1", "INVESTIGATION");
+  const second = enqueue(queue, "task-2", "IMPLEMENTATION");
+  const third = enqueue(queue, "task-3", "INVESTIGATION");
   assert.deepEqual(fakeRuns.started, [first.run_id]);
   assert.equal(queue.getSnapshot().active_count, 1);
 
@@ -70,6 +76,7 @@ test("global queue preserves order, supports reorder/remove, and respects concur
   assert.deepEqual(queue.getSnapshot().jobs.filter((job) => job.job_status === "QUEUED").map((job) => job.job_id), [third.job_id, second.job_id]);
   queue.remove(second.job_id);
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = ?").get(second.run_id).status, "CANCELLED");
+  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE run_id = ?").get(second.run_id).delivery_status, "UNDELIVERED");
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-2'").get().workflow_state, "TODO");
 
   fakeRuns.releases.get(first.run_id)();
@@ -91,13 +98,53 @@ test("completed Review tasks can continue with another run and cancellation rest
     await waitFor(() => queue.getSnapshot().active_count === 0);
     db.close();
   });
-  queue.enqueueTask("task-2", "INVESTIGATION");
-  const queued = queue.enqueueTask("task-1", "INVESTIGATION");
+  enqueue(queue, "task-2", "INVESTIGATION");
+  const queued = enqueue(queue, "task-1", "INVESTIGATION");
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "IN_PROGRESS");
   queue.remove(queued.job_id);
   assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
     workflow_state: "REVIEW", review_tag: "IMPLEMENTATION_COMPLETE",
   });
+});
+
+test("a new run can explicitly reuse unresolved guidance as a linked initial input", async (t) => {
+  const db = makeDb(1);
+  db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED' WHERE id = 'task-1'`).run();
+  db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
+    VALUES ('old-run', 'task-1', 'IMPLEMENTATION', 1, 'INTERRUPTED')`).run();
+  db.prepare(`INSERT INTO run_inputs (id, task_id, run_id, sequence, idempotency_key, content, delivery_type,
+    delivery_status, accepted_at) VALUES ('uncertain-input', 'task-1', 'old-run', 1, 'old-input', 'retry this',
+    'STEERING', 'DELIVERY_UNKNOWN', ?)`)
+    .run(new Date().toISOString());
+  const fakeRuns = makeFakeRuns(db);
+  const queue = new QueueManager(db, fakeRuns, 1);
+  queue.initialize();
+  t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
+  const queued = queue.enqueueTask("task-1", "IMPLEMENTATION", "retry this", "retry-key", "uncertain-input");
+  const linked = db.prepare(`SELECT reused_from_input_id, content FROM run_inputs WHERE run_id = ? AND delivery_type = 'INITIAL_PROMPT'`)
+    .get(queued.run_id);
+  assert.deepEqual(linked, { reused_from_input_id: "uncertain-input", content: "retry this" });
+  fakeRuns.releases.get(queued.run_id)();
+  await waitFor(() => queue.getSnapshot().active_count === 0);
+
+  db.prepare("UPDATE run_inputs SET delivery_status = 'DELIVERED' WHERE id = 'uncertain-input'").run();
+  db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED' WHERE id = 'task-1'").run();
+  assert.throws(() => queue.enqueueTask("task-1", "IMPLEMENTATION", "retry this", "new-key", "uncertain-input"), /Only undelivered or delivery-unknown/);
+});
+
+test("interrupted Review tasks can be safely recovered with a new explicit prompt", async (t) => {
+  const db = makeDb(1);
+  db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED' WHERE id = 'task-1'").run();
+  const fakeRuns = makeFakeRuns(db);
+  const queue = new QueueManager(db, fakeRuns, 1);
+  queue.initialize();
+  t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
+
+  const queued = enqueue(queue, "task-1", "IMPLEMENTATION", "Recover with this new instruction");
+  assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "IN_PROGRESS");
+  assert.equal(db.prepare("SELECT content FROM run_inputs WHERE run_id = ?").get(queued.run_id).content, "Recover with this new instruction");
+  fakeRuns.releases.get(queued.run_id)();
+  await waitFor(() => queue.getSnapshot().active_count === 0);
 });
 
 test("queue routes enqueue tasks and expose the global queue snapshot", async (t) => {
@@ -109,16 +156,43 @@ test("queue routes enqueue tasks and expose the global queue snapshot", async (t
   registerQueueRoutes(app, queue);
   t.after(async () => { for (const release of fakeRuns.releases.values()) release(); await app.close(); db.close(); });
 
-  const invalid = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: { stage: "VALIDATION_REVIEW" } });
+  const invalid = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
+    task_id: "task-1", stage: "VALIDATION_REVIEW", prompt: "Invalid", idempotency_key: "bad",
+  } });
   assert.equal(invalid.statusCode, 400);
-  const enqueued = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: { stage: "INVESTIGATION" } });
+  const missingPrompt = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
+    task_id: "task-1", stage: "INVESTIGATION", idempotency_key: "missing-prompt",
+  } });
+  assert.equal(missingPrompt.statusCode, 400);
+  const payload = { task_id: "task-1", stage: "INVESTIGATION", prompt: "Look into the race", idempotency_key: "start-1" };
+  const enqueued = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
   assert.equal(enqueued.statusCode, 201);
   assert.ok(enqueued.json().run_id);
+  assert.equal(db.prepare("SELECT content FROM run_inputs WHERE run_id = ?").get(enqueued.json().run_id).content, payload.prompt);
+  const retry = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
+  assert.equal(retry.statusCode, 200);
+  assert.equal(retry.json().run_id, enqueued.json().run_id);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM task_runs").get().count, 1);
+  const conflictingRetry = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
+    ...payload, prompt: "Different instructions",
+  } });
+  assert.equal(conflictingRetry.statusCode, 409);
+  const wrongTask = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
+    ...payload, task_id: "task-other", idempotency_key: "other-key",
+  } });
+  assert.equal(wrongTask.statusCode, 400);
   const snapshot = await app.inject({ method: "GET", url: "/api/queue" });
   assert.equal(snapshot.statusCode, 200);
   assert.equal(snapshot.json().max_concurrent_agents, 1);
   assert.equal(snapshot.json().active_count, 1);
   assert.equal(snapshot.json().jobs[0].task_id, "task-1");
+
+  db.prepare("DELETE FROM agent_jobs WHERE id = ?").run(enqueued.json().job_id);
+  const delayedRetry = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
+  assert.equal(delayedRetry.statusCode, 200);
+  assert.equal(delayedRetry.json().run_id, enqueued.json().run_id);
+  assert.equal(delayedRetry.json().job_id, null);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM task_runs").get().count, 1);
 });
 
 test("Stop Run aborts an active session and records USER_STOPPED / Interrupted", async (t) => {
@@ -147,7 +221,7 @@ test("Stop Run aborts an active session and records USER_STOPPED / Interrupted",
   registerQueueRoutes(app, queue);
   t.after(async () => { await app.close(); agents.dispose("task-1"); db.close(); });
 
-  const queued = queue.enqueueTask("task-1", "INVESTIGATION");
+  const queued = enqueue(queue, "task-1", "INVESTIGATION");
   await waitFor(() => session?.promptStarted === true);
   const stopped = await app.inject({ method: "POST", url: `/api/runs/${queued.run_id}/stop` });
   assert.equal(stopped.statusCode, 200);
@@ -178,7 +252,7 @@ test("Stop Run during worktree setup prevents the agent prompt from starting", a
 
   db.prepare(`INSERT INTO ticket_comments (id, task_id, author_type, content, delivery_status, created_at)
     VALUES ('c-1', 'task-1', 'USER', 'undelivered note', 'PENDING', ?)`).run(new Date().toISOString());
-  const queued = queue.enqueueTask("task-1", "INVESTIGATION");
+  const queued = enqueue(queue, "task-1", "INVESTIGATION");
   await worktreeStarted;
   const stopped = await app.inject({ method: "POST", url: `/api/runs/${queued.run_id}/stop` });
   assert.equal(stopped.statusCode, 200);
@@ -187,6 +261,7 @@ test("Stop Run during worktree setup prevents the agent prompt from starting", a
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = ?").get(queued.run_id).status, "INTERRUPTED");
   // Nothing reached the model, so the comment must still be pending for the next run.
   assert.equal(db.prepare("SELECT delivery_status FROM ticket_comments WHERE id = 'c-1'").get().delivery_status, "PENDING");
+  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE run_id = ?").get(queued.run_id).delivery_status, "UNDELIVERED");
 });
 
 test("queue dispatches up to maxConcurrentAgents and recovers interrupted claims safely", async (t) => {
@@ -196,9 +271,9 @@ test("queue dispatches up to maxConcurrentAgents and recovers interrupted claims
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
 
-  const first = queue.enqueueTask("task-1", "INVESTIGATION");
-  const second = queue.enqueueTask("task-2", "IMPLEMENTATION");
-  const third = queue.enqueueTask("task-3", "INVESTIGATION");
+  const first = enqueue(queue, "task-1", "INVESTIGATION");
+  const second = enqueue(queue, "task-2", "IMPLEMENTATION");
+  const third = enqueue(queue, "task-3", "INVESTIGATION");
   assert.deepEqual(fakeRuns.started, [first.run_id, second.run_id]);
   assert.equal(queue.getSnapshot().active_count, 2);
   fakeRuns.releases.get(first.run_id)();
@@ -213,9 +288,18 @@ test("queue dispatches up to maxConcurrentAgents and recovers interrupted claims
     VALUES ('stale-run', 'task-1', 'INVESTIGATION', 2, 'RUNNING')`).run();
   db.prepare(`INSERT INTO agent_jobs (id, task_run_id, queue_position, priority, status, created_at, started_at)
     VALUES ('stale-job', 'stale-run', 1, 0, 'CLAIMED', ?, ?)`).run(now, now);
+  db.prepare(`INSERT INTO run_inputs (id, task_id, run_id, sequence, idempotency_key, content,
+    delivery_type, delivery_status, accepted_at) VALUES
+    ('stale-pending', 'task-1', 'stale-run', 1, 'stale-pending', 'pending', 'STEERING', 'PENDING', ?),
+    ('stale-accepted', 'task-1', 'stale-run', 2, 'stale-accepted', 'accepted', 'STEERING', 'ACCEPTED', ?)`)
+    .run(now, now);
   queue.initialize();
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = 'stale-run'").get().status, "INTERRUPTED");
   assert.equal(db.prepare("SELECT reason_code FROM task_runs WHERE id = 'stale-run'").get().reason_code, "BACKEND_INTERRUPTED");
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "REVIEW");
   assert.equal(db.prepare("SELECT status FROM agent_jobs WHERE id = 'stale-job'").get().status, "FINISHED");
+  assert.deepEqual(db.prepare("SELECT id, delivery_status FROM run_inputs WHERE run_id = 'stale-run' ORDER BY sequence").all(), [
+    { id: "stale-pending", delivery_status: "UNDELIVERED" },
+    { id: "stale-accepted", delivery_status: "DELIVERY_UNKNOWN" },
+  ]);
 });

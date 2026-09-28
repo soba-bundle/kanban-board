@@ -14,6 +14,7 @@ import { registerRunRoutes } from "./agents/run-routes.js";
 import { QueueManager } from "./queue/queue-manager.js";
 import { WorktreeManager } from "./git/worktree-manager.js";
 import { registerQueueRoutes } from "./queue/queue-routes.js";
+import { TaskOperationCoordinator } from "./task-operation-coordinator.js";
 
 const databasePath = process.env.KANBAN_DB_PATH ?? "data/kanban.sqlite";
 const db = openDatabase(databasePath);
@@ -28,7 +29,8 @@ const app = Fastify();
 installLocalRequestGuards(app, Number(process.env.PORT ?? 3000));
 registerProjectRoutes(app, db);
 const worktreeManager = new WorktreeManager(db);
-registerTaskRoutes(app, db, worktreeManager);
+const taskOperations = new TaskOperationCoordinator();
+registerTaskRoutes(app, db, worktreeManager, taskOperations);
 registerCommentRoutes(app, db);
 registerTaskRunRoutes(app, db);
 const agentManager = new AgentManager(db);
@@ -37,7 +39,7 @@ const runManager = new RunManager(db, agentManager);
 registerRunRoutes(app, runManager);
 const queueManager = new QueueManager(db, runManager, undefined, worktreeManager);
 queueManager.initialize();
-registerQueueRoutes(app, queueManager);
+registerQueueRoutes(app, queueManager, taskOperations);
 
 app.get("/health", async () => {
   db.prepare("SELECT 1").get();

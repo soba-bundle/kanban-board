@@ -263,19 +263,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .create-dialog select option { background: #151a26; }
 .optional-label { margin-left: 4px; color: #707b90; font-size: 9px; font-weight: 400; }
 .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-top: 5px; }
-.dialog-actions-block { flex-direction: column; flex-wrap: nowrap; margin-top: 16px; gap: 9px; }
-.button-block { width: 100%; min-height: 42px; padding: 0 14px; font-size: 13px; }
 .start-subtitle { margin: 4px 0 0; font-size: 13px; }
-.start-options { display: flex; flex-direction: column; gap: 9px; margin-top: 16px; }
-.start-option { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 13px; border: 1px solid rgba(185, 198, 224, 0.13); border-radius: 10px; background: rgba(255, 255, 255, 0.02); text-align: left; transition: border-color 140ms ease, background 140ms ease, transform 140ms ease; }
-.start-option:hover:not(:disabled) { border-color: rgba(181, 164, 255, 0.4); background: rgba(143, 120, 240, 0.08); transform: translateY(-1px); }
-.start-option-icon { width: 20px; height: 20px; flex: 0 0 20px; margin-top: 1px; fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
-.start-option-icon.icon-impl { stroke: #b79bff; fill: rgba(143, 120, 240, 0.18); }
-.start-option-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.start-option-title { color: #f0f1f7; font-size: 13px; font-weight: 600; }
-.start-option-desc { color: #97a1b4; font-size: 11px; line-height: 1.45; }
-.spinner { width: 16px; height: 16px; flex: 0 0 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-dasharray: 30 40; animation: spin 0.7s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
+.start-stage-picker { display: flex; flex-wrap: wrap; gap: 9px; margin: 16px 0; padding: 0; border: 0; }
+.start-stage-picker legend { width: 100%; margin-bottom: 6px; color: #c7cdda; font-size: 11px; font-weight: 600; }
+.start-stage-option { display: flex; align-items: center; gap: 7px; padding: 8px 11px; border: 1px solid rgba(185, 198, 224, 0.14); border-radius: 8px; color: #c7cdda; background: rgba(255, 255, 255, 0.02); font-size: 12px; cursor: pointer; }
+.start-stage-selected { border-color: rgba(181, 164, 255, 0.55); background: rgba(143, 120, 240, 0.12); color: #f0f1f7; }
+.start-stage-option input { accent-color: var(--accent); }
+.start-prompt-label { display: block; margin-bottom: 6px; color: #c7cdda; font-size: 11px; font-weight: 600; }
+.start-prompt { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid rgba(194, 204, 229, 0.18); border-radius: 8px; background: rgba(12, 16, 25, 0.8); color: #e6e9f1; font: inherit; font-size: 12.5px; resize: vertical; }
 .confirm-dialog .dialog-actions { margin: 16px 18px 18px; justify-content: flex-end; }
 .confirm-dialog .dialog-actions > button { min-width: 96px; min-height: 34px; padding: 7px 13px; border-radius: 8px; font-size: 12px; font-weight: 600; }
 .error { color: #ff929a !important; font-size: 11px; }
@@ -382,6 +377,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .handover-list-title { margin: 0 0 3px; color: #7d879b; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
 .handover-list ul { margin: 0; padding-left: 17px; color: #b4bccd; font-size: 12px; line-height: 1.55; }
 .live-log { max-height: 420px; margin: 0; overflow: auto; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: rgba(8, 11, 18, 0.85); color: #b8c0d0; font: 11.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.live-task-context { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, 0.025); }
+.live-conversation { display: flex; flex-direction: column; gap: 10px; }
+.live-message, .live-input-status { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(20, 25, 37, 0.7); }
+.live-message-user { border-color: rgba(156, 143, 232, 0.25); background: rgba(92, 76, 164, 0.1); }
+.live-message-header, .live-input-status header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #dfe3ec; font-size: 11px; }
+.live-message-header time { margin-left: auto; color: #727d92; font-size: 10px; }
+.live-message-text, .live-input-status p { margin: 8px 0 0; color: #c4cada; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.live-message-meta, .live-input-status small { display: block; margin-top: 8px; color: #778297; font-size: 10px; }
+.live-details { margin-top: 8px; color: #929db2; font-size: 11px; }
+.live-details summary { cursor: pointer; }
+.live-details p, .live-details pre { max-height: 220px; overflow: auto; margin: 7px 0 0; color: #9ea8bc; white-space: pre-wrap; overflow-wrap: anywhere; }
+.input-status { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(194, 204, 229, 0.1); color: #aab4c8; font-size: 10px; }
+.input-status-delivered { background: rgba(77, 174, 128, 0.13); color: #79d5a3; }
+.input-status-undelivered, .input-status-delivery_unknown { background: rgba(231, 161, 72, 0.14); color: #ffc477; }
+.live-input-status button { margin-top: 9px; }
+.live-provisional { max-height: none; margin-top: 4px; overflow: visible; }
+.composer-stage-picker { display: flex; flex-wrap: wrap; gap: 7px 16px; margin: 0 0 9px; padding: 0; border: 0; color: #aab4c8; font-size: 11px; }
+.composer-stage-picker legend { margin-bottom: 5px; color: #818ba0; font-size: 10px; }
+.composer-stage-picker label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 .ticket-composer { padding: 12px 18px 16px; border-top: 1px solid var(--line); background: rgba(14, 18, 28, 0.9); }
 .composer-hint { margin: 0 0 7px; color: #7d879b; font-size: 10.5px; line-height: 1.5; }
 .live-state { margin-bottom: 7px; }

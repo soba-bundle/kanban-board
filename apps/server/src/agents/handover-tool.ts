@@ -48,12 +48,12 @@ export function createHandoverTool(db: Database.Database, context: HandoverToolC
     name: "submit_handover",
     label: "Submit Handover",
     description: [
-      "Report the structured result of the current run. Call this exactly once, as your final action.",
+      "Report the structured result of the current run as your final action. If new user guidance arrives after a submission, process it and submit an updated final result.",
       "Investigation requires: confidence, outcome.",
       "Implementation requires: files_changed.",
     ].join(" "),
     promptSnippet: "submit_handover - report the structured result of this run before finishing",
-    promptGuidelines: ["Finish every Investigation or Implementation run by calling submit_handover."],
+    promptGuidelines: ["Finish every Investigation or Implementation run by calling submit_handover after processing the accepted user guidance."],
     parameters: HandoverParameters,
     execute: async (_toolCallId, params) => {
       const runId = context.activeRunId();
@@ -75,8 +75,10 @@ export function createHandoverTool(db: Database.Database, context: HandoverToolC
         throw new Error(`Handover rejected for ${run.stage}. Fix these fields and call submit_handover again: ${issues}`);
       }
 
-      db.prepare("UPDATE task_runs SET handover_json = ? WHERE id = ?")
-        .run(JSON.stringify(parsed.data), runId);
+      const inputWatermark = (db.prepare(`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_inputs
+        WHERE run_id = ? AND delivery_status = 'DELIVERED'`).get(runId) as { sequence: number }).sequence;
+      db.prepare("UPDATE task_runs SET handover_json = ?, handover_input_sequence = ? WHERE id = ?")
+        .run(JSON.stringify(parsed.data), inputWatermark, runId);
       return {
         content: [{ type: "text" as const, text: `Handover recorded for this ${run.stage} run.` }],
         details: parsed.data,

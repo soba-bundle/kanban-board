@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { openDatabase } from "../dist/db.js";
-import { buildRunPrompt, markCommentsDelivered } from "../dist/agents/prompt-builder.js";
+import { buildRunPrompt } from "../dist/agents/prompt-builder.js";
 
 function makeDb(stage = "INVESTIGATION") {
   const db = openDatabase(":memory:");
@@ -11,65 +11,49 @@ function makeDb(stage = "INVESTIGATION") {
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Fix retry', 'Retries drop the abort signal.', 'IN_PROGRESS', ?, ?)`).run(now, now);
   db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
-    VALUES ('run-1', 'task-1', ?, 1, 'QUEUED')`).run(stage);
+    VALUES ('run-1', 'task-1', ?, 1, 'QUEUED'), ('run-2', 'task-1', ?, 2, 'QUEUED')`).run(stage, stage);
   return db;
 }
 
-function addComment(db, id, content, extra = {}) {
-  const { status = "PENDING", author = "USER", createdAt = new Date().toISOString() } = extra;
-  db.prepare(`INSERT INTO ticket_comments (id, task_id, author_type, content, delivery_status, created_at)
-    VALUES (?, 'task-1', ?, ?, ?, ?)`).run(id, author, content, status, createdAt);
+function addInput(db, id, runId, sequence, content, deliveryType = "QUEUED_INPUT", status = "PENDING") {
+  db.prepare(`INSERT INTO run_inputs (id, task_id, run_id, sequence, idempotency_key, content,
+    delivery_type, delivery_status, accepted_at) VALUES (?, 'task-1', ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, runId, sequence, id, content, deliveryType, status, new Date().toISOString());
 }
 
-test("prompt carries stage, task details, and no comment section when none are pending", (t) => {
+test("prompt puts explicit user instructions before task description and carries stage/title context", (t) => {
   const db = makeDb();
   t.after(() => db.close());
+  addInput(db, "initial", "run-1", 1, "Inspect the retry behavior", "INITIAL_PROMPT");
   const prompt = buildRunPrompt(db, "run-1");
   assert.match(prompt.text, /^Investigate this task\./);
   assert.match(prompt.text, /Title: Fix retry/);
+  assert.ok(prompt.text.indexOf("Inspect the retry behavior") < prompt.text.indexOf("Task description:"));
   assert.match(prompt.text, /Retries drop the abort signal\./);
-  assert.doesNotMatch(prompt.text, /New comments/);
   assert.deepEqual(prompt.commentIds, []);
   assert.throws(() => buildRunPrompt(db, "missing"), /not found/);
 });
 
-test("implementation stage and pending comments are folded into the prompt in order", (t) => {
+test("prompt combines only that run's queued guidance once in accepted order", (t) => {
   const db = makeDb("IMPLEMENTATION");
   t.after(() => db.close());
-  addComment(db, "c-2", "second note", { createdAt: "2025-01-02T00:00:00.000Z" });
-  addComment(db, "c-1", "first note", { createdAt: "2025-01-01T00:00:00.000Z" });
-  addComment(db, "c-sent", "already sent", { status: "DELIVERED" });
-  addComment(db, "c-queued", "steering in flight", { status: "QUEUED" });
-  addComment(db, "c-agent", "agent chatter", { author: "AGENT" });
+  addInput(db, "initial", "run-1", 1, "Implement the fix", "INITIAL_PROMPT");
+  addInput(db, "queued-2", "run-1", 3, "second note");
+  addInput(db, "queued-1", "run-1", 2, "first note");
+  addInput(db, "other-run", "run-2", 1, "must not leak", "INITIAL_PROMPT");
+  addInput(db, "delivered", "run-1", 4, "already delivered", "QUEUED_INPUT", "DELIVERED");
+  addInput(db, "steering", "run-1", 5, "belongs to active steering", "STEERING");
 
   const prompt = buildRunPrompt(db, "run-1");
   assert.match(prompt.text, /^Implement this task\./);
-  assert.match(prompt.text, /New comments from the user:\n- first note\n- second note/);
-  assert.doesNotMatch(prompt.text, /already sent|steering in flight|agent chatter/);
-  assert.deepEqual(prompt.commentIds, ["c-1", "c-2"]);
+  assert.ok(prompt.text.indexOf("Implement the fix") < prompt.text.indexOf("Task description:"));
+  assert.match(prompt.text, /Additional queued guidance:\n- first note\n- second note/);
+  assert.doesNotMatch(prompt.text, /must not leak|already delivered|belongs to active steering/);
+  assert.deepEqual(prompt.commentIds, []);
 });
 
-test("marking delivery stamps session metadata and never revives delivered comments", (t) => {
+test("a run without an explicit initial prompt cannot dispatch", (t) => {
   const db = makeDb();
   t.after(() => db.close());
-  addComment(db, "c-1", "please check logging");
-  addComment(db, "c-2", "and the timeout");
-
-  markCommentsDelivered(db, buildRunPrompt(db, "run-1").commentIds, "session-9", "run-1");
-  const rows = db.prepare("SELECT * FROM ticket_comments ORDER BY id").all();
-  for (const row of rows) {
-    assert.equal(row.delivery_status, "DELIVERED");
-    assert.equal(row.delivery_type, "NEXT_PROMPT");
-    assert.equal(row.delivered_session_id, "session-9");
-    assert.equal(row.delivered_run_id, "run-1");
-    assert.ok(row.delivered_at);
-  }
-
-  // A later run must not resend or restamp them.
-  const next = buildRunPrompt(db, "run-1");
-  assert.deepEqual(next.commentIds, []);
-  assert.doesNotMatch(next.text, /please check logging/);
-  markCommentsDelivered(db, ["c-1"], "session-10", "run-2");
-  assert.equal(db.prepare("SELECT delivered_session_id FROM ticket_comments WHERE id = 'c-1'").get().delivered_session_id, "session-9");
-  markCommentsDelivered(db, [], "session-10", "run-2");
+  assert.throws(() => buildRunPrompt(db, "run-1"), /no initial prompt/);
 });

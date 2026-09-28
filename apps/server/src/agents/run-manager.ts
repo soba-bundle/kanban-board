@@ -1,13 +1,16 @@
 import type Database from "better-sqlite3";
+import type { RunInput, ReviewTag } from "@kanban-board/shared";
 import { AgentManager } from "./agent-manager.js";
 import { markCommentsDelivered, revertCommentsToPending, type RunPrompt } from "./prompt-builder.js";
-import { markSteeringDelivered, recordSteeringQueued } from "./steering.js";
 import { readHandover } from "./handover-tool.js";
-import type { ReviewTag, TicketComment } from "@kanban-board/shared";
 
 const HANDOVER_RETRY_PROMPT = [
   "You ended the run without calling submit_handover.",
   "Call submit_handover now with the structured result of this run. Do not do any further work.",
+].join(" ");
+const HANDOVER_UPDATE_PROMPT = [
+  "Additional user guidance was processed after your current handover.",
+  "Update and resubmit the authoritative handover to account for all accepted guidance.",
 ].join(" ");
 
 const COMPLETION_TAG: Record<string, ReviewTag> = {
@@ -19,11 +22,20 @@ interface RunRow {
   task_id: string;
   stage: string;
   status: string;
+  session_id: string | null;
+  input_mode: string;
+}
+
+interface InputResult {
+  input: RunInput;
+  created: boolean;
 }
 
 export class RunManager {
   private readonly stopRequested = new Set<string>();
+  private readonly closingRuns = new Set<string>();
   private readonly activeRuns = new Map<string, Promise<void>>();
+  private readonly steeringQueues = new Map<string, Promise<void>>();
 
   constructor(private readonly db: Database.Database, private readonly agents: AgentManager) {}
 
@@ -41,16 +53,55 @@ export class RunManager {
     return completion;
   }
 
-  /** Send an explicit Live View steering message to the running working session. */
-  async steer(runId: string, text: string): Promise<TicketComment> {
+  /** Persist an input before acknowledging it; queued runs fold it into the start prompt. */
+  async steer(runId: string, inputId: string, text: string, reusedFromInputId?: string): Promise<InputResult> {
     const run = this.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found.`);
-    if (run.status !== "RUNNING") throw new Error(`Run ${runId} is not running.`);
-    await this.agents.steer(run.task_id, text);
-    // Recorded only once Pi has accepted the message into its steering queue.
-    const comment = recordSteeringQueued(this.db, run.task_id, runId, text);
-    this.agents.publish(run.task_id, runId, "comment_queued", { commentId: comment.id, content: comment.content });
-    return comment;
+    if (!["QUEUED", "RUNNING"].includes(run.status)) throw new Error(`Run ${runId} is not accepting messages.`);
+    if (this.closingRuns.has(runId)) throw new Error(`Run ${runId} is closing; refresh before sending.`);
+    const created = this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT run_id, content, reused_from_input_id FROM run_inputs WHERE id = ?").get(inputId) as
+        { run_id: string; content: string; reused_from_input_id: string | null } | undefined;
+      if (prior) {
+        if (prior.run_id !== runId || prior.content !== text || prior.reused_from_input_id !== (reusedFromInputId ?? null)) {
+          throw new Error("Input ID was already used for different guidance.");
+        }
+        return false;
+      }
+      let reusedFrom: string | null = null;
+      if (reusedFromInputId) {
+        const source = this.db.prepare(`SELECT task_id, content, delivery_status FROM run_inputs WHERE id = ?`)
+          .get(reusedFromInputId) as { task_id: string; content: string; delivery_status: string } | undefined;
+        if (!source || source.task_id !== run.task_id || !["UNDELIVERED", "DELIVERY_UNKNOWN"].includes(source.delivery_status)) {
+          throw new Error("Only undelivered or delivery-unknown guidance from this task can be reused.");
+        }
+        if (source.content !== text) throw new Error("Reused guidance must match the original text.");
+        reusedFrom = reusedFromInputId;
+      }
+      const sequence = (this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM run_inputs WHERE run_id = ?")
+        .get(runId) as { next: number }).next;
+      const sessionId = run.input_mode === "STEERING" ? run.session_id : null;
+      const sessionSequence = sessionId
+        ? (this.db.prepare("SELECT COALESCE(MAX(session_sequence), 0) + 1 AS next FROM run_inputs WHERE session_id = ?")
+          .get(sessionId) as { next: number }).next
+        : null;
+      const boundary = (this.db.prepare("SELECT transcript_end_entry_id FROM task_runs WHERE id = ?")
+        .get(runId) as { transcript_end_entry_id: string | null }).transcript_end_entry_id;
+      this.db.prepare(`INSERT INTO run_inputs (id, task_id, run_id, sequence, idempotency_key, content,
+        delivery_type, delivery_status, accepted_at, session_id, session_sequence,
+        transcript_boundary_entry_id, reused_from_input_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)`)
+        .run(inputId, run.task_id, runId, sequence, inputId, text,
+          run.input_mode === "QUEUED" ? "QUEUED_INPUT" : "STEERING", new Date().toISOString(),
+          sessionId, sessionSequence, boundary, reusedFrom);
+      return true;
+    })();
+
+    const input = this.getInput(inputId)!;
+    if (run.input_mode === "STEERING" && input.delivery_status === "PENDING") {
+      this.scheduleSteering(runId, inputId, text);
+    }
+    return { input, created };
   }
 
   async stop(runId: string): Promise<void> {
@@ -63,39 +114,102 @@ export class RunManager {
   }
 
   private async execute(runId: string, taskId: string, prompt: RunPrompt): Promise<void> {
-    const watcher = this.watchSteeringDelivery(runId, taskId);
-    const unwatch = watcher.unsubscribe;
+    const watcher = this.watchRunEvents(runId, taskId, prompt.inputIds ?? [], prompt.text);
     try {
       const session = await this.agents.getOrCreateWorkingSession(taskId);
-      this.db.prepare("UPDATE task_runs SET session_id = ?, session_file = ? WHERE id = ?")
-        .run(session.sessionId, session.sessionFile ?? null, runId);
+      const transcriptStart = session.sessionManager?.getLeafId() ?? null;
+      this.db.transaction(() => {
+        this.db.prepare(`UPDATE task_runs SET session_id = ?, session_file = ?, transcript_start_entry_id = ?
+          WHERE id = ?`).run(session.sessionId, session.sessionFile ?? null, transcriptStart, runId);
+        const initialInputs = prompt.inputIds ?? [];
+        let sessionSequence = (this.db.prepare("SELECT COALESCE(MAX(session_sequence), 0) AS current FROM run_inputs WHERE session_id = ?")
+          .get(session.sessionId) as { current: number }).current;
+        for (const inputId of initialInputs) {
+          sessionSequence++;
+          this.db.prepare(`UPDATE run_inputs SET session_id = ?, session_sequence = ?, transcript_boundary_entry_id = ?
+            WHERE id = ? AND run_id = ?`).run(session.sessionId, sessionSequence, transcriptStart, inputId, runId);
+        }
+        const pending = this.db.prepare(`SELECT id FROM run_inputs WHERE run_id = ? AND delivery_type = 'STEERING'
+          AND session_id IS NULL AND delivery_status = 'PENDING' ORDER BY sequence`).all(runId) as Array<{ id: string }>;
+        for (const input of pending) {
+          sessionSequence++;
+          this.db.prepare(`UPDATE run_inputs SET session_id = ?, session_sequence = ?, transcript_boundary_entry_id = ?
+            WHERE id = ?`).run(session.sessionId, sessionSequence, transcriptStart, input.id);
+        }
+      })();
       if (this.stopRequested.has(runId)) {
         this.markStopped(runId, taskId);
         return;
       }
       markCommentsDelivered(this.db, prompt.commentIds, session.sessionId, runId);
-      await this.agents.prompt(taskId, runId, prompt.text);
+      const promptPromise = this.agents.prompt(taskId, runId, prompt.text);
+      this.flushPendingSteering(runId);
+      await promptPromise;
+      this.closingRuns.add(runId);
+      await this.steeringQueues.get(runId);
       if (this.stopRequested.has(runId)) this.markStopped(runId, taskId);
       else await this.finishRun(runId, taskId);
     } catch (error) {
-      // The prompt never became a user message, so its comments were not seen by the model.
-      if (!watcher.sawUserMessage()) revertCommentsToPending(this.db, prompt.commentIds, runId);
       if (this.stopRequested.has(runId)) this.markStopped(runId, taskId);
-      else this.db.prepare("UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ? WHERE id = ?")
-        .run(new Date().toISOString(), error instanceof Error ? error.message : String(error), runId);
+      else {
+        const now = new Date().toISOString();
+        this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ? WHERE id = ?`)
+          .run(now, error instanceof Error ? error.message : String(error), runId);
+        if (!watcher.sawUserMessage()) revertCommentsToPending(this.db, prompt.commentIds, runId);
+        this.markInputsUnresolved(runId);
+      }
     } finally {
-      unwatch();
-      // The run is over, so its live buffer is no longer needed. Finished-run history
-      // is rebuilt from Pi JSONL (Phase 12), not from memory.
+      watcher.unsubscribe();
       this.agents.clearReplay(runId);
       this.stopRequested.delete(runId);
+      this.closingRuns.delete(runId);
+      this.steeringQueues.delete(runId);
     }
   }
 
-  /**
-   * Working runs must end with a valid handover. A run that does not gets one extra
-   * request; a second failure is routed to Review / RUN_FAILED.
-   */
+  private scheduleSteering(runId: string, inputId: string, text: string): void {
+    const previous = this.steeringQueues.get(runId) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(() => this.deliverSteering(runId, inputId, text));
+    this.steeringQueues.set(runId, next);
+    void next.catch(() => {});
+  }
+
+  private async deliverSteering(runId: string, inputId: string, text: string): Promise<void> {
+    const input = this.getInput(inputId);
+    if (!input || input.delivery_status !== "PENDING") return;
+    let run = this.getRun(runId);
+    if (!run || !["QUEUED", "RUNNING"].includes(run.status) || this.stopRequested.has(runId) || this.closingRuns.has(runId)) {
+      this.setInputStatus(inputId, "UNDELIVERED", "Run stopped or closed before Pi accepted the guidance.");
+      return;
+    }
+    while (this.agents.activeRunId(run.task_id) !== runId) {
+      run = this.getRun(runId);
+      if (!run || !["QUEUED", "RUNNING"].includes(run.status) || this.stopRequested.has(runId) || this.closingRuns.has(runId)) {
+        this.setInputStatus(inputId, "UNDELIVERED", "Run stopped or closed before Pi accepted the guidance.");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    this.db.prepare(`UPDATE run_inputs SET session_id = ?, session_sequence = (
+      SELECT COALESCE(MAX(session_sequence), 0) + 1 FROM run_inputs WHERE session_id = ?
+    ), transcript_boundary_entry_id = (SELECT transcript_end_entry_id FROM task_runs WHERE id = ?)
+      WHERE id = ? AND session_id IS NULL`).run(run.session_id, run.session_id, runId, inputId);
+    try {
+      await this.agents.steer(run.task_id, text);
+      this.db.prepare(`UPDATE run_inputs SET delivery_status = 'ACCEPTED'
+        WHERE id = ? AND delivery_status = 'PENDING'`).run(inputId);
+      this.publishInputStatus(inputId);
+    } catch (error) {
+      this.setInputStatus(inputId, "UNDELIVERED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private flushPendingSteering(runId: string): void {
+    const inputs = this.db.prepare(`SELECT id, content FROM run_inputs WHERE run_id = ? AND delivery_type = 'STEERING'
+      AND delivery_status = 'PENDING' ORDER BY sequence`).all(runId) as Array<{ id: string; content: string }>;
+    for (const input of inputs) this.scheduleSteering(runId, input.id, input.content);
+  }
+
   private async finishRun(runId: string, taskId: string): Promise<void> {
     const stage = this.getRun(runId)!.stage;
     const tag = COMPLETION_TAG[stage];
@@ -106,10 +220,45 @@ export class RunManager {
 
     if (!readHandover(this.db, runId)) {
       await this.agents.prompt(taskId, runId, HANDOVER_RETRY_PROMPT);
+      this.closingRuns.add(runId);
+      await this.steeringQueues.get(runId);
       if (this.stopRequested.has(runId)) {
         this.markStopped(runId, taskId);
         return;
       }
+      this.closingRuns.add(runId);
+      if (!readHandover(this.db, runId)) {
+        this.markHandoverFailed(runId, taskId);
+        return;
+      }
+    }
+
+    let handoverRevisionUsed = false;
+    for (;;) {
+      const unresolved = this.db.prepare(`SELECT COUNT(*) AS count FROM run_inputs WHERE run_id = ?
+        AND delivery_status IN ('PENDING', 'ACCEPTED', 'UNDELIVERED', 'DELIVERY_UNKNOWN')`).get(runId) as { count: number };
+      if (unresolved.count > 0) {
+        this.markInputDeliveryFailed(runId, taskId);
+        return;
+      }
+      const watermark = (this.db.prepare("SELECT handover_input_sequence FROM task_runs WHERE id = ?")
+        .get(runId) as { handover_input_sequence: number }).handover_input_sequence;
+      const latestDelivered = (this.db.prepare(`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_inputs
+        WHERE run_id = ? AND delivery_status = 'DELIVERED'`).get(runId) as { sequence: number }).sequence;
+      if (watermark >= latestDelivered) break;
+      if (handoverRevisionUsed) {
+        this.markHandoverFailed(runId, taskId, "Handover did not include all delivered guidance after its update request.");
+        return;
+      }
+      handoverRevisionUsed = true;
+      await this.agents.prompt(taskId, runId, HANDOVER_UPDATE_PROMPT);
+      this.closingRuns.add(runId);
+      await this.steeringQueues.get(runId);
+      if (this.stopRequested.has(runId)) {
+        this.markStopped(runId, taskId);
+        return;
+      }
+      this.closingRuns.add(runId);
       if (!readHandover(this.db, runId)) {
         this.markHandoverFailed(runId, taskId);
         return;
@@ -117,9 +266,11 @@ export class RunManager {
     }
 
     const now = new Date().toISOString();
-    this.markCompleted(runId);
-    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?")
-      .run(tag, now, taskId);
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE task_runs SET status = 'COMPLETED', completed_at = ? WHERE id = ?").run(now, runId);
+      this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?")
+        .run(tag, now, taskId);
+    })();
   }
 
   private markCompleted(runId: string): void {
@@ -127,38 +278,37 @@ export class RunManager {
       .run(new Date().toISOString(), runId);
   }
 
-  private markHandoverFailed(runId: string, taskId: string): void {
+  private markInputsUnresolved(runId: string): void {
+    this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
+      WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END
+      WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
+  }
+
+  private markHandoverFailed(runId: string, taskId: string, message = "Run ended without a valid handover after a second request."): void {
     const now = new Date().toISOString();
     this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'HANDOVER_FAILED', completed_at = ?,
-      error_message = 'Run ended without a valid handover after a second request.' WHERE id = ?`).run(now, runId);
+      error_message = ? WHERE id = ?`).run(now, message, runId);
     this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'RUN_FAILED', updated_at = ? WHERE id = ?")
       .run(now, taskId);
   }
 
-  /** Flips queued steering comments to delivered when Pi replays them as user messages. */
-  private watchSteeringDelivery(runId: string, taskId: string): { unsubscribe: () => void; sawUserMessage: () => boolean } {
-    let sawUserMessage = false;
-    const unsubscribe = this.agents.subscribe(taskId, runId, (event) => {
-      if (event.type !== "message_start" || event.data.role !== "user") return;
-      sawUserMessage = true;
-      const content = typeof event.data.text === "string" ? event.data.text : "";
-      if (!content) return;
-      const sessionId = (this.db.prepare("SELECT session_id FROM task_runs WHERE id = ?")
-        .get(runId) as { session_id: string | null }).session_id;
-      const commentId = markSteeringDelivered(this.db, taskId, content, sessionId, runId);
-      // Published after the triggering event finishes fanning out to subscribers.
-      if (commentId) queueMicrotask(() => this.agents.publish(taskId, runId, "comment_delivered", { commentId }));
-    });
-    return { unsubscribe, sawUserMessage: () => sawUserMessage };
-  }
-
-  private getRun(runId: string): RunRow | undefined {
-    return this.db.prepare("SELECT task_id, stage, status FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
+  private markInputDeliveryFailed(runId: string, taskId: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
+      WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END
+      WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
+    this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'INPUT_DELIVERY_FAILED', completed_at = ?,
+      error_message = 'Accepted run guidance was not fully confirmed in the Pi transcript.' WHERE id = ?`).run(now, runId);
+    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'RUN_FAILED', updated_at = ? WHERE id = ?")
+      .run(now, taskId);
   }
 
   private markStopped(runId: string, taskId: string): void {
     const now = new Date().toISOString();
     const run = this.getRun(runId);
+    this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
+      WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END
+      WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
     if (run?.stage === "VALIDATION_REVIEW") {
       this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'USER_STOPPED', interrupted_at = ?,
         completed_at = ?, error_message = 'Validation stopped by user.' WHERE id = ?`).run(now, now, runId);
@@ -170,5 +320,89 @@ export class RunManager {
       this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
         .run(now, taskId);
     }
+  }
+
+  private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void; sawUserMessage: () => boolean } {
+    let initialDelivered = false;
+    let sawUserMessage = false;
+    const unsubscribe = this.agents.subscribe(taskId, runId, (event) => {
+      if (event.type === "message_start" && event.data.role === "user") sawUserMessage = true;
+      if (event.type !== "entry_appended") return;
+      const entryId = typeof event.data.entryId === "string" ? event.data.entryId : null;
+      if (!entryId) return;
+      const sessionId = this.getRun(runId)?.session_id ?? null;
+      this.db.transaction(() => {
+        this.db.prepare("UPDATE task_runs SET transcript_end_entry_id = ? WHERE id = ?").run(entryId, runId);
+        if (sessionId) {
+          const sequence = (this.db.prepare(`SELECT COALESCE(MAX(sequence), 0) + 1 AS next
+            FROM run_transcript_entries WHERE run_id = ?`).get(runId) as { next: number }).next;
+          this.db.prepare(`INSERT OR IGNORE INTO run_transcript_entries (session_id, entry_id, run_id, sequence)
+            VALUES (?, ?, ?, ?)`).run(sessionId, entryId, runId, sequence);
+        }
+      })();
+      if (event.data.role !== "user") return;
+      const text = typeof event.data.text === "string" ? event.data.text : "";
+      const alreadyMatched = this.db.prepare(`SELECT 1 FROM run_inputs
+        WHERE session_id = ? AND transcript_entry_id = ? LIMIT 1`).get(sessionId, entryId);
+      if (alreadyMatched) return;
+      if (!initialDelivered && initialInputIds.length > 0) {
+        if (text !== initialPromptText) return;
+        initialDelivered = true;
+        for (const inputId of initialInputIds) this.markInputDelivered(inputId, sessionId, entryId);
+        return;
+      }
+      const next = this.db.prepare(`SELECT id, content, session_id FROM run_inputs WHERE run_id = ? AND delivery_type = 'STEERING'
+        AND delivery_status IN ('PENDING', 'ACCEPTED') ORDER BY session_sequence LIMIT 1`).get(runId) as
+        { id: string; content: string; session_id: string | null } | undefined;
+      if (!next) return;
+      if (next.session_id !== sessionId || next.content !== text) {
+        const ambiguous = this.db.prepare(`SELECT id FROM run_inputs WHERE run_id = ? AND delivery_type = 'STEERING'
+          AND delivery_status IN ('PENDING', 'ACCEPTED') ORDER BY session_sequence`).all(runId) as Array<{ id: string }>;
+        for (const input of ambiguous) {
+          this.setInputStatus(input.id, "DELIVERY_UNKNOWN", "Transcript steering entries could not be uniquely correlated in session order.");
+        }
+        return;
+      }
+      this.markInputDelivered(next.id, sessionId, entryId);
+    });
+    return { unsubscribe, sawUserMessage: () => sawUserMessage };
+  }
+
+  private markInputDelivered(inputId: string, sessionId: string | null, entryId: string): void {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`UPDATE run_inputs SET delivery_status = 'DELIVERED', delivered_at = ?,
+      session_id = COALESCE(session_id, ?), transcript_entry_id = ?
+      WHERE id = ? AND session_id = ? AND transcript_entry_id IS NULL
+        AND delivery_status IN ('PENDING', 'ACCEPTED')`)
+      .run(now, sessionId, entryId, inputId, sessionId);
+    if (result.changes) this.publishInputStatus(inputId);
+  }
+
+  private setInputStatus(inputId: string, status: string, reason: string): void {
+    this.db.prepare("UPDATE run_inputs SET delivery_status = ?, failure_reason = ? WHERE id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')")
+      .run(status, reason, inputId);
+    this.publishInputStatus(inputId);
+  }
+
+  private publishInputStatus(inputId: string): void {
+    const row = this.getInput(inputId);
+    if (!row) return;
+    this.agents.publish(row.task_id, row.run_id, "run_input_status", {
+      inputId: row.id,
+      deliveryStatus: row.delivery_status,
+      transcriptEntryId: row.transcript_entry_id,
+    });
+  }
+
+  private getRun(runId: string): RunRow | undefined {
+    return this.db.prepare("SELECT task_id, stage, status, session_id, input_mode FROM task_runs WHERE id = ?")
+      .get(runId) as RunRow | undefined;
+  }
+
+  private getInput(inputId: string): RunInput | undefined {
+    return this.db.prepare(`SELECT id, task_id, run_id, sequence, idempotency_key, content, delivery_type,
+      delivery_status, accepted_at, delivered_at, session_id, session_sequence, transcript_boundary_entry_id,
+      transcript_entry_id, failure_reason, reused_from_input_id FROM run_inputs WHERE id = ?`)
+      .get(inputId) as RunInput | undefined;
   }
 }

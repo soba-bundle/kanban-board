@@ -14,13 +14,15 @@ interface ClaimedJob {
 }
 
 interface NewQueueJob {
-  job_id: string;
+  job_id: string | null;
   run_id: string;
-  queue_position: number;
+  queue_position: number | null;
+  created: boolean;
 }
 
 export class QueueManager {
-  private pumping = false;
+  private dispatching = false;
+  private readonly active = new Map<string, Promise<void>>();
 
   constructor(
     private readonly db: Database.Database,
@@ -44,6 +46,10 @@ export class QueueManager {
         } else if (job.run_status === "RUNNING") {
           this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'BACKEND_INTERRUPTED',
             interrupted_at = ?, error_message = 'Backend restarted while run was active.' WHERE id = ?`).run(now, job.run_id);
+          this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
+            WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END,
+            failure_reason = 'Backend restarted before transcript delivery could be confirmed.'
+            WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(job.run_id);
           this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
             .run(now, job.task_id);
           this.db.prepare("UPDATE agent_jobs SET status = 'FINISHED', completed_at = ? WHERE id = ?").run(now, job.job_id);
@@ -56,50 +62,128 @@ export class QueueManager {
     this.dispatch();
   }
 
-  enqueueTask(taskId: string, stage: WorkingRunPhase): NewQueueJob {
+  enqueueTask(taskId: string, stage: WorkingRunPhase, prompt: string, idempotencyKey: string, reusedFromInputId?: string): NewQueueJob {
     const now = new Date().toISOString();
-    const job: NewQueueJob = { job_id: randomUUID(), run_id: randomUUID(), queue_position: 0 };
-    this.db.transaction(() => {
-      const task = this.db.prepare(`SELECT t.workflow_state, t.review_tag FROM tasks t
-        JOIN projects p ON p.id = t.project_id WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(taskId) as
+    const job: NewQueueJob = { job_id: randomUUID(), run_id: randomUUID(), queue_position: 0, created: true };
+    const inputId = randomUUID();
+    const result = this.db.transaction(() => {
+      const existing = this.db.prepare(`SELECT j.id AS job_id, r.id AS run_id, j.queue_position,
+          r.stage, i.content, i.reused_from_input_id
+        FROM run_inputs i JOIN task_runs r ON r.id = i.run_id
+        LEFT JOIN agent_jobs j ON j.task_run_id = r.id
+        WHERE i.task_id = ? AND i.idempotency_key = ? LIMIT 1`).get(taskId, idempotencyKey) as
+        { job_id: string | null; run_id: string; queue_position: number | null; stage: string; content: string; reused_from_input_id: string | null } | undefined;
+      if (existing) {
+        if (existing.stage !== stage || existing.content !== prompt || existing.reused_from_input_id !== (reusedFromInputId ?? null)) {
+          throw new Error("Idempotency key was already used for a different run request.");
+        }
+        return { job_id: existing.job_id, run_id: existing.run_id, queue_position: existing.queue_position, created: false };
+      }
+
+      const task = this.db.prepare(`SELECT workflow_state, review_tag FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(taskId) as
         { workflow_state: string; review_tag: string | null } | undefined;
       if (!task) throw new Error(`Task ${taskId} not found.`);
       const canStart = task.workflow_state === "TODO" || (task.workflow_state === "REVIEW" &&
-        (task.review_tag === "INVESTIGATION_COMPLETE" || task.review_tag === "IMPLEMENTATION_COMPLETE"));
-      if (!canStart) throw new Error("Only Todo tasks or completed runs in Review can be queued.");
+        ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? ""));
+      if (!canStart) throw new Error("Only Todo tasks or recoverable runs in Review can be queued.");
       const active = this.db.prepare(`SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
         WHERE r.task_id = ? AND j.status IN ('QUEUED', 'CLAIMED') LIMIT 1`).get(taskId);
       if (active) throw new Error("Task already has queued or running work.");
 
+      if (reusedFromInputId) {
+        const source = this.db.prepare(`SELECT task_id, content, delivery_status FROM run_inputs WHERE id = ?`)
+          .get(reusedFromInputId) as { task_id: string; content: string; delivery_status: string } | undefined;
+        if (!source || source.task_id !== taskId || !["UNDELIVERED", "DELIVERY_UNKNOWN"].includes(source.delivery_status)) {
+          throw new Error("Only undelivered or delivery-unknown guidance from this task can be reused.");
+        }
+        if (source.content !== prompt) throw new Error("Reused guidance must match the original text.");
+      }
+
       const sequence = (this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM task_runs WHERE task_id = ?")
         .get(taskId) as { next: number }).next;
-      const maxPosition = (this.db.prepare("SELECT COALESCE(MAX(queue_position), 0) AS max FROM agent_jobs WHERE status = 'QUEUED'")
-        .get() as { max: number }).max;
+      const maxPosition = (this.db.prepare("SELECT COALESCE(MAX(queue_position), 0) AS position FROM agent_jobs WHERE status = 'QUEUED'")
+        .get() as { position: number }).position;
       job.queue_position = maxPosition + 1;
       this.db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, return_workflow_state, return_review_tag)
         VALUES (?, ?, ?, ?, 'QUEUED', ?, ?)`)
         .run(job.run_id, taskId, stage, sequence, task.workflow_state, task.review_tag);
+      this.db.prepare(`INSERT INTO run_inputs (id, task_id, run_id, sequence, idempotency_key, content,
+        delivery_type, delivery_status, accepted_at, reused_from_input_id)
+        VALUES (?, ?, ?, 1, ?, ?, 'INITIAL_PROMPT', 'PENDING', ?, ?)`)
+        .run(inputId, taskId, job.run_id, idempotencyKey, prompt, now, reusedFromInputId ?? null);
       this.db.prepare(`INSERT INTO agent_jobs (id, task_run_id, queue_position, priority, status, created_at)
         VALUES (?, ?, ?, 0, 'QUEUED', ?)`)
         .run(job.job_id, job.run_id, job.queue_position, now);
-      this.db.prepare("UPDATE tasks SET workflow_state = 'IN_PROGRESS', updated_at = ? WHERE id = ?")
-        .run(now, taskId);
+      if (task.workflow_state === "TODO" || task.workflow_state === "REVIEW") {
+        this.db.prepare("UPDATE tasks SET workflow_state = 'IN_PROGRESS', review_tag = NULL, updated_at = ? WHERE id = ?")
+          .run(now, taskId);
+      }
+      return job;
     })();
     this.dispatch();
-    return job;
+    return result;
   }
 
   getSnapshot(): QueueSnapshot {
-    const jobs = this.db.prepare(`SELECT j.id AS job_id, r.id AS run_id, r.task_id, t.title, r.stage,
-        CASE WHEN j.status = 'QUEUED' THEN j.queue_position ELSE NULL END AS queue_position,
-        j.status AS job_status, r.status AS run_status
-      FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id JOIN tasks t ON t.id = r.task_id
-      JOIN projects p ON p.id = t.project_id
-      WHERE j.status IN ('QUEUED', 'CLAIMED') AND t.is_active = 1 AND p.is_active = 1
-      ORDER BY CASE j.status WHEN 'CLAIMED' THEN 0 ELSE 1 END, j.priority DESC, j.queue_position, j.created_at`)
-      .all() as QueueItem[];
-    const activeCount = jobs.filter((job) => job.job_status === "CLAIMED").length;
-    return { max_concurrent_agents: this.maxConcurrentAgents, active_count: activeCount, jobs };
+    const rows = this.db.prepare(`SELECT j.id AS job_id, j.task_run_id AS run_id, j.queue_position,
+        j.status AS job_status, j.created_at, r.task_id, r.stage, r.status AS run_status, i.content AS prompt
+      FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+      JOIN run_inputs i ON i.run_id = r.id AND i.delivery_type = 'INITIAL_PROMPT'
+      WHERE j.status IN ('QUEUED', 'CLAIMED') ORDER BY CASE WHEN j.status = 'CLAIMED' THEN 0 ELSE 1 END,
+        j.priority DESC, j.queue_position, j.created_at`).all() as QueueItem[];
+    return {
+      jobs: rows,
+      max_concurrent_agents: this.maxConcurrentAgents,
+      active_count: rows.filter((row) => row.job_status === "CLAIMED").length,
+    };
+  }
+
+  async stopRun(runId: string): Promise<void> {
+    const result = this.db.transaction(() => {
+      const active = this.db.prepare(`SELECT j.id AS job_id, j.status AS job_status, r.task_id,
+          r.status AS run_status, r.stage FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id WHERE r.id = ?`)
+        .get(runId) as { job_id: string; job_status: string; task_id: string; run_status: string; stage: string } | undefined;
+      if (!active) throw new Error(`Run ${runId} not found.`);
+      if (active.job_status === "QUEUED") throw new Error("Run is queued; remove it from the queue instead.");
+      if (active.job_status !== "CLAIMED") throw new Error(`Run ${runId} is not active.`);
+      if (active.run_status === "RUNNING") return "RUNNING";
+      if (active.run_status !== "QUEUED") throw new Error(`Run ${runId} is not active.`);
+
+      const now = new Date().toISOString();
+      const status = active.stage === "VALIDATION_REVIEW" ? "FAILED" : "INTERRUPTED";
+      const tag = active.stage === "VALIDATION_REVIEW" ? "VALIDATION_FAILED" : "INTERRUPTED";
+      const stopped = this.db.prepare(`UPDATE task_runs SET status = ?, reason_code = 'USER_STOPPED', interrupted_at = ?,
+        completed_at = ?, error_message = 'Run stopped by user before agent start.' WHERE id = ? AND status = 'QUEUED'`)
+        .run(status, now, active.stage === "VALIDATION_REVIEW" ? now : null, runId);
+      if (stopped.changes !== 1) throw new Error(`Run ${runId} is no longer queued.`);
+      this.db.prepare(`UPDATE run_inputs SET delivery_status = 'UNDELIVERED', failure_reason = 'Run stopped before dispatch.'
+        WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
+      this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?")
+        .run(tag, now, active.task_id);
+      return "STOPPED";
+    })();
+    if (result === "RUNNING") await this.runs.stop(runId);
+  }
+
+  remove(jobId: string): void {
+    this.db.transaction(() => {
+      const job = this.db.prepare(`SELECT j.task_run_id AS run_id, r.task_id, r.return_workflow_state, r.return_review_tag
+        FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+        WHERE j.id = ? AND j.status = 'QUEUED'`).get(jobId) as {
+          run_id: string; task_id: string; return_workflow_state: string | null; return_review_tag: string | null;
+        } | undefined;
+      if (!job) throw new Error("Queued job not found.");
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE agent_jobs SET status = 'CANCELLED', completed_at = ? WHERE id = ?").run(now, jobId);
+      this.db.prepare("UPDATE task_runs SET status = 'CANCELLED', completed_at = ? WHERE id = ?").run(now, job.run_id);
+      this.db.prepare("UPDATE run_inputs SET delivery_status = 'UNDELIVERED' WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')")
+        .run(job.run_id);
+      this.db.prepare("UPDATE tasks SET workflow_state = ?, review_tag = ?, updated_at = ? WHERE id = ?")
+        .run(job.return_workflow_state ?? "TODO", job.return_review_tag, now, job.task_id);
+      this.normalizeQueuePositions();
+    })();
+    this.dispatch();
   }
 
   reorder(jobId: string, position: number): void {
@@ -116,62 +200,28 @@ export class QueueManager {
     })();
   }
 
-  async stopRun(runId: string): Promise<void> {
-    const active = this.db.prepare(`SELECT j.id AS job_id, j.status AS job_status, r.task_id, r.status AS run_status, r.stage
-      FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id WHERE r.id = ?`).get(runId) as {
-        job_id: string; job_status: string; task_id: string; run_status: string; stage: string;
-      } | undefined;
-    if (!active) throw new Error(`Run ${runId} not found.`);
-    if (active.job_status === "QUEUED") throw new Error("Run is queued; remove it from the queue instead.");
-    if (active.job_status !== "CLAIMED") throw new Error(`Run ${runId} is not active.`);
-    if (active.run_status === "RUNNING") {
-      await this.runs.stop(runId);
-      return;
-    }
-    if (active.run_status !== "QUEUED") throw new Error(`Run ${runId} is not active.`);
-
-    const now = new Date().toISOString();
-    const status = active.stage === "VALIDATION_REVIEW" ? "FAILED" : "INTERRUPTED";
-    const tag = active.stage === "VALIDATION_REVIEW" ? "VALIDATION_FAILED" : "INTERRUPTED";
-    this.db.prepare(`UPDATE task_runs SET status = ?, reason_code = 'USER_STOPPED', interrupted_at = ?,
-      completed_at = ?, error_message = 'Run stopped by user before agent start.' WHERE id = ? AND status = 'QUEUED'`)
-      .run(status, now, active.stage === "VALIDATION_REVIEW" ? now : null, runId);
-    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?")
-      .run(tag, now, active.task_id);
-  }
-
-  remove(jobId: string): void {
-    this.db.transaction(() => {
-      const job = this.db.prepare(`SELECT j.task_run_id AS run_id, r.task_id, r.return_workflow_state, r.return_review_tag
-        FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
-        WHERE j.id = ? AND j.status = 'QUEUED'`).get(jobId) as {
-          run_id: string; task_id: string; return_workflow_state: string | null; return_review_tag: string | null;
-        } | undefined;
-      if (!job) throw new Error("Queued job not found.");
-      const now = new Date().toISOString();
-      this.db.prepare("UPDATE agent_jobs SET status = 'CANCELLED', completed_at = ? WHERE id = ?").run(now, jobId);
-      this.db.prepare("UPDATE task_runs SET status = 'CANCELLED', completed_at = ? WHERE id = ?").run(now, job.run_id);
-      this.db.prepare("UPDATE tasks SET workflow_state = ?, review_tag = ?, updated_at = ? WHERE id = ?")
-        .run(job.return_workflow_state ?? "TODO", job.return_review_tag, now, job.task_id);
-      this.normalizeQueuePositions();
-    })();
-  }
-
   private dispatch(): void {
-    if (this.pumping) return;
-    this.pumping = true;
+    if (this.dispatching) return;
+    this.dispatching = true;
     try {
-      let job: ClaimedJob | undefined;
-      while ((job = this.claimNext())) void this.execute(job);
+      while (this.active.size < this.maxConcurrentAgents) {
+        const job = this.claimNext();
+        if (!job) break;
+        const promise = this.execute(job);
+        this.active.set(job.job_id, promise);
+        void promise.finally(() => {
+          this.active.delete(job.job_id);
+          this.dispatch();
+        });
+      }
     } finally {
-      this.pumping = false;
+      this.dispatching = false;
     }
   }
 
   private claimNext(): ClaimedJob | undefined {
     return this.db.transaction(() => {
-      const activeCount = (this.db.prepare("SELECT COUNT(*) AS count FROM agent_jobs WHERE status = 'CLAIMED'")
-        .get() as { count: number }).count;
+      const activeCount = (this.db.prepare("SELECT COUNT(*) AS count FROM agent_jobs WHERE status = 'CLAIMED'").get() as { count: number }).count;
       if (activeCount >= this.maxConcurrentAgents) return undefined;
       const job = this.db.prepare(`SELECT j.id AS job_id, j.task_run_id AS run_id, r.task_id
         FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
@@ -190,18 +240,26 @@ export class QueueManager {
       const worktreePath = (this.db.prepare("SELECT worktree_path FROM tasks WHERE id = ?").get(job.task_id) as
         { worktree_path: string | null }).worktree_path;
       if (!worktreePath && this.worktrees) await this.worktrees.createTaskWorktree(job.task_id);
-      await this.runs.start(job.run_id, buildRunPrompt(this.db, job.run_id));
+      const prompt = this.db.transaction(() => {
+        const cutoff = this.db.prepare(`UPDATE task_runs SET input_mode = 'STEERING'
+          WHERE id = ? AND status = 'QUEUED' AND input_mode = 'QUEUED'`).run(job.run_id);
+        if (cutoff.changes !== 1) throw new Error(`Run ${job.run_id} could not enter dispatch.`);
+        return buildRunPrompt(this.db, job.run_id);
+      })();
+      await this.runs.start(job.run_id, prompt);
     } catch (error) {
       const now = new Date().toISOString();
+      const message = error instanceof Error ? error.message : String(error);
       this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ?
         WHERE id = ? AND status = 'QUEUED'`)
-        .run(now, error instanceof Error ? error.message : String(error), job.run_id);
+        .run(now, message, job.run_id);
+      this.db.prepare(`UPDATE run_inputs SET delivery_status = 'UNDELIVERED', failure_reason = ?
+        WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(message, job.run_id);
     } finally {
       const now = new Date().toISOString();
       this.db.prepare("UPDATE agent_jobs SET status = 'FINISHED', completed_at = ? WHERE id = ? AND status = 'CLAIMED'")
         .run(now, job.job_id);
       this.normalizeQueuePositions();
-      this.dispatch();
     }
   }
 

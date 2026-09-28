@@ -9,6 +9,7 @@ export interface GitCommandResult {
 export interface GitCommandOptions {
   cwd: string;
   timeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
 }
 
 export function runGit(args: string[], options: GitCommandOptions): Promise<GitCommandResult> {
@@ -22,6 +23,7 @@ export function runGit(args: string[], options: GitCommandOptions): Promise<GitC
         timeout: options.timeoutMs ?? 30_000,
         maxBuffer: 10 * 1024 * 1024,
         windowsHide: true,
+        ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
       },
       (error, stdout, stderr) => {
         if (!error) {

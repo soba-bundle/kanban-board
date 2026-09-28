@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
-import { EnqueueTaskSchema, ReorderQueueJobSchema } from "@kanban-board/shared";
+import { ReorderQueueJobSchema, StartRunSchema } from "@kanban-board/shared";
+import { TaskOperationCoordinator } from "../task-operation-coordinator.js";
 import { QueueManager } from "./queue-manager.js";
 
 function statusFor(error: unknown): number {
@@ -9,7 +10,11 @@ function statusFor(error: unknown): number {
   return 409;
 }
 
-export function registerQueueRoutes(app: FastifyInstance, queue: QueueManager) {
+export function registerQueueRoutes(
+  app: FastifyInstance,
+  queue: QueueManager,
+  operations = new TaskOperationCoordinator(),
+) {
   app.get("/api/queue", async () => queue.getSnapshot());
 
   app.post<{ Params: { runId: string } }>("/api/runs/:runId/stop", async (request, reply) => {
@@ -22,13 +27,27 @@ export function registerQueueRoutes(app: FastifyInstance, queue: QueueManager) {
   });
 
   app.post<{ Params: { taskId: string } }>("/api/tasks/:taskId/queue", async (request, reply) => {
-    const parsed = EnqueueTaskSchema.safeParse(request.body);
+    const parsed = StartRunSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    if (parsed.data.task_id !== request.params.taskId) {
+      return reply.code(400).send({ error: "Task ID in the request must match the URL." });
+    }
+    const release = operations.tryAcquire(request.params.taskId);
+    if (!release) return reply.code(409).send({ error: "Another operation is in progress for this task." });
     try {
-      return reply.code(201).send(queue.enqueueTask(request.params.taskId, parsed.data.stage));
+      const result = queue.enqueueTask(
+        request.params.taskId,
+        parsed.data.stage,
+        parsed.data.prompt,
+        parsed.data.idempotency_key,
+        parsed.data.reused_from_input_id,
+      );
+      return reply.code(result.created ? 201 : 200).send(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return reply.code(statusFor(error)).send({ error: message });
+    } finally {
+      release();
     }
   });
 

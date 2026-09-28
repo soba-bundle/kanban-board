@@ -170,5 +170,72 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const runInputsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get();
+  if (!runInputsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE task_runs ADD COLUMN transcript_start_entry_id TEXT;
+        ALTER TABLE task_runs ADD COLUMN transcript_end_entry_id TEXT;
+        ALTER TABLE validation_snapshots ADD COLUMN messages_watermark TEXT;
+
+        CREATE TABLE run_inputs (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id),
+          run_id TEXT NOT NULL REFERENCES task_runs(id),
+          sequence INTEGER NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          content TEXT NOT NULL,
+          delivery_type TEXT NOT NULL CHECK (delivery_type IN ('INITIAL_PROMPT', 'QUEUED_INPUT', 'STEERING')),
+          delivery_status TEXT NOT NULL CHECK (delivery_status IN
+            ('PENDING', 'ACCEPTED', 'DELIVERED', 'UNDELIVERED', 'DELIVERY_UNKNOWN', 'CANCELLED')),
+          accepted_at TEXT NOT NULL,
+          delivered_at TEXT,
+          session_id TEXT,
+          transcript_entry_id TEXT,
+          failure_reason TEXT,
+          reused_from_input_id TEXT REFERENCES run_inputs(id),
+          UNIQUE (run_id, sequence),
+          UNIQUE (task_id, idempotency_key)
+        );
+        CREATE INDEX run_inputs_task_sequence ON run_inputs(task_id, sequence);
+        CREATE INDEX run_inputs_run_sequence ON run_inputs(run_id, sequence);`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
+  const steeringSequenceApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get();
+  if (!steeringSequenceApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE task_runs ADD COLUMN input_mode TEXT NOT NULL DEFAULT 'QUEUED';
+        ALTER TABLE task_runs ADD COLUMN handover_input_sequence INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE run_inputs ADD COLUMN session_sequence INTEGER;
+        ALTER TABLE run_inputs ADD COLUMN transcript_boundary_entry_id TEXT;
+        CREATE UNIQUE INDEX run_inputs_session_sequence ON run_inputs(session_id, session_sequence)
+          WHERE session_id IS NOT NULL AND session_sequence IS NOT NULL;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
+  const liveHistoryApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 6").get();
+  if (!liveHistoryApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`CREATE TABLE run_transcript_entries (
+        session_id TEXT NOT NULL,
+        entry_id TEXT NOT NULL,
+        run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        PRIMARY KEY (session_id, entry_id),
+        UNIQUE (run_id, sequence)
+      );
+      CREATE INDEX run_transcript_entries_run ON run_transcript_entries(run_id, sequence);`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

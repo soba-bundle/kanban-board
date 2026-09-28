@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addComment, deleteComment, editComment, loadComments, loadRuns, steerRun } from "../src/ticket-api.js";
+import { addComment, createCheckpoint, deleteComment, editComment, enqueueReviewTask, loadCheckpointDiff, loadCheckpointPreview, loadComments, loadRuns, steerRun } from "../src/ticket-api.js";
 
 function captureFetch(t, handler = async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) {
   const originalFetch = globalThis.fetch;
@@ -37,6 +37,22 @@ test("ticket API uses the comment, run, and steering contracts", async (t) => {
   assert.deepEqual(JSON.parse(requests[2].options.body), { content: "hello" });
   assert.deepEqual(JSON.parse(requests[3].options.body), { content: "edited" });
   assert.deepEqual(JSON.parse(requests[5].options.body), { text: "focus here" });
+});
+
+test("Review actions use queue and checkpoint preview/confirmation contracts", async (t) => {
+  const requests = captureFetch(t);
+  await enqueueReviewTask("task-1", "IMPLEMENTATION");
+  await loadCheckpointPreview("task-1");
+  await createCheckpoint("task-1", ["new file.txt"]);
+  await loadCheckpointDiff("task-1");
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "POST /api/tasks/task-1/queue",
+    "GET /api/tasks/task-1/checkpoint-preview",
+    "POST /api/tasks/task-1/checkpoint",
+    "GET /api/tasks/task-1/checkpoint-diff",
+  ]);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { stage: "IMPLEMENTATION" });
+  assert.deepEqual(JSON.parse(requests[2].options.body), { include_untracked_files: ["new file.txt"] });
 });
 
 test("backend rejections surface their reason to the panel", async (t) => {

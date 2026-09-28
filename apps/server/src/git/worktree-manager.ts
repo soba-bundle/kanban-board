@@ -8,6 +8,7 @@ import {
   getChangedFiles,
   getCurrentBranch,
   getDiff,
+  createCheckpointCommit,
   getHeadSha,
   getStatus,
   type GitFileStatus,
@@ -127,6 +128,21 @@ export class WorktreeManager {
   async getStatus(taskId: string): Promise<GitFileStatus[]> {
     const { path } = this.getTaskWorktreePath(taskId);
     return getStatus(path);
+  }
+
+  async createCheckpoint(taskId: string): Promise<string> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    return createCheckpointCommit(path, `Checkpoint task ${taskId}`);
+  }
+
+  async previewCheckpoint(taskId: string): Promise<{ trackedChanges: string[]; untrackedFiles: string[]; commitSha: string }> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const status = await getStatus(path);
+    return {
+      trackedChanges: status.filter((file) => !file.untracked).map((file) => file.path),
+      untrackedFiles: status.filter((file) => file.untracked).map((file) => file.path),
+      commitSha: await getHeadSha(path),
+    };
   }
 
   async getDiff(taskId: string, from?: string, to?: string): Promise<string> {

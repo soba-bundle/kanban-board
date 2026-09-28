@@ -12,6 +12,10 @@ import {
   loadRuns,
   openRunEvents,
   steerRun,
+  enqueueReviewTask,
+  loadCheckpointPreview,
+  createCheckpoint,
+  loadCheckpointDiff,
 } from "../ticket-api.js";
 
 type Tab = "timeline" | "runs" | "live";
@@ -59,12 +63,16 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [error, setError] = useState<string | null>(null);
   const [liveLog, setLiveLog] = useState("");
   const [streamState, setStreamState] = useState<"idle" | "open" | "closed" | "error">("idle");
+  const [checkpointFiles, setCheckpointFiles] = useState<string[] | null>(null);
+  const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string } | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
   const { pushToast } = useToast();
 
   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
   const runningRunId = activeJob?.run_status === "RUNNING" ? activeJob.run_id : null;
   const canEdit = EDITABLE_STATES.has(task.workflow_state);
+  const canReviewAction = task.workflow_state === "REVIEW" &&
+    (task.review_tag === "INVESTIGATION_COMPLETE" || task.review_tag === "IMPLEMENTATION_COMPLETE");
 
   const refresh = useCallback(async () => {
     try {
@@ -164,6 +172,24 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
 
           {tab === "timeline" && (
             <>
+              {canReviewAction && (
+                <section className="ticket-section review-actions">
+                  <p className="ticket-section-title">Next step</p>
+                  <div className="dialog-actions">
+                    <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+                      const preview = await loadCheckpointPreview(task.id);
+                      if (preview.untracked_files.length) setCheckpointFiles(preview.untracked_files);
+                      else await createCheckpoint(task.id);
+                    }, "Checkpoint created")}>Commit changes</button>
+                    <button className="button-quiet" disabled={busy} onClick={() => void run(() => enqueueReviewTask(task.id, "INVESTIGATION"), "Investigation queued")}>Continue Investigation</button>
+                    <button className="button-quiet" disabled={busy} onClick={() => void run(() => enqueueReviewTask(task.id, "IMPLEMENTATION"), "Implementation queued")}>Continue Implementation</button>
+                    <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
+                      setCheckpointDiff(await loadCheckpointDiff(task.id));
+                    })}>View checkpoint diff</button>
+                  </div>
+                </section>
+              )}
+
               <section className="ticket-section">
                 <p className="ticket-section-title">Description</p>
                 <p className="ticket-description">{task.description || "No description."}</p>
@@ -216,6 +242,36 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 </ul>
               </section>
             </>
+          )}
+
+          {checkpointDiff && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="dialog checkpoint-diff-dialog" role="dialog" aria-modal="true" aria-labelledby="checkpoint-diff-title" onClick={(event) => event.stopPropagation()}>
+                <h2 id="checkpoint-diff-title">Checkpoint diff</h2>
+                <p>Commit {checkpointDiff.to_sha.slice(0, 12)}</p>
+                <p><strong>Changed files</strong></p>
+                <ul>{checkpointDiff.files.map((file) => <li key={file}>{file}</li>)}</ul>
+                <pre className="checkpoint-diff-content">{checkpointDiff.diff || "No differences."}</pre>
+                <div className="dialog-actions"><button className="button-quiet" onClick={() => setCheckpointDiff(null)}>Close</button></div>
+              </section>
+            </div>
+          )}
+
+          {checkpointFiles && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="checkpoint-confirm-title" onClick={(event) => event.stopPropagation()}>
+                <h2 id="checkpoint-confirm-title">Include new files in checkpoint?</h2>
+                <p>These untracked files will be included in the commit:</p>
+                <ul>{checkpointFiles.map((file) => <li key={file}>{file}</li>)}</ul>
+                <div className="dialog-actions">
+                  <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+                    await createCheckpoint(task.id, checkpointFiles);
+                    setCheckpointFiles(null);
+                  }, "Checkpoint created")}>Include and Commit</button>
+                  <button className="button-quiet" disabled={busy} onClick={() => setCheckpointFiles(null)}>Cancel</button>
+                </div>
+              </section>
+            </div>
           )}
 
           {tab === "runs" && (

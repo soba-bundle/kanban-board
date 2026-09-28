@@ -88,6 +88,39 @@ test("task worktree creation records base metadata and leaves primary checkout u
   assert.equal(git(repo, "show-ref", "--verify", "--quiet", `refs/heads/${worktree.agentBranch}`), "");
 });
 
+test("checkpoint commit stages tracked and untracked task changes only in the task worktree", async (t) => {
+  const temp = mkdtempSync(join(tmpdir(), "kanban-checkpoint-"));
+  const repo = join(temp, "repo");
+  const worktreeRoot = join(temp, "worktrees");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "Checkpoint Test");
+  git(repo, "config", "user.email", "checkpoint@example.invalid");
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  git(repo, "add", "file.txt");
+  git(repo, "commit", "-m", "base");
+  const db = openDatabase(join(temp, "app.sqlite"));
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO projects (id, name, root_path, worktree_root, created_at, updated_at)
+    VALUES ('p', 'P', ?, ?, ?, ?)`).run(repo, worktreeRoot, now, now);
+  db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
+    VALUES ('t', 'p', 'Task', '', 'REVIEW', ?, ?)`).run(now, now);
+  t.after(() => { db.close(); rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+  const manager = new WorktreeManager(db);
+  const worktree = await manager.createTaskWorktree("t");
+  writeFileSync(join(worktree.worktreePath, "file.txt"), "updated\n");
+  writeFileSync(join(worktree.worktreePath, "new.txt"), "new file\n");
+  const preview = await manager.previewCheckpoint("t");
+  assert.deepEqual(preview.trackedChanges, ["file.txt"]);
+  assert.deepEqual(preview.untrackedFiles, ["new.txt"]);
+  const sha = await manager.createCheckpoint("t");
+  assert.match(sha, /^[0-9a-f]{40}$/i);
+  assert.equal(await getHeadSha(worktree.worktreePath), sha);
+  assert.deepEqual(await manager.getStatus("t"), []);
+  assert.deepEqual(await getStatus(repo), []);
+  assert.deepEqual(git(worktree.worktreePath, "show", "--pretty=format:", "--name-only").split("\n").sort(), ["file.txt", "new.txt"]);
+});
+
 test("task worktree creation requires a configured root outside the repository", async (t) => {
   const temp = mkdtempSync(join(tmpdir(), "kanban-worktree-config-"));
   const repo = join(temp, "repo");

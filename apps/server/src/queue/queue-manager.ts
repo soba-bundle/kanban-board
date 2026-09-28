@@ -64,7 +64,9 @@ export class QueueManager {
         JOIN projects p ON p.id = t.project_id WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(taskId) as
         { workflow_state: string; review_tag: string | null } | undefined;
       if (!task) throw new Error(`Task ${taskId} not found.`);
-      if (task.workflow_state !== "TODO") throw new Error("Only Todo tasks can be queued in this phase.");
+      const canStart = task.workflow_state === "TODO" || (task.workflow_state === "REVIEW" &&
+        (task.review_tag === "INVESTIGATION_COMPLETE" || task.review_tag === "IMPLEMENTATION_COMPLETE"));
+      if (!canStart) throw new Error("Only Todo tasks or completed runs in Review can be queued.");
       const active = this.db.prepare(`SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
         WHERE r.task_id = ? AND j.status IN ('QUEUED', 'CLAIMED') LIMIT 1`).get(taskId);
       if (active) throw new Error("Task already has queued or running work.");

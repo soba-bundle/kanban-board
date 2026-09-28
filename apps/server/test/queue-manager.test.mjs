@@ -80,6 +80,26 @@ test("global queue preserves order, supports reorder/remove, and respects concur
   assert.equal(queue.getSnapshot().jobs.length, 0);
 });
 
+test("completed Review tasks can continue with another run and cancellation restores Review", async (t) => {
+  const db = makeDb(2);
+  db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'IMPLEMENTATION_COMPLETE' WHERE id = 'task-1'").run();
+  const fakeRuns = makeFakeRuns(db);
+  const queue = new QueueManager(db, fakeRuns, 1);
+  queue.initialize();
+  t.after(async () => {
+    for (const release of fakeRuns.releases.values()) release();
+    await waitFor(() => queue.getSnapshot().active_count === 0);
+    db.close();
+  });
+  queue.enqueueTask("task-2", "INVESTIGATION");
+  const queued = queue.enqueueTask("task-1", "INVESTIGATION");
+  assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "IN_PROGRESS");
+  queue.remove(queued.job_id);
+  assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
+    workflow_state: "REVIEW", review_tag: "IMPLEMENTATION_COMPLETE",
+  });
+});
+
 test("queue routes enqueue tasks and expose the global queue snapshot", async (t) => {
   const db = makeDb(1);
   const fakeRuns = makeFakeRuns(db);

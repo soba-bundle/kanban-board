@@ -50,6 +50,24 @@ export function steerRun(runId, text) {
   return request(`/api/runs/${encodeURIComponent(runId)}/steer`, { method: "POST", ...json({ text }) });
 }
 
+export function enqueueReviewTask(taskId, stage) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/queue`, { method: "POST", ...json({ stage }) });
+}
+
+export function loadCheckpointPreview(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint-preview`);
+}
+
+export function loadCheckpointDiff(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint-diff`);
+}
+
+export function createCheckpoint(taskId, includeUntrackedFiles = []) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint`, {
+    method: "POST", ...json({ include_untracked_files: includeUntrackedFiles }),
+  });
+}
+
 /** Opens the live event stream for a run. Returns the socket so callers can close it. */
 export function openRunEvents(runId, onEvent) {
   const protocol = location.protocol === "https:" ? "wss" : "ws";

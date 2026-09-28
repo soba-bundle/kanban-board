@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { WorktreeManager } from "./git/worktree-manager.js";
 import { randomUUID } from "node:crypto";
 import {
+  CheckpointConfirmationSchema,
   CreateTaskSchema,
   UpdateTaskSchema,
   WorkflowStateSchema,
@@ -98,6 +99,75 @@ export function registerTaskRoutes(app: FastifyInstance, db: Database.Database, 
       }
     }
     return reply.code(204).send();
+  });
+
+  app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/checkpoint-preview", async (request, reply) => {
+    const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
+      .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
+    if (!task) return reply.code(404).send({ error: "Task not found." });
+    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
+      return reply.code(409).send({ error: "Only completed work in Review can be checkpointed." });
+    }
+    if (!worktrees) return reply.code(503).send({ error: "Checkpointing is unavailable." });
+    try {
+      const preview = await worktrees.previewCheckpoint(request.params.taskId);
+      return {
+        tracked_changes: preview.trackedChanges,
+        untracked_files: preview.untrackedFiles,
+        commit_sha: preview.commitSha,
+      };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { taskId: string } }>("/api/tasks/:taskId/checkpoint", async (request, reply) => {
+    const parsed = CheckpointConfirmationSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
+      .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
+    if (!task) return reply.code(404).send({ error: "Task not found." });
+    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
+      return reply.code(409).send({ error: "Only completed work in Review can be checkpointed." });
+    }
+    if (!worktrees) return reply.code(503).send({ error: "Checkpointing is unavailable." });
+    try {
+      const preview = await worktrees.previewCheckpoint(request.params.taskId);
+      if (JSON.stringify(preview.untrackedFiles) !== JSON.stringify(parsed.data.include_untracked_files ?? [])) {
+        return reply.code(409).send({ error: "Task worktree changed; review the checkpoint contents again.", untracked_files: preview.untrackedFiles });
+      }
+      const sha = await worktrees.createCheckpoint(request.params.taskId);
+      const now = new Date().toISOString();
+      db.prepare("UPDATE tasks SET latest_task_commit_sha = ?, active_validation_snapshot_id = NULL, updated_at = ? WHERE id = ?")
+        .run(sha, now, request.params.taskId);
+      db.prepare(`UPDATE task_runs SET task_commit_sha = ? WHERE id = (
+        SELECT id FROM task_runs WHERE task_id = ? AND status = 'COMPLETED'
+        ORDER BY sequence DESC LIMIT 1)`)
+        .run(sha, request.params.taskId);
+      return { commit_sha: sha };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/checkpoint-diff", async (request, reply) => {
+    const row = db.prepare(`SELECT base_commit_sha, latest_task_commit_sha FROM tasks
+      WHERE id = ? AND is_active = 1`).get(request.params.taskId) as
+      { base_commit_sha: string | null; latest_task_commit_sha: string | null } | undefined;
+    if (!row) return reply.code(404).send({ error: "Task not found." });
+    if (!row.base_commit_sha || !row.latest_task_commit_sha) {
+      return reply.code(409).send({ error: "This task has no checkpoint to compare yet." });
+    }
+    if (!worktrees) return reply.code(503).send({ error: "Diff viewing is unavailable." });
+    try {
+      const [diff, files] = await Promise.all([
+        worktrees.getDiff(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
+        worktrees.getChangedFiles(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
+      ]);
+      return { from_sha: row.base_commit_sha, to_sha: row.latest_task_commit_sha, files, diff };
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get("/api/board", async () => {

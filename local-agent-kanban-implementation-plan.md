@@ -245,19 +245,25 @@ Document preflight and cleanup-pending behavior.
 
 ---
 
-## 2.13 Git Spike — Checkpoint Commits
+## 2.13 Git Spike — User-Directed Checkpoint Commits
 
-Prototype orchestrator-owned checkpoint:
+Prototype the checkpoint operation used only after an explicit user action from
+Review:
 
 ```text
-implementation handover
-→ git status
-→ stage intended task state
+Review → user selects Commit Changes
+→ inspect task worktree status
+→ if untracked files exist, show paths and request explicit inclusion approval
+→ stage all changes (tracked and approved untracked)
 → commit
 → record commit SHA
 ```
 
-Verify interruption does not auto-commit dirty WIP.
+Successful agent handover alone must never commit. Declining untracked-file
+inclusion cancels that attempt without changing workflow state or worktree
+contents; the ticket remains in Review for another user action. Verify failed or
+interrupted runs are never auto-committed and that the primary checkout remains
+untouched.
 
 ---
 
@@ -651,20 +657,43 @@ session viewer.
 
 ---
 
-# 8. Phase 6 — Checkpoint Commit Model
+# 8. Phase 6 — User-Directed Checkpoint Commit Model
 
-On successful Implementation handover:
+A successful Implementation handover does **not** automatically create a commit.
+It moves the task to Review with implementation changes uncommitted. In Review,
+the user must choose what happens next:
 
-1. inspect task worktree;
-2. create orchestrator checkpoint commit;
-3. record `task_commit_sha`;
-4. move to Review / Implementation Complete.
+```text
+Commit current changes
+Continue with Investigation
+Continue with Implementation
+```
 
-Do not auto-commit:
+This choice is presented whenever implementation changes reach Review, even
+when there are no untracked files. Committing is an explicit user action, not
+an automatic side effect of an agent handover.
 
-- Interrupted;
-- Failed;
-- user-stopped partial work.
+When the user chooses to commit:
+
+1. inspect task worktree status;
+2. if untracked files exist, show their paths and prompt the user to confirm
+   including them in the checkpoint;
+3. if confirmed (or there are no untracked files), stage and commit all task
+   worktree changes, including tracked modifications and confirmed untracked
+   files;
+4. record the resulting SHA in `task_runs.task_commit_sha` and
+   `tasks.latest_task_commit_sha`;
+5. return the task to Review with the checkpoint available for the user's next
+   decision.
+
+If the user declines inclusion of untracked files, cancel the entire checkpoint;
+do not commit only a partial subset. If the worktree is empty or Git cannot
+create the commit, report the problem and do not record a successful checkpoint.
+
+The user can choose Investigation or Implementation instead of committing. Any
+new agent run uses the existing task working session/worktree, and a subsequent
+Review decision again offers all three choices. Interrupted, failed, and
+user-stopped work is never automatically committed.
 
 Update diff APIs to support explicit SHA-based diffs.
 

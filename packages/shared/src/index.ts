@@ -179,4 +179,18 @@ export const QueueSnapshotSchema = z.object({
 export type QueueItem = z.infer<typeof QueueItemSchema>;
 export type QueueSnapshot = z.infer<typeof QueueSnapshotSchema>;
 export const EnqueueTaskSchema = z.object({ stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]) });
+export const CheckpointConfirmationSchema = z.object({ include_untracked_files: z.array(z.string()).optional() });
+export const CheckpointPreviewSchema = z.object({
+  tracked_changes: z.array(z.string()),
+  untracked_files: z.array(z.string()),
+  commit_sha: z.string().nullable(),
+});
+export type CheckpointPreview = z.infer<typeof CheckpointPreviewSchema>;
+export const CheckpointDiffSchema = z.object({
+  from_sha: z.string(),
+  to_sha: z.string(),
+  files: z.array(z.string()),
+  diff: z.string(),
+});
+export type CheckpointDiff = z.infer<typeof CheckpointDiffSchema>;
 export const ReorderQueueJobSchema = z.object({ position: z.number().int().positive() });

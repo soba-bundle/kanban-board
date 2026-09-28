@@ -23,6 +23,16 @@ export async function getHeadSha(cwd: string): Promise<string> {
   return gitOutput(cwd, ["rev-parse", "HEAD"]);
 }
 
+export async function createCheckpointCommit(cwd: string, message: string): Promise<string> {
+  const status = await getStatus(cwd);
+  if (status.length === 0) throw new Error("There are no changes to checkpoint.");
+  const add = await runGit(["add", "--all"], { cwd });
+  if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Unable to stage task worktree changes.");
+  const commit = await runGit(["commit", "-m", message], { cwd });
+  if (commit.exitCode !== 0) throw new Error(commit.stderr.trim() || "Unable to create checkpoint commit.");
+  return getHeadSha(cwd);
+}
+
 export interface GitFileStatus {
   path: string;
   indexStatus: string;

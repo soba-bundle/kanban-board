@@ -4,6 +4,7 @@ import { HandoverCard } from "./HandoverCard.js";
 import { HumanRequestPanel } from "./HumanRequestPanel.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
 import { useToast } from "./ToastContext.js";
+import { completeTask, loadTaskCompletionStatus } from "../board-api.js";
 import {
   answerHumanRequest,
   loadHumanRequests,
@@ -114,6 +115,10 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [checkpointPreview, setCheckpointPreview] = useState<CheckpointPreview | null>(null);
   const [checkpointStatus, setCheckpointStatus] = useState<CheckpointPreview | null>(null);
   const [checkpointStatusError, setCheckpointStatusError] = useState<string | null>(null);
+  const [completionStatus, setCompletionStatus] = useState<{
+    ready: boolean; reason: "WORKTREE_CHANGES" | "BRANCH_CHANGES" | "GIT_STATE_UNAVAILABLE" | null;
+  } | null>(null);
+  const [completionStatusError, setCompletionStatusError] = useState<string | null>(null);
   const [checkpointedSha, setCheckpointedSha] = useState<string | null>(null);
   const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string } | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -183,6 +188,29 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    setCompletionStatus(null);
+    setCompletionStatusError(null);
+    if (task.workflow_state !== "REVIEW") return;
+    let current = true;
+    const load = () => {
+      void loadTaskCompletionStatus(task.id).then((status) => {
+        if (current) {
+          setCompletionStatus(status);
+          setCompletionStatusError(null);
+        }
+      }).catch((caught) => {
+        if (current) {
+          setCompletionStatus(null);
+          setCompletionStatusError(caught instanceof Error ? caught.message : String(caught));
+        }
+      });
+    };
+    load();
+    const timer = setInterval(load, 5000);
+    return () => { current = false; clearInterval(timer); };
+  }, [task.id, task.workflow_state]);
 
   useEffect(() => {
     setCheckpointedSha(null);
@@ -469,6 +497,19 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                       <span className="run-empty">No changes to checkpoint.</span>
                     ))}
                     <button className="button-quiet" disabled={busy} onClick={() => setStartingRun(true)}>Start run</button>
+                    {completionStatus?.ready ? (
+                      <button className="button-primary" disabled={busy || !!activeJob} onClick={() => void run(async () => {
+                        await completeTask(task.id);
+                      }, "Task marked as done")}>Mark as done</button>
+                    ) : completionStatus?.reason === "BRANCH_CHANGES" ? (
+                      <button className="button-quiet" disabled>Merge back to source (unavailable until Phase 9)</button>
+                    ) : completionStatus?.reason === "WORKTREE_CHANGES" ? (
+                      <span className="run-error">Commit or discard Git changes before marking this task as done.</span>
+                    ) : completionStatus?.reason === "GIT_STATE_UNAVAILABLE" ? (
+                      <span className="run-error">Git state could not be verified; this task cannot be marked as done.</span>
+                    ) : completionStatusError ? (
+                      <span className="run-error">Cannot verify task Git state: {completionStatusError}</span>
+                    ) : <button className="button-quiet" disabled>Checking Git status…</button>}
                     <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
                       setCheckpointDiff(await loadCheckpointDiff(task.id));
                     })}>View checkpoint diff</button>

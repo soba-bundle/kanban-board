@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createProject, createTask, deleteProject, deleteTask, loadBoard, removeQueueJob, reorderQueueJob, stopRun } from "../src/board-api.js";
+import { completeTask, createProject, createTask, deleteProject, deleteTask, loadBoard, loadTaskCompletionStatus, removeQueueJob, reorderQueueJob, stopRun } from "../src/board-api.js";
 
 test("board loading explains empty or non-JSON backend responses", async (t) => {
   const originalFetch = globalThis.fetch;
@@ -37,6 +37,8 @@ test("board actions use the task and queue API contracts", async (t) => {
   await createProject("New project", "C:\\repo", "C:\\worktrees");
   await createTask("project/1", "A task", "Task context");
   await deleteTask("task/1");
+  await loadTaskCompletionStatus("task/1");
+  await completeTask("task/1");
   await reorderQueueJob("job/1", 2);
   await removeQueueJob("job/1");
   await stopRun("run/1");
@@ -46,6 +48,8 @@ test("board actions use the task and queue API contracts", async (t) => {
     ["/api/projects", "POST"],
     ["/api/tasks", "POST"],
     ["/api/tasks/task%2F1", "DELETE"],
+    ["/api/tasks/task%2F1/complete-preview", undefined],
+    ["/api/tasks/task%2F1/complete", "POST"],
     ["/api/queue/job%2F1", "PATCH"],
     ["/api/queue/job%2F1", "DELETE"],
     ["/api/runs/run%2F1/stop", "POST"],
@@ -57,5 +61,5 @@ test("board actions use the task and queue API contracts", async (t) => {
   assert.deepEqual(JSON.parse(requests[1].options.body), {
     project_id: "project/1", title: "A task", description: "Task context",
   });
-  assert.deepEqual(JSON.parse(requests[3].options.body), { position: 2 });
+  assert.deepEqual(JSON.parse(requests[5].options.body), { position: 2 });
 });

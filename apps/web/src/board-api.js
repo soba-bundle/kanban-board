@@ -73,6 +73,14 @@ export function deleteTask(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" }, false);
 }
 
+export function loadTaskCompletionStatus(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/complete-preview`);
+}
+
+export function completeTask(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/complete`, { method: "POST" });
+}
+
 export function reorderQueueJob(jobId, position) {
   return request(`/api/queue/${encodeURIComponent(jobId)}`, {
     method: "PATCH",

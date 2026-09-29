@@ -21,6 +21,7 @@ interface TaskProjectRow {
   project_id: string;
   worktree_path: string | null;
   agent_branch: string | null;
+  base_commit_sha: string | null;
   root_path: string;
   worktree_root: string | null;
   ide_command: string | null;
@@ -71,6 +72,7 @@ export class WorktreeManager {
       tasks.project_id AS project_id,
       tasks.worktree_path AS worktree_path,
       tasks.agent_branch AS agent_branch,
+      tasks.base_commit_sha AS base_commit_sha,
       projects.root_path AS root_path,
       projects.worktree_root AS worktree_root,
       projects.ide_command AS ide_command
@@ -146,6 +148,33 @@ export class WorktreeManager {
   async getStatus(taskId: string): Promise<GitFileStatus[]> {
     const { path } = this.getTaskWorktreePath(taskId);
     return getStatus(path);
+  }
+
+  async getTaskCompletionStatus(taskId: string): Promise<{
+    ready: boolean;
+    reason: "WORKTREE_CHANGES" | "BRANCH_CHANGES" | "GIT_STATE_UNAVAILABLE" | null;
+  }> {
+    const row = this.getTaskProject(taskId);
+    if (!row.worktree_path && !row.agent_branch && !row.base_commit_sha) return { ready: true, reason: null };
+    if (!row.agent_branch || !row.base_commit_sha) return { ready: false, reason: "GIT_STATE_UNAVAILABLE" };
+
+    if (row.worktree_path) {
+      const { path } = this.getTaskWorktreePath(taskId);
+      const operation = await getGitOperationState(path);
+      if (operation.operation) return { ready: false, reason: "GIT_STATE_UNAVAILABLE" };
+      const status = await getStatus(path);
+      if (status.length > 0) return { ready: false, reason: "WORKTREE_CHANGES" };
+      if (await getCurrentBranch(path) !== row.agent_branch) return { ready: false, reason: "GIT_STATE_UNAVAILABLE" };
+      return await getHeadSha(path) === row.base_commit_sha
+        ? { ready: true, reason: null }
+        : { ready: false, reason: "BRANCH_CHANGES" };
+    }
+
+    const branch = await runGit(["rev-parse", "--verify", `refs/heads/${row.agent_branch}`], { cwd: realpathSync(row.root_path) });
+    if (branch.exitCode !== 0) return { ready: false, reason: "GIT_STATE_UNAVAILABLE" };
+    return branch.stdout.trim() === row.base_commit_sha
+      ? { ready: true, reason: null }
+      : { ready: false, reason: "BRANCH_CHANGES" };
   }
 
   async createCheckpoint(taskId: string, expected?: CheckpointPreview): Promise<string> {

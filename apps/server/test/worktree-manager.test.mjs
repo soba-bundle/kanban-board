@@ -48,6 +48,7 @@ test("task worktree creation records base metadata and leaves primary checkout u
   assert.equal(worktree.baseCommitSha, baseSha);
   assert.equal(await getCurrentBranch(worktree.worktreePath), worktree.agentBranch);
   assert.equal(await getHeadSha(worktree.worktreePath), baseSha);
+  assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: true, reason: null });
   assert.deepEqual(await getStatus(repo), []);
   assert.equal(await getCurrentBranch(repo), "main");
   assert.deepEqual(
@@ -65,6 +66,7 @@ test("task worktree creation records base metadata and leaves primary checkout u
   writeFileSync(join(worktree.worktreePath, "new.cpp"), "int helper() { return 2; }\n");
   assert.deepEqual((await manager.getChangedFiles("task-1")).sort(), ["main.cpp", "new.cpp"]);
   assert.deepEqual((await manager.getStatus("task-1")).map((file) => file.path).sort(), ["main.cpp", "new.cpp"]);
+  assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: false, reason: "WORKTREE_CHANGES" });
   assert.match(await manager.getDiff("task-1"), /return 1/);
   await assert.rejects(manager.openInIDE("task-1"), /Configure an IDE executable/);
 
@@ -82,6 +84,10 @@ test("task worktree creation records base metadata and leaves primary checkout u
   assert.equal(existsSync(worktree.worktreePath), true);
   git(worktree.worktreePath, "reset", "--hard");
   git(worktree.worktreePath, "clean", "-fd");
+  assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: true, reason: null });
+  writeFileSync(join(worktree.worktreePath, "main.cpp"), "int main() { return 2; }\n");
+  await manager.createCheckpoint("task-1");
+  assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: false, reason: "BRANCH_CHANGES" });
   await manager.removeTaskWorktree("task-1");
   assert.equal(existsSync(worktree.worktreePath), false);
   assert.equal(db.prepare("SELECT worktree_path FROM tasks WHERE id = 'task-1'").get().worktree_path, null);

@@ -292,3 +292,11 @@ At the user's request, the plan now includes a future Settings implementation: d
 - `npm run smoke:pi`: passed all three configured real-Pi checks—persistent-session restart/Live history, WebSocket events and steering delivery, and abort during real streaming. Smoke cleanup is isolated; no persistent application database reset was performed.
 - The integrated review covered queue capacity and order, Stop/answer ordering, unanswered and answered restart recovery, no original-prompt replay, extension isolation, and the agreed UI. No critical issues or warnings were reported.
 - **Phase 7 gate: PASSED.** Phase 8 and later remain out of scope. Per-agent Pi capability profiles remain future Settings work. No changes were made to the user-global Pi extension.
+
+### 2026-09-29 — Review completion feedback: safe Mark as done
+
+- Added a Review-only completion preview and `POST /api/tasks/:taskId/complete` action. Mark as done is permitted only when there is no active work, the worktree has no uncommitted Git changes, and the task branch still points at its recorded base. Completion removes the clean worktree before moving the task to Done; dirty, changed, unverifiable, or failed-cleanup cases leave the task in Review.
+- The panel shows Mark as done only when the backend preview reports readiness. Uncommitted changes require commit/discard before closure; a changed task branch shows a disabled Merge back to source action pending Phase 9. Added the requested Phase 9 policy: after validation and explicit confirmation, successful merge-back closes the task and removes its worktree only when clean.
+- Added route/API/UI coverage for clean completion and worktree removal, dirty and branch-changed rejection, retained Review state on rejection, and the Mark as done vs. Merge back UI distinction. Independent review found no critical issues.
+- Verification passed: `npm test` (119 tests across shared/server/web), `npm run typecheck`, and `git diff --check`. No application database reset or persistent worktree operation was performed.
+- Merge-back execution, validation, and confirmation are intentionally not implemented in this safe-close change; they remain Phase 9 work.

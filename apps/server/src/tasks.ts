@@ -115,6 +115,73 @@ export function registerTaskRoutes(
     }
   });
 
+  app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/complete-preview", async (request, reply) => {
+    const task = db.prepare(`SELECT t.workflow_state, t.worktree_path FROM tasks t JOIN projects p ON p.id = t.project_id
+      WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(request.params.taskId) as
+      { workflow_state: string; worktree_path: string | null } | undefined;
+    if (!task) return reply.code(404).send({ error: "Task not found." });
+    if (task.workflow_state !== "REVIEW") return reply.code(409).send({ error: "Only tasks in Review can be marked as done." });
+    if (!worktrees) {
+      return task.worktree_path
+        ? reply.code(503).send({ error: "Task Git state cannot be verified." })
+        : { ready: true, reason: null };
+    }
+    try {
+      return await worktrees.getTaskCompletionStatus(request.params.taskId);
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { taskId: string } }>("/api/tasks/:taskId/complete", async (request, reply) => {
+    const release = operations.tryAcquire(request.params.taskId);
+    if (!release) return reply.code(409).send({ error: "Another operation is in progress for this task." });
+    try {
+      const task = db.prepare(`SELECT t.workflow_state, t.worktree_path FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.id = ? AND t.is_active = 1 AND p.is_active = 1`).get(request.params.taskId) as
+        { workflow_state: string; worktree_path: string | null } | undefined;
+      if (!task) return reply.code(404).send({ error: "Task not found." });
+      if (task.workflow_state !== "REVIEW") return reply.code(409).send({ error: "Only tasks in Review can be marked as done." });
+      const activeRun = db.prepare(`SELECT 1 FROM task_runs r LEFT JOIN agent_jobs j ON j.task_run_id = r.id
+        WHERE r.task_id = ? AND (r.status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_HUMAN', 'WAITING_FOR_INFERENCE')
+          OR j.status IN ('QUEUED', 'CLAIMED')) LIMIT 1`).get(request.params.taskId);
+      if (activeRun) return reply.code(409).send({ error: "Stop or finish active work before marking this task as done." });
+
+      const gitStatus = worktrees
+        ? await worktrees.getTaskCompletionStatus(request.params.taskId).catch((error) => ({
+          ready: false, reason: "GIT_STATE_UNAVAILABLE" as const,
+          message: error instanceof Error ? error.message : String(error),
+        }))
+        : task.worktree_path ? { ready: false, reason: "GIT_STATE_UNAVAILABLE" as const } : { ready: true, reason: null };
+      if (!gitStatus.ready) {
+        const error = "message" in gitStatus ? gitStatus.message
+          : gitStatus.reason === "WORKTREE_CHANGES"
+            ? "Task worktree has uncommitted Git changes; commit or discard them before marking the task as done."
+            : gitStatus.reason === "BRANCH_CHANGES"
+              ? "Task branch contains changes that must be merged back to the source branch before marking it as done."
+              : "Task Git state could not be verified; marking it as done is blocked.";
+        return reply.code(409).send({ error, reason: gitStatus.reason });
+      }
+      if (task.worktree_path) {
+        if (!worktrees) return reply.code(503).send({ error: "Task worktree cleanup is unavailable; the task remains in Review." });
+        try {
+          await worktrees.removeTaskWorktree(request.params.taskId);
+        } catch (error) {
+          return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      const now = new Date().toISOString();
+      const updated = db.prepare(`UPDATE tasks SET workflow_state = 'DONE', review_tag = NULL,
+        cleanup_status = NULL, updated_at = ? WHERE id = ? AND is_active = 1 AND workflow_state = 'REVIEW'`)
+        .run(now, request.params.taskId);
+      if (updated.changes !== 1) return reply.code(409).send({ error: "Task state changed; refresh before closing it." });
+      return { status: "done" };
+    } finally {
+      release();
+    }
+  });
+
   app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/checkpoint-preview", async (request, reply) => {
     const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
       .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;

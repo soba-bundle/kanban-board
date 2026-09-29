@@ -496,6 +496,13 @@ Implement “Merge back to working branch” for the project's recorded base bra
 Require successful matching validation and explicit approval. A checkpoint alone
 must not enable unsafe integration. Expose validation prerequisites clearly.
 
+Review closure policy: show “Mark as done” only when the task worktree is clean and
+the task branch has no changes relative to its recorded base; on success, move the
+task to Done and remove its clean worktree. If the working tree is dirty, require
+commit/discard first. If the task branch contains changes, show “Merge back to
+source”; after validation and explicit user confirmation, complete the planned
+merge flow, then close the task and remove the worktree only when it is clean.
+
 Unchanged SHAs: final checks, fast-forward, deterministic post-integration verification.
 Base moved: persist approval, sync into task, priority fresh validation, recheck
 exact SHAs before integration. Priority never preempts an active job.

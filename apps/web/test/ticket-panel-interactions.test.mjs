@@ -93,6 +93,59 @@ test("composer gates on prompt/stage, keeps Shift+Enter, and preserves draft thr
   view.unmount();
 });
 
+test("Review can be closed as Done while retaining the task and its run history", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const requests = [];
+  let changed = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), method: options.method ?? "GET" });
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-task-1", commit_sha: "a".repeat(40), state_token: "clean",
+    });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: true, reason: null });
+    if (String(url).endsWith("/complete")) return response(url, { status: "done" });
+    return response(url, []);
+  };
+  const view = testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, {
+      task: task("REVIEW", "INVESTIGATION_COMPLETE"), queue: null, onClose() {}, onChanged() { changed++; },
+    })));
+
+  const closeButton = await testing.screen.findByRole("button", { name: "Mark as done" });
+  testing.fireEvent.click(closeButton);
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.method === "POST" &&
+    request.url === "/api/tasks/task-1/complete")));
+  await testing.waitFor(() => assert.ok(changed > 0, "the board refreshes so the task moves from Review to Done"));
+  view.unmount();
+});
+
+test("Review with task-branch changes shows Merge back, not Mark as done", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), method: options.method ?? "GET" });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-task-1", commit_sha: "a".repeat(40), state_token: "clean",
+    });
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    return response(url, []);
+  };
+  const view = testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, {
+      task: task("REVIEW", "INVESTIGATION_COMPLETE"), queue: null, onClose() {}, onChanged() {},
+    })));
+
+  const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to source/ });
+  assert.equal(mergeButton.disabled, true, "merge-back remains gated until the planned validation/approval phase");
+  assert.equal(testing.screen.queryByRole("button", { name: "Mark as done" }), null);
+  assert.equal(requests.some((request) => request.method === "POST" && request.url.endsWith("/complete")), false);
+  view.unmount();
+});
+
 test("explicit reuse starts a new run linked to the unresolved source input", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);

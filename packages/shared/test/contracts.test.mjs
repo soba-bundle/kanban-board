@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   BoardSnapshotSchema,
   CreateTaskSchema,
-  CreateTicketCommentSchema,
   ImplementationHandoverSchema,
   InvestigationHandoverSchema,
   LiveEventSchema,
@@ -13,7 +12,6 @@ import {
   RunMessageSchema,
   StartRunSchema,
   TaskRunSummarySchema,
-  TicketCommentSchema,
   handoverSchemaForStage,
   ProjectSchema,
   RunStatusSchema,
@@ -89,32 +87,7 @@ test("run summary rejects unknown reason codes", () => {
   assert.equal(TaskRunSummarySchema.safeParse({ ...run, reason_code: null }).success, true);
 });
 
-test("ticket comment schema validates delivery metadata", () => {
-  const comment = {
-    id: "c1",
-    task_id: "t1",
-    run_id: null,
-    author_type: "USER",
-    content: "Please check the retry path.",
-    delivery_status: "PENDING",
-    delivery_type: null,
-    delivered_session_id: null,
-    delivered_run_id: null,
-    delivered_at: null,
-    created_at: timestamp,
-    updated_at: null,
-  };
-  assert.equal(TicketCommentSchema.safeParse(comment).success, true);
-  assert.equal(TicketCommentSchema.safeParse({
-    ...comment,
-    delivery_status: "QUEUED",
-    delivery_type: "STEERING",
-  }).success, true);
-  assert.equal(TicketCommentSchema.safeParse({ ...comment, delivery_status: "SENT" }).success, false);
-  assert.equal(TicketCommentSchema.safeParse({ ...comment, delivery_type: "EMAIL" }).success, false);
-  assert.equal(CreateTicketCommentSchema.safeParse({ content: " note " }).success, true);
-  assert.equal(CreateTicketCommentSchema.safeParse({ content: "   " }).success, false);
-
+test("run reason codes reject unknown values", () => {
   assert.equal(RunReasonCodeSchema.safeParse("HANDOVER_FAILED").success, true);
   assert.equal(RunReasonCodeSchema.safeParse("GAVE_UP").success, false);
 });

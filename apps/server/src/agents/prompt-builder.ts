@@ -4,8 +4,6 @@ export interface RunPrompt {
   text: string;
   /** Run inputs that will be included in the initial Pi user message. */
   inputIds: string[];
-  /** Legacy comments are never injected into a new run. */
-  commentIds: string[];
 }
 
 interface PromptRow {
@@ -37,31 +35,5 @@ export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt 
     sections.push(`Additional queued guidance:\n${queuedInputs.map((input) => `- ${input.content}`).join("\n")}`);
   }
 
-  return { text: sections.join("\n\n"), inputIds: inputs.map((input) => input.id), commentIds: [] };
-}
-
-export function revertCommentsToPending(db: Database.Database, commentIds: string[], runId: string): void {
-  if (commentIds.length === 0) return;
-  const update = db.prepare(`UPDATE ticket_comments SET delivery_status = 'PENDING', delivery_type = NULL,
-    delivered_session_id = NULL, delivered_run_id = NULL, delivered_at = NULL
-    WHERE id = ? AND delivery_status = 'DELIVERED' AND delivery_type = 'NEXT_PROMPT' AND delivered_run_id = ?`);
-  db.transaction(() => {
-    for (const id of commentIds) update.run(id, runId);
-  })();
-}
-
-export function markCommentsDelivered(
-  db: Database.Database,
-  commentIds: string[],
-  sessionId: string,
-  runId: string,
-): void {
-  if (commentIds.length === 0) return;
-  const now = new Date().toISOString();
-  const update = db.prepare(`UPDATE ticket_comments SET delivery_status = 'DELIVERED',
-    delivery_type = 'NEXT_PROMPT', delivered_session_id = ?, delivered_run_id = ?, delivered_at = ?
-    WHERE id = ? AND delivery_status = 'PENDING'`);
-  db.transaction(() => {
-    for (const id of commentIds) update.run(sessionId, runId, now, id);
-  })();
+  return { text: sections.join("\n\n"), inputIds: inputs.map((input) => input.id) };
 }

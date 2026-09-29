@@ -30,7 +30,11 @@ export function HandoverCard({ run }: { run: TaskRunSummary }) {
         </span>
       </header>
       {run.error_message && <p className="run-error">{run.error_message}</p>}
-      {!handover && <p className="run-empty">No handover recorded for this run.</p>}
+      {!handover && <p className="run-empty">{run.status === "INTERRUPTED"
+        ? "Run interrupted before the final handover. Enter a new prompt in Live to continue."
+        : run.status === "FAILED"
+          ? "Run failed before a final handover was recorded."
+          : "No handover recorded for this run."}</p>}
       {handover && (
         <div className="handover-body">
           {typeof handover.summary === "string" && <p className="handover-summary">{handover.summary}</p>}

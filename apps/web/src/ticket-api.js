@@ -1,4 +1,4 @@
-async function request(url, options, expectJson = true) {
+async function request(url, options) {
   let response;
   try {
     response = await fetch(url, options);
@@ -17,7 +17,7 @@ async function request(url, options, expectJson = true) {
     }
   }
   if (!response.ok) throw new Error(result?.error ?? result?.message ?? `${url} failed with HTTP ${response.status}.`);
-  if (expectJson && result === undefined) throw new Error(`${url} returned an empty response.`);
+  if (result === undefined) throw new Error(`${url} returned an empty response.`);
   return result;
 }
 
@@ -26,28 +26,12 @@ const json = (body) => ({
   body: JSON.stringify(body),
 });
 
-export function loadComments(taskId) {
-  return request(`/api/tasks/${encodeURIComponent(taskId)}/comments`);
-}
-
 export function loadRuns(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/runs`);
 }
 
 export function loadLiveHistory(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/live/history`);
-}
-
-export function addComment(taskId, content) {
-  return request(`/api/tasks/${encodeURIComponent(taskId)}/comments`, { method: "POST", ...json({ content }) });
-}
-
-export function editComment(commentId, content) {
-  return request(`/api/comments/${encodeURIComponent(commentId)}`, { method: "PATCH", ...json({ content }) });
-}
-
-export function deleteComment(commentId) {
-  return request(`/api/comments/${encodeURIComponent(commentId)}`, { method: "DELETE" }, false);
 }
 
 export function steerRun(runId, inputId, text, reusedFromInputId) {

@@ -82,7 +82,7 @@ async function verifyRepeatedSessionAndRestore() {
   let expectedSessionId;
   let expectedSessionFile;
   for (const [runId, prompt] of prompts) {
-    await runs.start(runId, { text: prompt, commentIds: [], inputIds: [] });
+    await runs.start(runId, { text: prompt, inputIds: [] });
     await waitForRun(runId);
     const run = db.prepare("SELECT session_id, session_file FROM task_runs WHERE id = ?").get(runId);
     expectedSessionId ??= run.session_id;
@@ -96,7 +96,7 @@ async function verifyRepeatedSessionAndRestore() {
   agents = createAgentManager();
   await new RunManager(db, agents).start("smoke-restore", {
     text: "After restarting, what exact marker did I ask you to remember? Reply with only the marker.",
-    commentIds: [], inputIds: [],
+    inputIds: [],
   });
   await waitForRun("smoke-restore");
   const restoredRun = db.prepare("SELECT session_id, session_file FROM task_runs WHERE id = 'smoke-restore'").get();

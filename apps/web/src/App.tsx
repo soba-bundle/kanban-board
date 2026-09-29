@@ -171,8 +171,8 @@ export function App() {
             : deleteTarget.item.name}
           kind={deleteTarget.kind === "task" ? "ticket" : "project"}
           effects={deleteTarget.kind === "task"
-            ? "This permanently deletes the ticket with its description, comments, run history, and review state, and removes it from the board. A clean worktree is removed; dirty worktrees are kept and must be cleaned first."
-            : "This permanently deletes the project and every ticket inside it, along with their comments, run histories, and review states. Worktree files on disk are retained."
+            ? "This permanently deletes the ticket with its description, run history, and review state, and removes it from the board. A clean worktree is removed; dirty worktrees are kept and must be cleaned first."
+            : "This permanently deletes the project and every ticket inside it, along with their run histories, and review states. Worktree files on disk are retained."
           }
           busy={busyId === deleteTarget.item.id}
           onCancel={() => setDeleteTarget(null)}

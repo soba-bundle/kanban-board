@@ -84,10 +84,6 @@ function describeEvent(event: LiveEvent): string | null {
       return typeof data.delta === "string" ? data.delta : null;
     case "tool_execution_start":
       return `\n[tool] ${String(data.toolName ?? "unknown")}\n`;
-    case "comment_queued":
-      return `\n[steering queued] ${String(data.content ?? "")}\n`;
-    case "comment_delivered":
-      return `\n[steering delivered]\n`;
     default:
       return null;
   }

@@ -27,7 +27,7 @@ export function registerTaskRunRoutes(app: FastifyInstance, db: Database.Databas
       ...run,
       stage: run.stage,
       status: run.status,
-      handover: handover_json ? JSON.parse(handover_json) : null,
+      handover: run.status === "COMPLETED" && handover_json ? JSON.parse(handover_json) : null,
     }));
   });
 }

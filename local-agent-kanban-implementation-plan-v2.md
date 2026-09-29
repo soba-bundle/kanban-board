@@ -11,8 +11,10 @@ the original as history. This plan describes target behavior, not completed code
 Development stopped after the v1 Phase 6 checkpoint work, committed as `577df52`.
 The baseline includes Review actions, user-triggered checkpoints, untracked-file
 confirmation, SHA persistence and a basic SHA-pinned checkpoint diff API/viewer.
-It still has comments/Timeline and does not implement the newly confirmed workflow.
-Existing passing tests do not establish conformance to v2.
+It still has the retired ticket-comments/Timeline concept and does not implement the
+newly confirmed workflow. Existing passing tests do not establish conformance to v2.
+Existing application databases are to be intentionally cleared; legacy ticket
+comments will not be migrated or preserved.
 
 **Resume at Phase 6A — Direct Messaging and Durable Live Migration.** Do not restart
 Phases 0–6 wholesale, and do not jump directly to Phase 7. Phase 6A deliberately
@@ -47,7 +49,8 @@ Phase 12. After its acceptance gate passes, continue Phase 7, then 8 through 13.
 - Phase 4: five-column board remains primary, global queue/max concurrency,
   reorder/remove/Stop and Windows owned-process cleanup; no hard budgets.
 - Phase 5: preserve strict stage-specific handovers and single missing-handover
-  retry. Replace comment/timeline behavior with Phase 6A, not a second input channel.
+  retry. Replace the retired ticket-comments/Timeline behavior with Phase 6A run
+  inputs, not a second input channel.
 - Phase 6: retain user-directed checkpointing, SHA persistence and exact-SHA diffs.
   Upgrade always-confirm UX, concurrency guards and post-checkpoint action state.
 
@@ -60,23 +63,26 @@ steering does not start a turn. Verify delivery through actual conversation even
 
 Implement in the following order, with a passing verification gate at each step.
 
-### 6A.1 Contracts and safe data migration
+### 6A.1 Contracts and clean database initialization
 
 Define run-start request: task ID, stage, nonblank prompt and idempotency identity.
 Define run-message request with stable identity and backend-selected queued/steer
 routing. Add durable ordered run input records with delivery status/type, accepted
 and delivered times, session/transcript entry references, failure reason, and a
 link to the original when explicitly reused. Add run transcript start/end boundary
-references and a future validation message watermark; retain immutable historical
-data. Keep the migration additive and versioned.
+references and a future validation message watermark; retain immutable run history.
+Keep the new schema versioned.
 
-Remove writable comment endpoints/UI from the active product. Preserve old rows
-as read-only legacy history; identify delivered versus undelivered guidance and
-surface the latter for explicit reuse. Never blindly resend delivered text.
+Retire ticket comments completely: do not expose comment routes or UI, do not
+migrate old comments into run inputs, and do not retain old application data.
+Before reset, inventory all configured database paths, stop the backend, and clear
+only the confirmed application databases. Do not delete session files, worktrees,
+repositories, or unrelated databases. Ensure the final versioned schema and clean
+database initialization have no ticket_comments table or comment-only metadata.
 
-Verify: migrate a DB containing delivered, pending and accepted-but-undelivered
-legacy comments without deleting history or silently injecting it into new runs.
-Contract tests reject blank prompts and invalid stages, and retries are idempotent.
+Verify: clean initialization has no ticket_comments table or comment records, while
+run inputs and transcript history work normally. Contract tests reject blank prompts
+and invalid stages, and retries are idempotent.
 
 ### 6A.2 Unified Todo/Review start flow
 
@@ -171,8 +177,9 @@ provisional tokens but must not corrupt or misattribute durable messages.
 
 ### 6A.6 Live-first UI and confirmation dialogs
 
-Remove Timeline/comments. Default to Live; retain Runs handovers. Show title and
-description above the initial composer. Start focuses the same stage/prompt flow.
+Remove the ticket-comments/Timeline concept entirely. Default to Live; retain Runs
+handovers. Show title and description above the initial composer. Start focuses the
+same stage/prompt flow.
 Todo/Review Send and Enter require both fields and open confirmation; Shift+Enter
 adds a newline. Preserve draft on cancel. Retain direct-Implementation warning.
 Queued sends append run inputs; running sends steer. Display accepted/pending versus
@@ -209,10 +216,39 @@ untouched, empty worktree, SHA recording, and post-checkpoint action state.
 
 ### Phase 6A exit gate
 
-PRD v2 sections 3–6 and 8–9 work end-to-end; old comment creation is unavailable;
-legacy data is preserved; two concurrent refreshed tickets recover correct history
-and streams; one authoritative handover follows all accepted guidance; tests and
-typecheck pass. No validation/merge implementation is claimed by this migration.
+**Decision: PASSED — 2026-09-29.** Evidence against the gate:
+
+- Ticket-comment routes are not registered; the production-server regression test
+  verifies legacy GET/POST/PATCH/DELETE paths return 404. Comment UI, APIs,
+  shared contracts and active application behavior are removed.
+- The three confirmed SQLite files were intentionally cleared and reinitialized:
+  `apps/server/data/kanban.sqlite`, `apps/server/data/security-smoke.sqlite`, and
+  `apps/server/data/backups/kanban-pre-phase6a-reset.sqlite`. Each is at schema
+  version 7, has zero tasks, passes `PRAGMA integrity_check`, and contains neither
+  `ticket_comments` nor `comments_watermark`. Paths and scope are in
+  `phase-6a-rectification-log.md`.
+- `phase6a-acceptance.test.mjs` verifies two simultaneous tickets across refresh,
+  reconnect, steering and completion without cross-talk. It uses controlled
+  sessions; `npm run smoke:pi` separately verifies real Pi persistent-session
+  restoration, event streaming, steering delivery and abort.
+- Run-input delivery/reuse, handover retry/failure, checkpoint, migration and
+  component behavior have focused suite coverage. `steering.test.mjs` submits
+  initial and revised candidates through the actual `submit_handover` tool and
+  verifies the final payload/watermark and one Runs result.
+- The Stop-during-drain test stops while the handover-update prompt is pending. It
+  verifies `INTERRUPTED` / `USER_STOPPED`, delivered guidance remains `DELIVERED`,
+  and Runs suppresses the provisional candidate. It then queues a new explicit
+  prompt from Review and verifies a distinct run uses the same session, Live history
+  retains both runs' inputs, and Runs shows only the completed follow-up handover.
+  The component test checks interrupted-run messaging and that the prompt composer
+  remains enabled for an explicit continuation.
+- `npm run typecheck` passed. `npm test` passed all 93 tests (shared 9, server 68,
+  web 16), including real temporary-Git checkpoint commit/failure tests.
+  `npm run smoke:pi` passed all three real-Pi scenarios. `git diff --check` passed.
+
+This gate does not claim Phase 8 validation or Phase 9 merge implementation.
+Production questionnaire-extension compatibility remains a separate Phase 7
+kickoff prerequisite.
 
 ## 4. Phase 7 — Questionnaire / Requires Human
 
@@ -234,7 +270,7 @@ Build/test/review, detect tracked mutation, clean disposable worktree.
 
 PASSED creates immutable task/base/message snapshot and Ready to Merge.
 ISSUES_FOUND becomes Validation Issues; infrastructure/session/tool problems become
-Validation Failed. Results appear in Runs/Live, never comments. Retry never resumes
+Validation Failed. Results appear in Runs/Live. Retry never resumes
 an old validation session. Candidate changes invalidate readiness.
 
 Verify snapshot pinning, message selection, worktree isolation and all outcomes.
@@ -289,7 +325,7 @@ questionnaire, validation and merge.
 Build on already functional durable Live: collapsed reasoning/tools with previews,
 per-response Model/Input Tokens/Output Tokens, richer tool renderers, changed-file
 sidebar, project filter, Settings, toasts and recovery messaging. Do not reintroduce
-Timeline or comments. Keep board primary and Runs handover behavior intact.
+Timeline or ticket comments. Keep board primary and Runs handover behavior intact.
 
 ## 10. Phase 13 — End-to-End Hardening
 
@@ -306,7 +342,8 @@ Timeline or comments. Keep board primary and Runs handover behavior intact.
 - Merge conflicts, base moving once/twice, dirty primary, compare-and-swap and crash.
 - Inference retries/overflow/compaction and provisional text rollback.
 - Single-instance exclusion, localhost Host/Origin protection and no cross-task access.
-- Legacy migration preserves history and never duplicates delivered guidance.
+- Clean database initialization contains no ticket-comments schema or data; reset
+does not delete session files, worktrees or unrelated databases.
 
 ## 11. Verification commands and engineering invariants
 

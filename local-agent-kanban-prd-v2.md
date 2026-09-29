@@ -38,8 +38,8 @@ remain; project-specific profiles are future work.
 
 ## 3. Ticket navigation
 
-Ticket tabs are **Live** (default) and **Runs**. Remove Timeline and the writable
-comments section. Runs retains the current structured handover presentation.
+Ticket tabs are **Live** (default) and **Runs**. The retired Timeline and ticket-
+comments concepts are absent. Runs retains the current structured handover presentation.
 A new Todo ticket has no agent output: Live shows title, description, prompt
 composer and Investigation/Implementation selection.
 
@@ -103,7 +103,7 @@ On restart reconcile accepted inputs against the saved boundary and active branc
 Never resend a delivered input. If a crash or transcript change makes delivery
 ambiguous, mark it delivery-unknown and surface it for explicit user resolution;
 do not silently retry or attach it to another run. Messages retain task, run,
-session and delivery identity; do not append a separate ticket comment.
+session and delivery identity; all user guidance is represented as a run input.
 
 ## 5. Completion and handover
 
@@ -162,8 +162,8 @@ Build/test must not mutate authoritative task state; unexpected tracked changes
 in the validation worktree mean validation failure.
 
 Outcomes remain PASSED, ISSUES_FOUND and VALIDATION_FAILED. Passing creates an
-immutable snapshot and Ready to Merge. Store/render results in Runs/Live, not
-comments. Retry uses a new Review session. Changing candidate code invalidates
+immutable snapshot and Ready to Merge. Store/render results in Runs/Live. Retry
+uses a new Review session. Changing candidate code invalidates
 validation; new guidance must not silently count as already validated.
 
 Phase 9 integrates only the exact validated state:
@@ -208,18 +208,23 @@ Phase 12. A bounded in-memory live buffer alone is not sufficient history.
 ## 9. Persistence and migration
 
 Retain projects, tasks, task_runs, agent_jobs, human_requests, validation_results,
-validation_snapshots and merge_attempts. Introduce run-scoped input records with
-stable ID, task/run, sequence, text, delivery type/status, accepted/delivered time,
-session/transcript identity and cancellation/failure information. Exact migration
-schema is an implementation detail; distinguish intent from actual receipt.
+validation_snapshots and merge_attempts. Do not include the retired ticket_comments
+table or comment-only metadata in the active schema. Introduce run-scoped input
+records with stable ID, task/run, sequence, text, delivery type/status,
+accepted/delivered time, session/transcript identity and cancellation/failure
+information. Exact migration schema is an implementation detail; distinguish intent
+from actual receipt.
 
-Replace comment watermarks with message watermarks for future validation.
-Remove new comment CRUD from the active API/UI. Preserve existing comments as
-read-only legacy data for migration/audit; do not delete them or blindly resend
-already delivered content. Surface undelivered legacy guidance for explicit reuse.
-On queued-job cancellation or Stop, preserve undelivered inputs visibly; do not
+Use message watermarks for future validation. Existing application databases are
+intentionally cleared and initialized clean for this implementation; there is no
+legacy-comment migration, audit, or reuse flow. The reset must explicitly inventory
+configured database paths, stop the backend, and clear only confirmed application
+databases. Do not delete session files, worktrees, repositories, or unrelated
+databases. Keep schema initialization/versioning for the new data model.
+
+On queued-job cancellation or Stop, preserve undelivered run inputs visibly; do not
 silently inject them into another run. The user may explicitly reuse an eligible
-input through Live, creating a new linked input record. Delivered transcript
+run input through Live, creating a new linked input record. Delivered transcript
 content is immutable.
 
 ## 10. Questionnaire, queue and process safety
@@ -276,7 +281,7 @@ manual recovery. No automatic destructive repair.
 4. Queued sends combine in order; active sends steer; dispatch races lose no input.
 5. One final handover follows processing all accepted guidance in a normal run.
 6. Browser refresh restores history and the correct stream for at least two running tickets.
-7. No new comments can be added; legacy data survives migration without duplicate delivery.
+7. Ticket comments, their routes/UI, and comment-only schema are absent. Existing application databases are intentionally reset without importing legacy comments.
 8. Commit always confirms; cancellation preserves Review/work; untracked files need approval.
 9. Checkpoint diffs stay SHA-pinned despite later edits. Merge remains validation-gated.
 10. Questionnaire, validation, merge, inference, process cleanup and restart scenarios

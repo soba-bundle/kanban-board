@@ -250,8 +250,6 @@ test("Stop Run during worktree setup prevents the agent prompt from starting", a
   registerQueueRoutes(app, queue);
   t.after(async () => { releaseWorktree?.(); await app.close(); db.close(); });
 
-  db.prepare(`INSERT INTO ticket_comments (id, task_id, author_type, content, delivery_status, created_at)
-    VALUES ('c-1', 'task-1', 'USER', 'undelivered note', 'PENDING', ?)`).run(new Date().toISOString());
   const queued = enqueue(queue, "task-1", "INVESTIGATION");
   await worktreeStarted;
   const stopped = await app.inject({ method: "POST", url: `/api/runs/${queued.run_id}/stop` });
@@ -259,8 +257,7 @@ test("Stop Run during worktree setup prevents the agent prompt from starting", a
   releaseWorktree();
   await waitFor(() => db.prepare("SELECT status FROM agent_jobs WHERE id = ?").get(queued.job_id).status === "FINISHED");
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = ?").get(queued.run_id).status, "INTERRUPTED");
-  // Nothing reached the model, so the comment must still be pending for the next run.
-  assert.equal(db.prepare("SELECT delivery_status FROM ticket_comments WHERE id = 'c-1'").get().delivery_status, "PENDING");
+  // Nothing reached the model; guidance stays undelivered for explicit reuse.
   assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE run_id = ?").get(queued.run_id).delivery_status, "UNDELIVERED");
 });
 

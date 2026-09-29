@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import type { RunInput, ReviewTag } from "@kanban-board/shared";
 import { AgentManager } from "./agent-manager.js";
-import { markCommentsDelivered, revertCommentsToPending, type RunPrompt } from "./prompt-builder.js";
+import type { RunPrompt } from "./prompt-builder.js";
 import { readHandover } from "./handover-tool.js";
 
 const HANDOVER_RETRY_PROMPT = [
@@ -141,7 +141,6 @@ export class RunManager {
         this.markStopped(runId, taskId);
         return;
       }
-      markCommentsDelivered(this.db, prompt.commentIds, session.sessionId, runId);
       const promptPromise = this.agents.prompt(taskId, runId, prompt.text);
       this.flushPendingSteering(runId);
       await promptPromise;
@@ -155,7 +154,6 @@ export class RunManager {
         const now = new Date().toISOString();
         this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ? WHERE id = ?`)
           .run(now, error instanceof Error ? error.message : String(error), runId);
-        if (!watcher.sawUserMessage()) revertCommentsToPending(this.db, prompt.commentIds, runId);
         this.markInputsUnresolved(runId);
       }
     } finally {
@@ -322,11 +320,9 @@ export class RunManager {
     }
   }
 
-  private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void; sawUserMessage: () => boolean } {
+  private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void } {
     let initialDelivered = false;
-    let sawUserMessage = false;
     const unsubscribe = this.agents.subscribe(taskId, runId, (event) => {
-      if (event.type === "message_start" && event.data.role === "user") sawUserMessage = true;
       if (event.type !== "entry_appended") return;
       const entryId = typeof event.data.entryId === "string" ? event.data.entryId : null;
       if (!entryId) return;
@@ -365,7 +361,7 @@ export class RunManager {
       }
       this.markInputDelivered(next.id, sessionId, entryId);
     });
-    return { unsubscribe, sawUserMessage: () => sawUserMessage };
+    return { unsubscribe };
   }
 
   private markInputDelivered(inputId: string, sessionId: string | null, entryId: string): void {

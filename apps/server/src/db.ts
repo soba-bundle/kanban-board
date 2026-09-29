@@ -237,5 +237,16 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const ticketCommentsRetired = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 7").get();
+  if (!ticketCommentsRetired) {
+    const migrate = db.transaction(() => {
+      db.exec(`DROP TABLE ticket_comments;
+        ALTER TABLE validation_snapshots DROP COLUMN comments_watermark;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (7, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

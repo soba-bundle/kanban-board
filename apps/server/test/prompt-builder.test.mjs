@@ -30,7 +30,7 @@ test("prompt puts explicit user instructions before task description and carries
   assert.match(prompt.text, /Title: Fix retry/);
   assert.ok(prompt.text.indexOf("Inspect the retry behavior") < prompt.text.indexOf("Task description:"));
   assert.match(prompt.text, /Retries drop the abort signal\./);
-  assert.deepEqual(prompt.commentIds, []);
+  assert.deepEqual(prompt.inputIds, ["initial"]);
   assert.throws(() => buildRunPrompt(db, "missing"), /not found/);
 });
 
@@ -49,7 +49,7 @@ test("prompt combines only that run's queued guidance once in accepted order", (
   assert.ok(prompt.text.indexOf("Implement the fix") < prompt.text.indexOf("Task description:"));
   assert.match(prompt.text, /Additional queued guidance:\n- first note\n- second note/);
   assert.doesNotMatch(prompt.text, /must not leak|already delivered|belongs to active steering/);
-  assert.deepEqual(prompt.commentIds, []);
+  assert.deepEqual(prompt.inputIds, ["initial", "queued-1", "queued-2"]);
 });
 
 test("a run without an explicit initial prompt cannot dispatch", (t) => {

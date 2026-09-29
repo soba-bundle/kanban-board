@@ -122,34 +122,6 @@ export const BoardSnapshotSchema = z.object({
 });
 export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
 
-export const CommentAuthorTypeSchema = z.enum(["USER", "AGENT", "SYSTEM"]);
-export type CommentAuthorType = z.infer<typeof CommentAuthorTypeSchema>;
-
-export const CommentDeliveryStatusSchema = z.enum(["PENDING", "QUEUED", "DELIVERED"]);
-export type CommentDeliveryStatus = z.infer<typeof CommentDeliveryStatusSchema>;
-
-export const CommentDeliveryTypeSchema = z.enum(["NEXT_PROMPT", "STEERING"]);
-export type CommentDeliveryType = z.infer<typeof CommentDeliveryTypeSchema>;
-
-export const TicketCommentSchema = z.object({
-  id: z.string().min(1),
-  task_id: z.string().min(1),
-  run_id: z.string().min(1).nullable(),
-  author_type: CommentAuthorTypeSchema,
-  content: z.string().min(1),
-  delivery_status: CommentDeliveryStatusSchema,
-  delivery_type: CommentDeliveryTypeSchema.nullable(),
-  delivered_session_id: z.string().min(1).nullable(),
-  delivered_run_id: z.string().min(1).nullable(),
-  delivered_at: z.string().datetime().nullable(),
-  created_at: z.string().datetime(),
-  updated_at: z.string().datetime().nullable(),
-});
-export type TicketComment = z.infer<typeof TicketCommentSchema>;
-
-export const CreateTicketCommentSchema = z.object({ content: z.string().trim().min(1) });
-export const UpdateTicketCommentSchema = CreateTicketCommentSchema;
-
 export const TaskRunSummarySchema = z.object({
   id: z.string().min(1),
   stage: WorkingPhaseSchema,

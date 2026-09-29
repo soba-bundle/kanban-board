@@ -74,7 +74,7 @@ function collect(socket, count) {
 test("joining Live mid-run replays earlier output before streaming new events", async (t) => {
   const { db, agents, runs, getSession } = makeFixture(t);
   const app = await startApp(t, db, agents);
-  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  void runs.start("run-1", { text: "investigate", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted === true);
 
   // Output produced before anyone is watching.
@@ -97,7 +97,7 @@ test("joining Live mid-run replays earlier output before streaming new events", 
 test("reconnect replays only events after the supplied sequence cursor", async (t) => {
   const { db, agents, runs, getSession } = makeFixture(t);
   const app = await startApp(t, db, agents);
-  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  void runs.start("run-1", { text: "investigate", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted === true);
   getSession().emitDelta("one");
   getSession().emitDelta("two");
@@ -113,7 +113,7 @@ test("reconnect replays only events after the supplied sequence cursor", async (
 test("an expired replay cursor signals a gap and sends the bounded tail", async (t) => {
   const { db, agents, runs, getSession } = makeFixture(t, 2);
   const app = await startApp(t, db, agents);
-  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  void runs.start("run-1", { text: "investigate", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted === true);
   for (const text of ["a", "b", "c", "d"]) getSession().emitDelta(text);
 
@@ -148,7 +148,7 @@ test("a run socket receives only events scoped to its task and run", async (t) =
 
 test("replay is bounded and dropped once the run finishes", async (t) => {
   const { agents, runs, getSession, db } = makeFixture(t, 3);
-  void runs.start("run-1", { text: "investigate", commentIds: [] });
+  void runs.start("run-1", { text: "investigate", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted === true);
 
   for (const text of ["a", "b", "c", "d", "e"]) getSession().emitDelta(text);

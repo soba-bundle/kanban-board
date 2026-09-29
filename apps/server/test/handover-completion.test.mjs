@@ -42,7 +42,7 @@ const task = (db) => db.prepare("SELECT workflow_state, review_tag FROM tasks WH
 
 test("investigation handover on the first prompt completes the run and moves to Review", async (t) => {
   const { db, runs, prompts } = makeFixture(t, { submitOn: [0] });
-  await runs.start("run-1", { text: "investigate", commentIds: [] });
+  await runs.start("run-1", { text: "investigate", inputIds: [] });
 
   assert.equal(prompts.length, 1);
   assert.equal(run(db).status, "COMPLETED");
@@ -52,14 +52,14 @@ test("investigation handover on the first prompt completes the run and moves to 
 
 test("implementation handover uses its own review tag", async (t) => {
   const { db, runs } = makeFixture(t, { stage: "IMPLEMENTATION", submitOn: [0] });
-  await runs.start("run-1", { text: "implement", commentIds: [] });
+  await runs.start("run-1", { text: "implement", inputIds: [] });
   assert.equal(run(db).status, "COMPLETED");
   assert.deepEqual(task(db), { workflow_state: "REVIEW", review_tag: "IMPLEMENTATION_COMPLETE" });
 });
 
 test("a missing handover is requested exactly once and then succeeds", async (t) => {
   const { db, runs, prompts } = makeFixture(t, { submitOn: [1] });
-  await runs.start("run-1", { text: "investigate", commentIds: [] });
+  await runs.start("run-1", { text: "investigate", inputIds: [] });
 
   assert.equal(prompts.length, 2);
   assert.match(prompts[1], /without calling submit_handover/);
@@ -70,7 +70,7 @@ test("a missing handover is requested exactly once and then succeeds", async (t)
 
 test("a second missing handover fails the run with HANDOVER_FAILED", async (t) => {
   const { db, runs, prompts } = makeFixture(t, { submitOn: [] });
-  await runs.start("run-1", { text: "investigate", commentIds: [] });
+  await runs.start("run-1", { text: "investigate", inputIds: [] });
 
   // Exactly one retry, never more.
   assert.equal(prompts.length, 2);
@@ -83,7 +83,7 @@ test("a second missing handover fails the run with HANDOVER_FAILED", async (t) =
 
 test("validation review runs complete without requiring a handover", async (t) => {
   const { db, runs, prompts } = makeFixture(t, { stage: "VALIDATION_REVIEW", submitOn: [] });
-  await runs.start("run-1", { text: "review", commentIds: [] });
+  await runs.start("run-1", { text: "review", inputIds: [] });
 
   assert.equal(prompts.length, 1);
   assert.equal(run(db).status, "COMPLETED");
@@ -93,7 +93,7 @@ test("validation review runs complete without requiring a handover", async (t) =
 
 test("a stop during the handover retry is recorded as interrupted, not handover failure", async (t) => {
   const { db, runs } = makeFixture(t, { submitOn: [] });
-  const started = runs.start("run-1", { text: "investigate", commentIds: [] });
+  const started = runs.start("run-1", { text: "investigate", inputIds: [] });
   await runs.stop("run-1");
   await started;
 

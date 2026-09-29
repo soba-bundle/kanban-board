@@ -80,9 +80,9 @@ test("successive runs reuse the persisted task session", async (t) => {
   t.after(() => { agents.dispose("task-1"); db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
   const runs = new RunManager(db, agents);
 
-  await runs.start("run-1", { text: "investigate", commentIds: [] });
+  await runs.start("run-1", { text: "investigate", inputIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-1'").get().status === "COMPLETED");
-  await runs.start("run-2", { text: "implement", commentIds: [] });
+  await runs.start("run-2", { text: "implement", inputIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-2'").get().status === "COMPLETED");
 
   assert.equal(createdSessions.length, 1);
@@ -96,7 +96,7 @@ test("successive runs reuse the persisted task session", async (t) => {
 
   agents.dispose("task-1");
   const restoredAgents = createAgentManager();
-  await new RunManager(db, restoredAgents).start("run-3", { text: "continue", commentIds: [] });
+  await new RunManager(db, restoredAgents).start("run-3", { text: "continue", inputIds: [] });
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-3'").get().status !== "RUNNING");
   assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = 'run-3'").get().status, "COMPLETED", db.prepare("SELECT error_message FROM task_runs WHERE id = 'run-3'").get().error_message);
   assert.equal(createdSessions.length, 2);

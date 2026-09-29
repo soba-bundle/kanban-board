@@ -16,6 +16,7 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   });
   t.after(() => vite.close());
   const { TicketPanel, LiveMessageCard } = await vite.ssrLoadModule("/src/components/TicketPanel.tsx");
+  const { HandoverCard } = await vite.ssrLoadModule("/src/components/HandoverCard.tsx");
   const { ToastProvider } = await vite.ssrLoadModule("/src/components/ToastContext.tsx");
   const task = {
     id: "task-1", project_id: "project-1", title: "Improve retries", description: "Avoid duplicate requests.",
@@ -32,6 +33,29 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.doesNotMatch(markup, /Timeline|Comments/);
   assert.match(markup, /composer-stage-picker/);
   assert.match(markup, /Start run/);
+
+  const interruptedTaskMarkup = renderToStaticMarkup(createElement(ToastProvider, null,
+    createElement(TicketPanel, {
+      task: { ...task, workflow_state: "REVIEW", review_tag: "INTERRUPTED" },
+      queue: null, onClose() {}, onChanged() {},
+    })));
+  assert.match(interruptedTaskMarkup, /Enter a prompt and choose a stage to start a run/);
+  assert.match(interruptedTaskMarkup, /composer-stage-picker/);
+  assert.match(interruptedTaskMarkup, /Start run/);
+
+  const interruptedCard = renderToStaticMarkup(createElement(HandoverCard, { run: {
+    id: "run-1", stage: "INVESTIGATION", sequence: 1, status: "INTERRUPTED", reason_code: "USER_STOPPED",
+    error_message: "Run stopped by user.", handover: null,
+  } }));
+  assert.match(interruptedCard, /Run interrupted before the final handover/);
+  assert.match(interruptedCard, /Enter a new prompt in Live to continue/);
+  assert.doesNotMatch(interruptedCard, /Initial candidate/);
+
+  const completedCard = renderToStaticMarkup(createElement(HandoverCard, { run: {
+    id: "run-2", stage: "INVESTIGATION", sequence: 2, status: "COMPLETED", reason_code: null,
+    error_message: null, handover: { summary: "Final handover" },
+  } }));
+  assert.match(completedCard, /Final handover/);
 
   const timestamp = new Date().toISOString();
   const messageCard = renderToStaticMarkup(createElement(LiveMessageCard, {

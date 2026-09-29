@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../dist/db.js";
 
-test("migration 7 retires ticket comments while preserving run-input and transcript schema", (t) => {
+test("migrations retire ticket comments and preserve legacy Human Requests and transcript schema", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "kanban-db-migration-"));
   const path = join(dir, "legacy.sqlite");
   let db;
@@ -25,6 +25,10 @@ test("migration 7 retires ticket comments while preserving run-input and transcr
       title TEXT NOT NULL, description TEXT NOT NULL, workflow_state TEXT NOT NULL,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE task_runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id));
+    CREATE TABLE human_requests (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+      run_id TEXT NOT NULL REFERENCES task_runs(id), session_id TEXT, tool_call_id TEXT,
+      question TEXT NOT NULL, options_json TEXT, answer TEXT, status TEXT NOT NULL,
+      created_at TEXT NOT NULL, answered_at TEXT);
     CREATE TABLE ticket_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), content TEXT NOT NULL);
     CREATE TABLE validation_snapshots (
       id TEXT PRIMARY KEY, comments_watermark TEXT, result TEXT NOT NULL, created_at TEXT NOT NULL
@@ -34,11 +38,15 @@ test("migration 7 retires ticket comments while preserving run-input and transcr
     INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
       VALUES ('t1', 'p1', 'Task', '', 'TODO', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z');
     INSERT INTO task_runs (id, task_id) VALUES ('r1', 't1');
+    INSERT INTO human_requests (id, task_id, run_id, session_id, tool_call_id, question,
+      options_json, answer, status, created_at, answered_at) VALUES
+      ('h1', 't1', 'r1', 's1', 'call1', 'Legacy question', '["Yes"]', 'Yes', 'ANSWERED',
+        '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z');
     INSERT INTO ticket_comments VALUES ('c1', 't1', 'legacy guidance');`);
   legacy.close();
 
   db = openDatabase(path);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("SELECT transcript_start_entry_id, transcript_end_entry_id FROM task_runs WHERE id = 'r1'").get(), {
     transcript_start_entry_id: null,
@@ -55,15 +63,20 @@ test("migration 7 retires ticket comments while preserving run-input and transcr
   assert.deepEqual(db.prepare("PRAGMA table_info(run_transcript_entries)").all().map((column) => column.name), [
     "session_id", "entry_id", "run_id", "sequence",
   ]);
+  assert.deepEqual(db.prepare(`SELECT question, options_json, answer, status, questions_json, answers_json
+    FROM human_requests WHERE id = 'h1'`).get(), {
+    question: "Legacy question", options_json: '["Yes"]', answer: "Yes", status: "ANSWERED",
+    questions_json: null, answers_json: null,
+  });
   assert.throws(() => db.prepare(`INSERT INTO run_inputs
     (id, task_id, run_id, sequence, idempotency_key, content, delivery_type, delivery_status, accepted_at)
     VALUES ('i1', 't1', 'r1', 1, 'k1', 'text', 'STEERING', 'NOPE', '2025-01-01T00:00:00.000Z')`).run(), /CHECK constraint failed/);
 });
 
-test("fresh databases apply migrations through the comment-free live-history schema", (t) => {
+test("fresh databases apply migrations through the structured Human Request schema", (t) => {
   const db = openDatabase(":memory:");
   t.after(() => db.close());
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 7);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "task_id", "validation_run_id", "validated_task_sha", "validated_base_sha",

@@ -34,6 +34,22 @@ export function loadLiveHistory(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/live/history`);
 }
 
+export function loadHumanRequests(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/human-requests`);
+}
+
+export function answerHumanRequest(requestId, answers) {
+  return request(`/api/human-requests/${encodeURIComponent(requestId)}/answer`, {
+    method: "POST", ...json({ answers }),
+  });
+}
+
+export function stopHumanRequest(requestId) {
+  return request(`/api/human-requests/${encodeURIComponent(requestId)}/stop`, {
+    method: "POST", ...json({}),
+  });
+}
+
 export function steerRun(runId, inputId, text, reusedFromInputId) {
   return request(`/api/runs/${encodeURIComponent(runId)}/inputs`, {
     method: "POST",

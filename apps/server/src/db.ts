@@ -248,5 +248,19 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const structuredHumanRequestsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 8").get();
+  if (!structuredHumanRequestsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE human_requests ADD COLUMN questions_json TEXT;
+        ALTER TABLE human_requests ADD COLUMN answers_json TEXT;
+        CREATE UNIQUE INDEX human_requests_session_tool_call
+          ON human_requests(session_id, tool_call_id)
+          WHERE session_id IS NOT NULL AND tool_call_id IS NOT NULL;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

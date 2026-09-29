@@ -7,6 +7,8 @@ import { registerProjectRoutes } from "./projects.js";
 import { registerTaskRoutes } from "./tasks.js";
 import { registerTaskRunRoutes } from "./task-runs.js";
 import { AgentManager } from "./agents/agent-manager.js";
+import { HumanRequestService } from "./agents/human-requests.js";
+import { registerHumanRequestRoutes } from "./agents/human-request-routes.js";
 import { registerLiveEventRoutes } from "./agents/live-event-routes.js";
 import { RunManager } from "./agents/run-manager.js";
 import { registerRunRoutes } from "./agents/run-routes.js";
@@ -31,13 +33,20 @@ const worktreeManager = new WorktreeManager(db);
 const taskOperations = new TaskOperationCoordinator();
 registerTaskRoutes(app, db, worktreeManager, taskOperations);
 registerTaskRunRoutes(app, db);
-const agentManager = new AgentManager(db);
+let queueManager: QueueManager;
+const humanRequests = new HumanRequestService(db, {
+  onWaiting: (request) => queueManager.parkForHuman(request.run_id, request.id),
+  onAnswered: (request) => queueManager.resumeHumanRun(request.run_id, request.id),
+});
+const agentManager = new AgentManager(db, undefined, undefined, undefined, humanRequests);
 await registerLiveEventRoutes(app, db, agentManager);
-const runManager = new RunManager(db, agentManager);
+const runManager = new RunManager(db, agentManager, humanRequests);
 registerRunRoutes(app, runManager);
-const queueManager = new QueueManager(db, runManager, undefined, worktreeManager);
+queueManager = new QueueManager(db, runManager, undefined, worktreeManager);
+await runManager.reconcileHumanRequests();
 queueManager.initialize();
 registerQueueRoutes(app, queueManager, taskOperations);
+registerHumanRequestRoutes(app, db, humanRequests, (runId) => queueManager.stopRun(runId));
 
 app.get("/health", async () => {
   db.prepare("SELECT 1").get();

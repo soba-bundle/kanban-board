@@ -45,7 +45,66 @@ export const RunStatusSchema = z.enum([
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
-export const AgentJobStatusSchema = z.enum(["QUEUED", "CLAIMED", "FINISHED", "CANCELLED"]);
+export const HumanRequestStatusSchema = z.enum(["PENDING", "ANSWERED", "CANCELLED"]);
+export type HumanRequestStatus = z.infer<typeof HumanRequestStatusSchema>;
+export const HumanRequestQuestionOptionSchema = z.object({
+  value: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().optional(),
+});
+export const HumanRequestQuestionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  prompt: z.string().min(1),
+  options: z.array(HumanRequestQuestionOptionSchema),
+  allowOther: z.boolean(),
+}).refine((question) => question.options.length > 0 || question.allowOther, {
+  message: "A question must provide an option or allow a custom answer.",
+});
+export const HumanRequestQuestionsSchema = z.array(HumanRequestQuestionSchema).min(1)
+  .superRefine((questions, context) => {
+    const ids = new Set<string>();
+    questions.forEach((question, index) => {
+      if (ids.has(question.id)) {
+        context.addIssue({ code: "custom", path: [index, "id"], message: "Question IDs must be unique." });
+      }
+      ids.add(question.id);
+    });
+  });
+export const HumanRequestAnswerInputSchema = z.object({
+  id: z.string().min(1),
+  value: z.string().min(1),
+});
+export const HumanRequestAnswerBatchSchema = z.object({
+  answers: z.array(HumanRequestAnswerInputSchema).min(1),
+});
+export const HumanRequestAnswerSchema = z.object({
+  id: z.string().min(1),
+  value: z.string().min(1),
+  label: z.string().min(1),
+  wasCustom: z.boolean(),
+  index: z.number().int().positive().optional(),
+});
+export const HumanRequestSchema = z.object({
+  id: z.string().min(1),
+  task_id: z.string().min(1),
+  run_id: z.string().min(1),
+  session_id: z.string().min(1),
+  tool_call_id: z.string().min(1),
+  status: HumanRequestStatusSchema,
+  created_at: z.string().datetime(),
+  answered_at: z.string().datetime().nullable(),
+  questions: HumanRequestQuestionsSchema,
+  answers: z.array(HumanRequestAnswerSchema).nullable(),
+});
+export type HumanRequestQuestionOption = z.infer<typeof HumanRequestQuestionOptionSchema>;
+export type HumanRequestQuestion = z.infer<typeof HumanRequestQuestionSchema>;
+export type HumanRequestAnswerInput = z.infer<typeof HumanRequestAnswerInputSchema>;
+export type HumanRequestAnswerBatch = z.infer<typeof HumanRequestAnswerBatchSchema>;
+export type HumanRequestAnswer = z.infer<typeof HumanRequestAnswerSchema>;
+export type HumanRequest = z.infer<typeof HumanRequestSchema>;
+
+export const AgentJobStatusSchema = z.enum(["QUEUED", "CLAIMED", "WAITING_FOR_HUMAN", "FINISHED", "CANCELLED"]);
 export type AgentJobStatus = z.infer<typeof AgentJobStatusSchema>;
 
 export const RunReasonCodeSchema = z.enum([

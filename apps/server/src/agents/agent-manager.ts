@@ -1,8 +1,17 @@
 import { createAgentSession, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type Database from "better-sqlite3";
-import type { LiveEvent, LiveHistorySnapshot } from "@kanban-board/shared";
+import {
+  HumanRequestQuestionsSchema,
+  type HumanRequestAnswer,
+  type HumanRequestQuestion,
+  type LiveEvent,
+  type LiveHistorySnapshot,
+} from "@kanban-board/shared";
 import { normalizePiEvent } from "./pi-events.js";
 import { createHandoverTool } from "./handover-tool.js";
+import type { HumanRequestService } from "./human-requests.js";
+import { createKanbanQuestionnaireTool } from "../pi/questionnaire-tool.js";
+import { createKanbanResourceLoader } from "../pi/resource-loader.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -45,10 +54,15 @@ export class AgentManager {
     private readonly db: Database.Database,
     private readonly sessionDir = process.env.KANBAN_SESSION_DIR ?? "data/sessions",
     private readonly sessionFactory: SessionFactory = async (cwd, manager, customTools) => {
-      const { session } = await createAgentSession({ cwd, sessionManager: manager, customTools });
+      const { agentDir, settingsManager, resourceLoader } = createKanbanResourceLoader(cwd);
+      await resourceLoader.reload();
+      const { session } = await createAgentSession({
+        cwd, agentDir, settingsManager, resourceLoader, sessionManager: manager, customTools,
+      });
       return session;
     },
     private readonly replayLimit = Number(process.env.KANBAN_LIVE_REPLAY_LIMIT ?? 2000),
+    private readonly humanRequests?: HumanRequestService,
   ) {}
 
   async createWorkingSession(taskId: string): Promise<WorkingSession> {
@@ -137,6 +151,28 @@ export class AgentManager {
     return this.sessions.get(taskId)?.sessionManager?.getLeafId() ?? null;
   }
 
+  questionnaireCallState(taskId: string, sessionId: string, toolCallId: string): "RESULT" | "DANGLING" | "MISSING" {
+    const session = this.sessions.get(taskId);
+    if (!session?.sessionManager || session.sessionId !== sessionId) return "MISSING";
+    const callIndexes: number[] = [];
+    const resultIndexes: Array<{ index: number; valid: boolean }> = [];
+    const branch = session.sessionManager.getBranch();
+    for (const [index, entry] of branch.entries()) {
+      if (entry.type !== "message") continue;
+      const message = entry.message as { role?: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: boolean };
+      if (message.role === "toolResult" && message.toolCallId === toolCallId) {
+        resultIndexes.push({ index, valid: message.toolName === "kanban_questionnaire" && !message.isError });
+      }
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content as Array<{ type?: string; id?: string; name?: string }>) {
+        if (part.type === "toolCall" && part.id === toolCallId && part.name === "kanban_questionnaire") callIndexes.push(index);
+      }
+    }
+    if (callIndexes.length !== 1 || resultIndexes.length > 1 ||
+      resultIndexes.some((result) => !result.valid || result.index <= callIndexes[0]!)) return "MISSING";
+    return resultIndexes.length === 1 ? "RESULT" : "DANGLING";
+  }
+
   historySnapshot(taskId: string): LiveHistorySnapshot {
     const task = this.db.prepare(`SELECT t.working_session_id, t.working_session_file, t.worktree_path, p.root_path
       FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?`).get(taskId) as
@@ -180,17 +216,17 @@ export class AgentManager {
       for (const run of sessionRuns) {
         const recorded = this.db.prepare(`SELECT entry_id FROM run_transcript_entries
           WHERE run_id = ? AND session_id = ? ORDER BY sequence`).all(run.id, sessionId) as Array<{ entry_id: string }>;
-        if (recorded.length > 0) {
-          for (const item of recorded) if (indices.has(item.entry_id)) runByEntry.set(item.entry_id, run.id);
-          continue;
-        }
+        for (const item of recorded) if (indices.has(item.entry_id)) runByEntry.set(item.entry_id, run.id);
         const start = run.transcript_start_entry_id === null ? -1 : indices.get(run.transcript_start_entry_id);
         if (start === undefined) continue;
         const end = run.transcript_end_entry_id === null
           ? (run.status === "RUNNING" ? branch.length - 1 : start)
           : indices.get(run.transcript_end_entry_id);
         if (end === undefined || end <= start) continue;
-        for (let index = start + 1; index <= end; index++) runByEntry.set(branch[index]!.id, run.id);
+        for (let index = start + 1; index <= end; index++) {
+          const entryId = branch[index]!.id;
+          if (!runByEntry.has(entryId)) runByEntry.set(entryId, run.id);
+        }
       }
       for (const entry of branch) {
         if (entry.type !== "message" || !entry.message || typeof entry.message.role !== "string") continue;
@@ -203,7 +239,7 @@ export class AgentManager {
           session_id: sessionId,
           run_id: runByEntry.get(entry.id) ?? null,
           timestamp: entry.timestamp,
-          role: entry.message.role,
+          role: entry.message.role === "toolResult" ? "tool" : entry.message.role,
           message: entry.message as unknown as Record<string, unknown>,
         });
       }
@@ -252,9 +288,16 @@ export class AgentManager {
   }
 
   private async openSession(taskId: string, row: TaskSessionRow, manager: SessionManager): Promise<WorkingSession> {
+    this.repairAnsweredQuestionnaireCalls(taskId, manager);
     this.sessions.get(taskId)?.dispose();
     const session = await this.sessionFactory(this.cwd(row), manager, [
       createHandoverTool(this.db, { activeRunId: () => this.activeRuns.get(taskId) }),
+      createKanbanQuestionnaireTool({
+        humanRequests: this.humanRequests,
+        taskId,
+        runId: () => this.activeRuns.get(taskId),
+        sessionId: manager.getSessionId(),
+      }),
     ]);
     session.sessionManager ??= manager;
     const workingSession = session;
@@ -288,6 +331,132 @@ export class AgentManager {
       }
     });
     return workingSession;
+  }
+
+  private repairAnsweredQuestionnaireCalls(taskId: string, manager: SessionManager): void {
+    const branch = manager.getBranch();
+    const calls = new Map<string, Array<{ name: string; entryId: string; index: number }>>();
+    const results = new Map<string, Array<{ entryId: string; valid: boolean; index: number }>>();
+    for (const [index, entry] of branch.entries()) {
+      if (entry.type !== "message") continue;
+      const message = entry.message as { role?: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: boolean };
+      if (message.role === "toolResult" && message.toolCallId) {
+        const matching = results.get(message.toolCallId) ?? [];
+        matching.push({ entryId: entry.id, valid: message.toolName === "kanban_questionnaire" && !message.isError, index });
+        results.set(message.toolCallId, matching);
+      }
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content as Array<{ type?: string; id?: string; name?: string }>) {
+        if (part.type !== "toolCall" || !part.id) continue;
+        const matching = calls.get(part.id) ?? [];
+        matching.push({ name: part.name ?? "", entryId: entry.id, index });
+        calls.set(part.id, matching);
+      }
+    }
+
+    const requests = this.db.prepare(`SELECT run_id, tool_call_id, question, options_json, answer, questions_json, answers_json
+      FROM human_requests WHERE task_id = ? AND session_id = ? AND status = 'ANSWERED'
+      ORDER BY created_at, id`).all(taskId, manager.getSessionId()) as Array<{
+        run_id: string; tool_call_id: string; question: string; options_json: string | null; answer: string | null;
+        questions_json: string | null; answers_json: string | null;
+      }>;
+    const requestByCallId = new Map(requests.map((request) => [request.tool_call_id, request]));
+
+    for (const [toolCallId, matchingCalls] of calls) {
+      if (matchingCalls.length !== 1 || matchingCalls[0]!.name !== "kanban_questionnaire") continue;
+      const request = requestByCallId.get(toolCallId);
+      if (!request) continue;
+      const existingResults = results.get(toolCallId) ?? [];
+      if (existingResults.length > 1 || (existingResults[0] &&
+        (!existingResults[0].valid || existingResults[0].index <= matchingCalls[0]!.index))) continue;
+      let resultEntryId = existingResults[0]?.entryId;
+      if (!resultEntryId) {
+        const normalized = this.recoveryAnswers(request);
+        if (!normalized) continue;
+        const summary = normalized.questions.map((question) => {
+          const answer = normalized.answers.find((item) => item.id === question.id)!;
+          return answer.wasCustom
+            ? `${question.label}: user wrote: ${answer.value}`
+            : `${question.label}: user selected: ${answer.index ?? ""}. ${answer.label}`;
+        }).join("\n");
+        resultEntryId = manager.appendMessage({
+          role: "toolResult",
+          toolCallId,
+          toolName: "kanban_questionnaire",
+          content: [{ type: "text", text: summary }],
+          isError: false,
+          timestamp: Date.now(),
+        });
+        results.set(toolCallId, [{ entryId: resultEntryId, valid: true, index: manager.getBranch().length - 1 }]);
+      }
+      this.recordRecoveredToolEntry(manager.getSessionId(), request.run_id, matchingCalls[0]!.entryId);
+      this.recordRecoveredToolEntry(manager.getSessionId(), request.run_id, resultEntryId);
+    }
+  }
+
+  private recordRecoveredToolEntry(sessionId: string, runId: string, entryId: string): void {
+    this.db.transaction(() => {
+      const sequence = (this.db.prepare(`SELECT COALESCE(MAX(sequence), 0) + 1 AS next
+        FROM run_transcript_entries WHERE run_id = ?`).get(runId) as { next: number }).next;
+      this.db.prepare(`INSERT OR IGNORE INTO run_transcript_entries (session_id, entry_id, run_id, sequence)
+        VALUES (?, ?, ?, ?)`).run(sessionId, entryId, runId, sequence);
+    })();
+  }
+
+  private recoveryAnswers(request: {
+    question: string; options_json: string | null; answer: string | null;
+    questions_json: string | null; answers_json: string | null;
+  }): { questions: HumanRequestQuestion[]; answers: HumanRequestAnswer[] } | undefined {
+    try {
+      let questions: HumanRequestQuestion[];
+      if (request.questions_json) {
+        const stored = JSON.parse(request.questions_json) as Array<Record<string, unknown>>;
+        questions = HumanRequestQuestionsSchema.parse(stored.map((question) => ({
+          ...question,
+          label: question.label ?? question.prompt,
+          allowOther: question.allowOther ?? false,
+          options: Array.isArray(question.options) ? question.options.map((option) => typeof option === "string"
+            ? { value: option, label: option }
+            : { ...(option as Record<string, unknown>), label: (option as Record<string, unknown>).label ?? (option as Record<string, unknown>).value }) : [],
+        })));
+      } else {
+        const legacyOptions = JSON.parse(request.options_json ?? "[]") as Array<string | { value: string; label?: string; description?: string }>;
+        questions = HumanRequestQuestionsSchema.parse([{
+          id: "legacy-question",
+          label: request.question,
+          prompt: request.question,
+          options: legacyOptions.map((option) => typeof option === "string"
+            ? { value: option, label: option }
+            : { ...option, label: option.label ?? option.value }),
+          allowOther: legacyOptions.length === 0 || (request.answer !== null && !legacyOptions.some((option) =>
+            (typeof option === "string" ? option : option.value) === request.answer)),
+        }]);
+      }
+      const submitted = request.answers_json
+        ? JSON.parse(request.answers_json) as Array<{ id?: string; value?: string }>
+        : request.answer === null ? [] : [{ id: questions[0]!.id, value: request.answer }];
+      if (submitted.length !== questions.length) return undefined;
+      const byId = new Map(submitted.map((answer) => [answer.id, answer.value]));
+      if (byId.size !== submitted.length || questions.some((question) => !byId.has(question.id))) return undefined;
+
+      const answers: HumanRequestAnswer[] = [];
+      for (const question of questions) {
+        const value = byId.get(question.id);
+        if (typeof value !== "string" || !value.trim()) return undefined;
+        const optionIndex = question.options.findIndex((option) => option.value === value);
+        if (optionIndex >= 0) {
+          const option = question.options[optionIndex]!;
+          answers.push({ id: question.id, value, label: option.label, wasCustom: false, index: optionIndex + 1 });
+        } else if (question.allowOther) {
+          answers.push({ id: question.id, value, label: value, wasCustom: true });
+        } else {
+          return undefined;
+        }
+      }
+      return { questions, answers };
+    } catch {
+      return undefined;
+    }
   }
 
   private getTask(taskId: string): TaskSessionRow {

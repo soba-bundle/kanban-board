@@ -3,6 +3,13 @@ import test from "node:test";
 import {
   BoardSnapshotSchema,
   CreateTaskSchema,
+  HumanRequestAnswerBatchSchema,
+  HumanRequestAnswerInputSchema,
+  HumanRequestAnswerSchema,
+  HumanRequestQuestionSchema,
+  HumanRequestQuestionsSchema,
+  HumanRequestSchema,
+  HumanRequestStatusSchema,
   ImplementationHandoverSchema,
   InvestigationHandoverSchema,
   LiveEventSchema,
@@ -27,6 +34,35 @@ test("workflow enums accept declared values and reject unknown values", () => {
   assert.equal(WorkflowStateSchema.safeParse("ARCHIVED").success, false);
   assert.equal(RunStatusSchema.safeParse("WAITING_FOR_HUMAN").success, true);
   assert.equal(RunStatusSchema.safeParse("PAUSED").success, false);
+});
+
+test("Human Request contracts validate multi-question prompts and normalized answer batches", () => {
+  const questions = [
+    {
+      id: "scope", label: "Scope", prompt: "Which scope?",
+      options: [{ value: "small", label: "Small" }, { value: "large", label: "Large" }], allowOther: true,
+    },
+    { id: "risk", label: "Risk", prompt: "What risk is acceptable?", options: [], allowOther: true },
+  ];
+  assert.equal(HumanRequestQuestionsSchema.safeParse(questions).success, true);
+  assert.equal(HumanRequestQuestionsSchema.safeParse([questions[0], questions[0]]).success, false);
+  assert.equal(HumanRequestQuestionSchema.safeParse({ ...questions[1], allowOther: false }).success, false);
+  assert.equal(HumanRequestAnswerInputSchema.safeParse({ id: "scope", value: "large" }).success, true);
+  assert.equal(HumanRequestAnswerBatchSchema.safeParse({ answers: [
+    { id: "scope", value: "large" }, { id: "risk", value: "A controlled rollout" },
+  ] }).success, true);
+  assert.equal(HumanRequestAnswerSchema.safeParse({
+    id: "scope", value: "large", label: "Large", wasCustom: false, index: 2,
+  }).success, true);
+  assert.equal(HumanRequestAnswerSchema.safeParse({
+    id: "risk", value: "A controlled rollout", label: "A controlled rollout", wasCustom: true,
+  }).success, true);
+  assert.equal(HumanRequestStatusSchema.safeParse("CANCELLED").success, true);
+  assert.equal(HumanRequestStatusSchema.safeParse("WAITING").success, false);
+  assert.equal(HumanRequestSchema.safeParse({
+    id: "request-1", task_id: "t1", run_id: "r1", session_id: "s1", tool_call_id: "call-1",
+    status: "PENDING", created_at: timestamp, answered_at: null, questions, answers: null,
+  }).success, true);
 });
 
 test("project schema validates required project fields", () => {

@@ -252,14 +252,229 @@ kickoff prerequisite.
 
 ## 4. Phase 7 — Questionnaire / Requires Human
 
-Begin only after questionnaire spikes prove waiting, Stop and crash repair.
-Persist HumanRequest, park the same session, move to Requires Human and release
-local scheduler capacity. Answer persists/displays in Live and requeues without
-preemption; continue the same safe tool flow when scheduled. Stop aborts pending
-tool/turn and owned children, preserves history/work and returns Review/Interrupted.
-Repair incomplete tool history before provider requests after crash.
+### Compatibility finding and code boundary
 
-Verify normal answer, another concurrent run during wait, Stop and backend crash.
+The server's SDK-created `AgentSession` loads user extensions, but defaults to
+`print` mode unless explicitly bound to a UI. The installed
+`~/.pi/agent/extensions/pi-questions/index.ts` tool requires `ctx.mode === "tui"`
+and uses `ctx.ui.custom()`. The Kanban server does not bind a TUI; RPC mode also
+does not support `custom()`. A real in-memory `createAgentSession()` probe on the
+pinned Pi 0.84.4 loaded this tool from the user extension directory. It is **not
+compatible with the Kanban host as-is**.
+
+Keep the user-global extension untouched. Own Kanban Pi code under
+`apps/server/src/pi/`, separating SDK/server-backed tools from TUI-only extension
+adapters (and adding skill resources only when needed). Share questionnaire
+contracts between adapters. Configure the hosted session to avoid registering the
+global `pi-questions` tool alongside the repo-owned SDK tool, while preserving
+other user extensions. Prove that isolation with a deterministic test; CI must not
+depend on a developer's home-directory extensions.
+
+### Test-first implementation sequence
+
+Use a strict red/green workflow: write and review the characterization and
+acceptance tests for persistence, queue lifecycle, Stop, restart repair and UI
+before feature implementation. Confirm the request/recovery contract from those
+tests, then implement incrementally to make them pass. Do not make speculative
+production changes during compatibility spikes.
+
+1. **Characterize compatibility and define the request contract.** Pin the
+   characterization to the installed SDK behavior; test repo-owned tool
+   registration, parameter/result compatibility with `pi-questions`, multiple
+   questions, stable question IDs, option selection, free text and cancellation.
+   Keep this test isolated from the user's home directory.
+2. **Test persistence and API boundaries.** Cover creating/reloading a pending
+   HumanRequest, valid choice/free-text answers, invalid or duplicate answers,
+   idempotent answer submission, and Stop/answer races. Add a migration only if
+   the existing `human_requests` table cannot represent the approved contract; it
+   currently exists in the base schema but has no application service/API.
+3. **Test agent/queue lifecycle before implementation.** A tool request must
+   persist, put the task/run in Requires Human / `WAITING_FOR_HUMAN`, and release
+   scheduler capacity. Another task must run during the wait. An answer must be
+   persisted and visible in Live, then requeue the same continuation without
+   preemption; after obtaining capacity, the same session/tool flow resumes and
+   records one correlated tool result. Stop must abort the pending tool/turn,
+   cancel the request, preserve work/history and return Review/Interrupted.
+4. **Test backend-restart repair.** Cover restart with an unanswered request and
+   with an answer persisted before tool-result append. Preserve answer/request
+   state, reconcile unmatched questionnaire tool calls before any provider request,
+   and assert no duplicate tool result, request, provider replay or run dispatch.
+5. **Test the UI.** In `TicketPanel`, render the pending question(s), options and
+   free-text path in Requires Human; verify Answer/Stop controls, validation,
+   pending/answered state and Live history after continuation. Ordinary guidance
+   must not bypass a pending request.
+6. **Run integrated acceptance and regression checks.** Verify a normal answer,
+   another concurrent run while waiting, Stop, and backend crash/recovery using
+   controlled Pi sessions first; then exercise the real Pi runtime. Run typecheck,
+   focused tests and the full suite before updating the Phase 7 gate.
+
+Requirements throughout: persist HumanRequest state outside the in-memory tool
+Promise; retain the same task session; release scheduler capacity while waiting;
+answers requeue without preemption; Stop aborts pending tool/turn and owned
+children; preserve history/work; repair incomplete tool history before provider
+requests after crash. No automatic retry/replay of an unanswered request.
+
+### Decisions to settle in test design
+
+The existing `human_requests` table has one `question`/`options_json`/`answer`
+shape but the tool supports a multi-question call. Prefer one durable request per
+tool call with a structured question set and answers keyed by question ID; confirm
+that representation (and any required additive migration) in the contract tests.
+For restart while unanswered, keep the request visible and parked in Requires
+Human; after an explicit answer, repair/resume the same session only after a queue
+slot is available. Stop is the explicit cancellation path.
+
+### Confirmed multi-question UX and implementation sequence
+
+The requested interaction is **one Human Request per questionnaire tool call**,
+containing N stable-ID questions. In the Live panel, mirror the reference
+extension's tabbed flow: one question per tab, retain selections/free-text drafts
+when switching tabs, show a review/submit step enabled only when every question
+has an answer, and submit one answer batch. A custom free-text answer and choices
+must coexist in that batch. Stop cancels the whole request and sends no partial
+answers. This is a web interaction; do not add a Kanban TUI implementation or
+modify the user-global extension.
+
+### Sequential implementation plan — gated by the reviewed acceptance tests
+
+Implement one layer at a time. Keep the reviewed tests as the contract; if a test
+appears wrong, review the contract before changing it. Do not begin a later step
+until the current step's focused tests pass.
+
+1. **Migration and shared contract.** Add migration 8 for structured
+   `questions_json` / `answers_json` and uniqueness of `(session_id, tool_call_id)`
+   (or the exact key asserted by the migration test). Preserve the legacy columns
+   for compatibility. Define shared request/question/answer types and terminal
+   statuses. Verify fresh DB, migration from the previous schema, defaults/nulls,
+   and duplicate-call rejection with migration tests.
+2. **Durable Human Request state machine.** Implement
+   `apps/server/src/agents/human-requests.ts`: validate stable unique question IDs,
+   choices/custom-answer rules, exact answer coverage, normalization, list/reload,
+   idempotent identical answers, conflict rejection, and atomic answer-vs-Stop
+   transitions. Persist before making the tool wait observable. Keep separate
+   durable answer state and an in-process wait/resume/cancel mechanism. Make the
+   service and migration tests green before wiring Pi.
+3. **HTTP API.** Add authenticated list, batch-answer, and Stop routes; call the
+   real service and map invalid input, missing requests, and terminal conflicts
+   to stable responses. Verify persistence with a fresh API read, idempotent
+   answers, and route error mapping; service tests cover answer/Stop races, while
+   the queue tests cover user Stop of pending and queued continuations.
+4. **Repo-owned Pi tool and loader boundary.** Implement
+   `apps/server/src/pi/questionnaire-tool.ts` with the tested Pi schema/result
+   format and connect it to the service. Configure hosted `AgentManager` sessions
+   to exclude only the incompatible global TUI `questionnaire`, retain other
+   configured user extensions, and register the Kanban tool. Run the compatibility
+   and real `AgentSession.prompt()` tool tests; do not modify the user-global
+   extension or introduce a Kanban TUI adapter.
+5. **Queue lease and same-session continuation.** Integrate `RunManager`,
+   `QueueManager`, `AgentManager`, and the request service. **First make the
+   scheduler model explicit:** the current queue holds a concurrency slot for the
+   full `RunManager.start()` promise, while the Pi prompt must remain suspended
+   during a human wait. Parking must release the slot without losing the pending
+   execution; answering must enqueue a continuation that reacquires a slot before
+   resolving the tool wait. Resume that same Pi session/run—never start a parallel
+   prompt or preempt another job. Maintain `WAITING_FOR_HUMAN` / `REQUIRES_HUMAN`,
+   persist the one correlated tool result, and make queued Stop cancel the
+   continuation without partial answer delivery. Run the hosted queue/Stop tests
+   and verify the competing run completes before resumption.
+6. **Restart reconciliation.** Add startup recovery after the service and queue
+   primitives exist. An unanswered request remains visible and parked with no
+   tool result, provider call, guidance replay, or queue dispatch. For an answer
+   committed before tool-result append, idempotently append exactly one matching
+   result to the original session before any resumed provider request, then queue
+   the same continuation behind capacity. Cover multiple dangling calls, existing
+   results, mismatched/ghost calls, and Stop/answer ordering. Verify startup order
+   so normal queue initialization cannot interrupt or dispatch these runs first.
+7. **Live-panel UI.** Extend shared/web API types and `TicketPanel` with pending,
+   answered, and cancelled request states. Implement one-question-per-tab drafts,
+   free text, review gating, one batch answer POST, validation feedback, and Stop
+   with no partial POST. Disable ordinary guidance while waiting. Verify API-backed
+   close/reopen and persisted Live tool history as well as the interaction tests.
+8. **Integrated gate and log.** Run all Phase 7 acceptance tests, then the Pi
+   smoke/compatibility checks, typecheck, and full server/web suite. Review Stop,
+   queue-capacity and both restart crash boundaries together. Update this log and
+   the Phase 7 gate only when the entire suite passes. No automatic retry/replay
+   for an unanswered request; no persistent DB reset as a test shortcut.
+
+### Execution status — Steps 1–8 PASSED
+
+Migration 8 adds nullable structured request/answer JSON columns while preserving
+legacy Human Request fields and rows, plus a partial unique index on the session
+and Pi tool-call identity. Shared Zod schemas/types define question/options,
+answer inputs and normalized answers, request state, and uniqueness/answerability
+of the question set.
+
+`HumanRequestService` now persists before signaling a wait, validates and
+normalizes a complete answer batch, makes identical submissions idempotent,
+rejects conflicting answers, and atomically resolves answer-vs-cancel state.
+Its in-process waiter is only released by explicit `resume()` after scheduling;
+Stop rejects the waiter without overwriting an answer already committed. Legacy
+single-question rows remain readable. Step 3 adds request-list, batch-answer,
+and request-Stop routes and registers them in the server entrypoint; they inherit
+the global local host/origin guard, and Stop delegates to `QueueManager.stopRun`.
+Step 4 adds the repo-owned `kanban_questionnaire` SDK tool and a production Pi
+resource loader that excludes the configured global `extensions/pi-questions`
+path while preserving other extensions. The tool validates the multi-question
+contract, binds the active run ID at invocation, requires a configured service,
+rejects cancellation rather than returning a successful tool result, and checks
+complete answer coverage. `AgentManager` registers the tool; without injected
+queue-backed service it fails clearly instead of silently parking. Step 5 wires
+the real request service into `AgentManager`/`RunManager`/`QueueManager`, changes
+parked runs/jobs to `WAITING_FOR_HUMAN`, and releases queue capacity while keeping
+the original Pi prompt suspended. An answer requeues the same run, reacquires a
+slot before resolving the tool waiter, and can repeat this cycle for another
+Human Request. Stop cancels an unanswered wait or a queued answered continuation
+without resolving the waiter. Persisted Live history includes correlated tool
+results. Hosted Pi, repeated-wait, queue/Stop tests (20/20 focused), build,
+typecheck, and diff checks pass; independent review found no critical issues.
+Step 6 restart reconciliation is complete. Server startup awaits `RunManager.reconcileHumanRequests()` before normal queue initialization. Reconciliation covers persisted requests even when the queue row is missing or stale: pending requests remain parked without tool results or provider prompts, and a missing waiter job is recreated. Answered requests are repaired only when one successful matching tool result can be correlated after the unique call; every durable request must be answered and matched before continuation is queued. Recovered continuations append behind existing queue work, reacquire a claimed slot, and continue the same session with a distinct continuation instruction rather than replaying the original prompt. Stop/cancel state is respected, and generic orphaned RUNNING runs are interrupted even if their job is missing or no longer CLAIMED.
+
+Step 7 is implemented per the user's design: the request card sits directly above the Live composer without overlaying transcript output; question tabs retain drafts; the final Review tab submits all answers in one batch; Stop submits none and leaves a compact cancelled card. Pending Human Requests disable ordinary guidance. The board continues to place waiting tasks in Needs Input, separate from Review. API-backed reload/reopen is covered. Independent UI and integrated reviewers found no critical issues.
+
+**Phase 7 gate: PASSED.** `npm test` passed all shared/server/web tests (10 + 86 + 20 = 116, zero failures); `npm run typecheck` passed; `npm run smoke:pi` passed all three real-Pi scenarios (persistent-session restore/history, WebSocket and steering, streaming abort); `git diff --check` passed. The integrated review covered queue capacity, Stop/answer ordering, both restart crash boundaries, transcript-result correlation, and extension isolation. See `phase-6a-rectification-log.md` for the detailed implementation and verification record. Per-agent capability profiles remain future Settings work; Phase 8 and later remain out of scope.
+
+### Test-first acceptance tests and review — 2026-09-29
+
+The remaining Phase 7 acceptance **test specifications** are now authored and
+independently reviewed. No Phase 7 production feature code was changed. Coverage
+includes:
+
+- Production `AgentManager` resource loading against a temporary configured Pi
+  agent directory: exclude the incompatible `pi-questions` fixture, retain an
+  unrelated extension, and require the repo-owned hosted tool.
+- Migration 8 structure and uniqueness (one durable request per Pi tool-call
+  ID); real `HumanRequestService` validation/idempotency and API persistence.
+- A real hosted `AgentSession.prompt()` loop using a deterministic in-process
+  stream function (no external provider). It invokes the registered questionnaire
+  tool, parks the running request, runs a competing task, queues the accepted
+  answer without preemption, resumes the original `RunManager` operation after
+  capacity returns, and asserts one correlated Pi tool result and persisted Live
+  history. The separate controlled scheduler test is explicitly labeled as a
+  seam test.
+- Stop of an unanswered waiter and Stop of an answered continuation while it is
+  queued behind another task; answer/Stop commit-order coverage.
+- Restart repair for two answered dangling calls, an already-present result, an
+  unanswered call, and a ghost/mismatched request. No automatic provider replay
+  is allowed for an unanswered request.
+- Pi-style question tabs/review/batch/draft retention and no-partial-answer Stop.
+  A separate web integration test uses the actual HumanRequest service/routes
+  and Live-history route to reopen while pending, answer, and reopen with the
+  persisted request and tool-result entry.
+
+Verification so far: typecheck, MJS syntax checks, and `git diff --check` pass.
+  Focused tests are intentionally red against the unimplemented feature: the
+  configured production loader still exposes the TUI-only questionnaire, and
+  migration/service/route/tool/queue/restart/UI behavior is absent. The
+  unanswered restart characterization itself previously passed; current strict
+  migration assertions now fail until migration 8 exists. No external provider
+  request or persistent database operation was made.
+
+The independent final review found no critical defects or warnings in the
+remaining test specifications. Its approval is for test coverage only: the
+Phase 7 implementation/gate is **not passed** until production code makes the
+acceptance tests green. The Pi TUI tabs remain a behavioral reference—the
+requested Kanban interaction is implemented in the web panel, and the user's
+global extension stays untouched.
 
 ## 5. Phase 8 — Independent Validation and Snapshots
 
@@ -326,6 +541,22 @@ Build on already functional durable Live: collapsed reasoning/tools with preview
 per-response Model/Input Tokens/Output Tokens, richer tool renderers, changed-file
 sidebar, project filter, Settings, toasts and recovery messaging. Do not reintroduce
 Timeline or ticket comments. Keep board primary and Runs handover behavior intact.
+
+### Per-agent Pi capability profiles — future settings implementation
+
+Add an application Settings page for role-specific Pi capabilities. Investigation,
+Implementation, and Validation/Review agents must be able to load different sets
+of built-in/custom tools, skills, and extensions. Make the profiles user-editable
+in the Settings page and persist them in an application-owned JSON settings file.
+Resolve each profile dynamically when creating the corresponding hosted Pi
+session; do not mutate or duplicate the user's global extension directory. Keep
+the Kanban-only `pi-questions` exclusion mandatory regardless of profile.
+
+Before implementing, specify the JSON schema and path, role-to-profile mapping,
+extension/skill source resolution and trust rules. Test settings round-trip,
+role-specific resource/tool exposure, session isolation (no resources leaking
+between roles), and behavior when a profile changes between runs. This is a
+separate future step, not part of Phase 7 queue integration.
 
 ## 10. Phase 13 — End-to-End Hardening
 

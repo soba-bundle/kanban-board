@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CheckpointPreview, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
+import type { CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
 import { HandoverCard } from "./HandoverCard.js";
+import { HumanRequestPanel } from "./HumanRequestPanel.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
 import { useToast } from "./ToastContext.js";
 import {
+  answerHumanRequest,
+  loadHumanRequests,
   loadLiveHistory,
   loadRuns,
   openRunEvents,
   steerRun,
+  stopHumanRequest,
   loadCheckpointPreview,
   createCheckpoint,
   loadCheckpointDiff,
@@ -91,6 +95,9 @@ function describeEvent(event: LiveEvent): string | null {
 
 export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProps) {
   const [runs, setRuns] = useState<TaskRunSummary[]>([]);
+  const [humanRequests, setHumanRequests] = useState<HumanRequest[]>([]);
+  const [humanRequestError, setHumanRequestError] = useState<string | null>(null);
+  const [humanRequestBusy, setHumanRequestBusy] = useState(false);
   const [tab, setTab] = useState<Tab>("live");
   const [draft, setDraft] = useState("");
   const [draftInputId, setDraftInputId] = useState<string | null>(null);
@@ -110,6 +117,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [checkpointedSha, setCheckpointedSha] = useState<string | null>(null);
   const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string } | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  const mountedRef = useRef(true);
   const liveCursorRef = useRef(0);
   const liveTaskIdRef = useRef(task.id);
   liveTaskIdRef.current = task.id;
@@ -130,16 +138,46 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const refresh = useCallback(async () => {
     try {
       const nextRuns = await loadRuns(task.id);
+      if (!mountedRef.current) return;
       setRuns(nextRuns);
       setError(null);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      if (mountedRef.current) setError(caught instanceof Error ? caught.message : String(caught));
     }
   }, [task.id]);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const refreshHumanRequests = useCallback(async () => {
+    try {
+      const nextRequests = await loadHumanRequests(task.id);
+      if (!mountedRef.current || liveTaskIdRef.current !== task.id) return;
+      setHumanRequests(nextRequests);
+      setHumanRequestError(null);
+    } catch (caught) {
+      if (mountedRef.current && liveTaskIdRef.current === task.id) {
+        setHumanRequestError(caught instanceof Error ? caught.message : String(caught));
+      }
+    }
+  }, [task.id]);
+
+  useEffect(() => {
+    setHumanRequests([]);
+    void refreshHumanRequests();
+  }, [refreshHumanRequests]);
+
+  useEffect(() => {
+    if (!activeJob && task.workflow_state !== "REQUIRES_HUMAN") return;
+    const timer = setInterval(() => { void refreshHumanRequests(); }, ACTIVE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [activeJob, humanRequests, refreshHumanRequests, task.workflow_state]);
+
   async function refreshLiveHistory() {
     const snapshot = await loadLiveHistory(task.id);
-    if (liveTaskIdRef.current !== task.id) return;
+    if (!mountedRef.current || liveTaskIdRef.current !== task.id) return;
     setLiveHistory(snapshot);
     setLiveLog(formatProvisional(snapshot));
   }
@@ -297,6 +335,46 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     }
   }
 
+  const activeHumanRequest = humanRequests.find((request) => request.status === "PENDING") ?? humanRequests.slice().reverse()[0];
+  const waitingForHuman = activeHumanRequest?.status === "PENDING";
+
+  async function submitHumanAnswers(answers: HumanRequestAnswerInput[]) {
+    if (!activeHumanRequest || !waitingForHuman) return;
+    setHumanRequestBusy(true);
+    setHumanRequestError(null);
+    try {
+      const updated = await answerHumanRequest(activeHumanRequest.id, answers);
+      if (!mountedRef.current) return;
+      setHumanRequests((current) => current.map((request) => request.id === updated.id ? updated : request));
+      await refreshHumanRequests();
+      await refreshLiveHistory();
+      onChanged();
+    } catch (caught) {
+      if (mountedRef.current) setHumanRequestError(caught instanceof Error ? caught.message : String(caught));
+      await refreshHumanRequests();
+    } finally {
+      if (mountedRef.current) setHumanRequestBusy(false);
+    }
+  }
+
+  async function stopWaitingForHuman() {
+    if (!activeHumanRequest || !waitingForHuman) return;
+    setHumanRequestBusy(true);
+    setHumanRequestError(null);
+    try {
+      await stopHumanRequest(activeHumanRequest.id);
+      if (!mountedRef.current) return;
+      setHumanRequests((current) => current.map((request) => request.id === activeHumanRequest.id
+        ? { ...request, status: "CANCELLED" } : request));
+      onChanged();
+    } catch (caught) {
+      if (mountedRef.current) setHumanRequestError(caught instanceof Error ? caught.message : String(caught));
+      await refreshHumanRequests();
+    } finally {
+      if (mountedRef.current) setHumanRequestBusy(false);
+    }
+  }
+
   const history = liveHistory?.task_id === task.id ? liveHistory : null;
   const transcriptInputByEntry = new Map((history?.inputs ?? [])
     .filter((input) => input.transcript_entry_id && input.session_id)
@@ -323,6 +401,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }
 
   function submitDraft() {
+    if (waitingForHuman) return;
     const text = draft.trim();
     if (!text) return;
     if (activeJob) {
@@ -489,9 +568,16 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
           )}
         </div>
 
+        {tab === "live" && activeHumanRequest && <HumanRequestPanel key={activeHumanRequest.id}
+          request={activeHumanRequest} busy={humanRequestBusy} error={humanRequestError}
+          onAnswer={(answers) => { void submitHumanAnswers(answers); }}
+          onStop={() => { void stopWaitingForHuman(); }} />}
+        {tab === "live" && !activeHumanRequest && humanRequestError &&
+          <div className="human-request-load-error" role="alert">Human Request status: {humanRequestError}</div>}
         {tab === "live" && <footer className="ticket-composer">
           <p className="composer-hint">
-            {runningRunId
+            {waitingForHuman ? "Answer the Human Request above or stop the run before sending other guidance."
+              : runningRunId
               ? "New guidance is saved before being steered. Delivery status updates when its transcript entry is confirmed."
               : activeJob
                 ? "Guidance sent now is saved to this queued run in send order."
@@ -508,7 +594,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             value={draft}
             rows={3}
             placeholder={activeJob ? "Add guidance to this run…" : "What should the agent do?"}
-            disabled={!activeJob && !canStartRun}
+            disabled={!!waitingForHuman || (!activeJob && !canStartRun)}
             onChange={(event) => { setDraft(event.target.value); setDraftInputId(null); setReuseInputId(null); }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -518,7 +604,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             }}
           />
           <div className="dialog-actions">
-            <button className="button-primary" disabled={busy || !draft.trim() || (!activeJob && (!canStartRun || !startStage))} onClick={submitDraft}>
+            <button className="button-primary" disabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && (!canStartRun || !startStage))} onClick={submitDraft}>
               {activeJob ? "Send guidance" : "Start run"}
             </button>
           </div>

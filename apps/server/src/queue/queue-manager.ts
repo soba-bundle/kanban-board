@@ -20,9 +20,18 @@ interface NewQueueJob {
   created: boolean;
 }
 
+interface SuspendedExecution {
+  jobId: string;
+  requestId: string | null;
+  parked: boolean;
+  notifyParked: () => void;
+  parkedPromise: Promise<void>;
+}
+
 export class QueueManager {
   private dispatching = false;
   private readonly active = new Map<string, Promise<void>>();
+  private readonly suspended = new Map<string, SuspendedExecution>();
 
   constructor(
     private readonly db: Database.Database,
@@ -44,19 +53,17 @@ export class QueueManager {
         if (job.run_status === "QUEUED") {
           this.db.prepare("UPDATE agent_jobs SET status = 'QUEUED', started_at = NULL WHERE id = ?").run(job.job_id);
         } else if (job.run_status === "RUNNING") {
-          this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'BACKEND_INTERRUPTED',
-            interrupted_at = ?, error_message = 'Backend restarted while run was active.' WHERE id = ?`).run(now, job.run_id);
-          this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
-            WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END,
-            failure_reason = 'Backend restarted before transcript delivery could be confirmed.'
-            WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(job.run_id);
-          this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
-            .run(now, job.task_id);
-          this.db.prepare("UPDATE agent_jobs SET status = 'FINISHED', completed_at = ? WHERE id = ?").run(now, job.job_id);
+          this.markBackendInterrupted(job.run_id, job.task_id, job.job_id, now);
         } else {
           this.db.prepare("UPDATE agent_jobs SET status = 'FINISHED', completed_at = ? WHERE id = ?").run(now, job.job_id);
         }
       }
+      const orphanedRuns = this.db.prepare(`SELECT r.id AS run_id, r.task_id, j.id AS job_id
+        FROM task_runs r LEFT JOIN agent_jobs j ON j.task_run_id = r.id
+        WHERE r.status = 'RUNNING' AND (j.id IS NULL OR j.status <> 'CLAIMED')`).all() as Array<{
+          run_id: string; task_id: string; job_id: string | null;
+        }>;
+      for (const run of orphanedRuns) this.markBackendInterrupted(run.run_id, run.task_id, run.job_id, now);
       this.normalizeQueuePositions();
     })();
     this.dispatch();
@@ -145,6 +152,21 @@ export class QueueManager {
           r.status AS run_status, r.stage FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id WHERE r.id = ?`)
         .get(runId) as { job_id: string; job_status: string; task_id: string; run_status: string; stage: string } | undefined;
       if (!active) throw new Error(`Run ${runId} not found.`);
+      const answeredRequest = this.db.prepare(`SELECT 1 FROM human_requests
+        WHERE run_id = ? AND status = 'ANSWERED' LIMIT 1`).get(runId);
+      const humanWait = active.run_status === "WAITING_FOR_HUMAN";
+      const answeredContinuation = active.run_status === "QUEUED" && !!answeredRequest;
+
+      if ((humanWait || answeredContinuation) &&
+        ["WAITING_FOR_HUMAN", "QUEUED", "CLAIMED"].includes(active.job_status)) {
+        const now = new Date().toISOString();
+        this.db.prepare(`UPDATE agent_jobs SET status = 'CANCELLED', queue_position = NULL, completed_at = ?
+          WHERE id = ? AND status IN ('WAITING_FOR_HUMAN', 'QUEUED', 'CLAIMED')`).run(now, active.job_id);
+        this.db.prepare(`UPDATE human_requests SET status = 'CANCELLED'
+          WHERE run_id = ? AND status = 'PENDING'`).run(runId);
+        this.normalizeQueuePositions();
+        return "HUMAN_WAIT";
+      }
       if (active.job_status === "QUEUED") throw new Error("Run is queued; remove it from the queue instead.");
       if (active.job_status !== "CLAIMED") throw new Error(`Run ${runId} is not active.`);
       if (active.run_status === "RUNNING") return "RUNNING";
@@ -163,7 +185,64 @@ export class QueueManager {
         .run(tag, now, active.task_id);
       return "STOPPED";
     })();
-    if (result === "RUNNING") await this.runs.stop(runId);
+    if (result === "RUNNING") {
+      await this.runs.stop(runId);
+    } else if (result === "HUMAN_WAIT") {
+      if (typeof this.runs.stop === "function") await this.runs.stop(runId);
+      else this.markHumanWaitStopped(runId);
+      this.suspended.delete(runId);
+      this.dispatch();
+    }
+  }
+
+  parkForHuman(runId: string, requestId: string): void {
+    const execution = this.suspended.get(runId);
+    if (!execution) throw new Error(`Run ${runId} has no active queue lease to park.`);
+    this.db.transaction(() => {
+      const state = this.db.prepare(`SELECT j.id AS job_id, j.status AS job_status, r.status AS run_status,
+          h.status AS request_status FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+          JOIN human_requests h ON h.run_id = r.id WHERE r.id = ? AND h.id = ?`)
+        .get(runId, requestId) as { job_id: string; job_status: string; run_status: string; request_status: string } | undefined;
+      if (!state || state.job_id !== execution.jobId || state.job_status !== "CLAIMED" ||
+        state.run_status !== "RUNNING" || state.request_status !== "PENDING") {
+        throw new Error("Run cannot enter a Human Request wait in its current state.");
+      }
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE task_runs SET status = 'WAITING_FOR_HUMAN' WHERE id = ? AND status = 'RUNNING'").run(runId);
+      this.db.prepare("UPDATE agent_jobs SET status = 'WAITING_FOR_HUMAN', queue_position = NULL WHERE id = ? AND status = 'CLAIMED'")
+        .run(state.job_id);
+      this.db.prepare(`UPDATE tasks SET workflow_state = 'REQUIRES_HUMAN', review_tag = NULL, updated_at = ?
+        WHERE id = (SELECT task_id FROM task_runs WHERE id = ?)`).run(now, runId);
+    })();
+    execution.requestId = requestId;
+    execution.parked = true;
+    execution.notifyParked();
+  }
+
+  resumeHumanRun(runId: string, requestId: string): void {
+    const result = this.db.transaction(() => {
+      const job = this.db.prepare(`SELECT j.id AS job_id, j.status AS job_status, r.status AS run_status,
+          h.status AS request_status FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+          JOIN human_requests h ON h.run_id = r.id WHERE r.id = ? AND h.id = ?`)
+        .get(runId, requestId) as { job_id: string; job_status: string; run_status: string; request_status: string } | undefined;
+      if (!job) throw new Error(`Human Request ${requestId} is not associated with a queued run.`);
+      if (job.request_status !== "ANSWERED") throw new Error("Only an answered Human Request can resume.");
+      if (job.job_status === "CANCELLED" || ["INTERRUPTED", "FAILED"].includes(job.run_status)) return false;
+      const pendingRequest = this.db.prepare(`SELECT 1 FROM human_requests
+        WHERE run_id = ? AND status = 'PENDING' LIMIT 1`).get(runId);
+      if (pendingRequest) return false;
+      if (job.job_status !== "WAITING_FOR_HUMAN" || job.run_status !== "WAITING_FOR_HUMAN") {
+        throw new Error("Run is not parked for a Human Request.");
+      }
+      const position = (this.db.prepare("SELECT COALESCE(MAX(queue_position), 0) + 1 AS next FROM agent_jobs WHERE status = 'QUEUED'")
+        .get() as { next: number }).next;
+      this.db.prepare(`UPDATE task_runs SET status = 'QUEUED' WHERE id = ? AND status = 'WAITING_FOR_HUMAN'`).run(runId);
+      this.db.prepare(`UPDATE agent_jobs SET status = 'QUEUED', queue_position = ?, started_at = NULL
+        WHERE id = ? AND status = 'WAITING_FOR_HUMAN'`).run(position, job.job_id);
+      this.normalizeQueuePositions();
+      return true;
+    })();
+    if (result) this.dispatch();
   }
 
   remove(jobId: string): void {
@@ -237,6 +316,34 @@ export class QueueManager {
 
   private async execute(job: ClaimedJob): Promise<void> {
     try {
+      const suspended = this.suspended.get(job.run_id);
+      if (suspended?.parked) {
+        const requestId = suspended.requestId;
+        if (!requestId) throw new Error(`Run ${job.run_id} has no Human Request to resume.`);
+        suspended.parked = false;
+        suspended.requestId = null;
+        suspended.parkedPromise = new Promise<void>((resolve) => { suspended.notifyParked = resolve; });
+        const completion = typeof this.runs.resume === "function"
+          ? this.runs.resume(job.run_id, requestId)
+          : this.runs.start(job.run_id, undefined, requestId);
+        const outcome = await Promise.race([
+          completion.then(() => "completed" as const),
+          suspended.parkedPromise.then(() => "parked" as const),
+        ]);
+        if (outcome !== "parked" && !suspended.parked) this.suspended.delete(job.run_id);
+        return;
+      }
+
+      const restartRequest = this.db.prepare(`SELECT id FROM human_requests
+        WHERE run_id = ? AND status = 'ANSWERED' ORDER BY answered_at DESC, id DESC LIMIT 1`).get(job.run_id) as
+        { id: string } | undefined;
+      const runStatus = (this.db.prepare("SELECT status FROM task_runs WHERE id = ?").get(job.run_id) as
+        { status: string }).status;
+      if (restartRequest && runStatus === "QUEUED" && typeof this.runs.resumeAfterRestart === "function") {
+        await this.runs.resumeAfterRestart(job.run_id, restartRequest.id);
+        return;
+      }
+
       const worktreePath = (this.db.prepare("SELECT worktree_path FROM tasks WHERE id = ?").get(job.task_id) as
         { worktree_path: string | null }).worktree_path;
       if (!worktreePath && this.worktrees) await this.worktrees.createTaskWorktree(job.task_id);
@@ -246,20 +353,78 @@ export class QueueManager {
         if (cutoff.changes !== 1) throw new Error(`Run ${job.run_id} could not enter dispatch.`);
         return buildRunPrompt(this.db, job.run_id);
       })();
-      await this.runs.start(job.run_id, prompt);
+      let notifyParked!: () => void;
+      const parkedPromise = new Promise<void>((resolve) => { notifyParked = resolve; });
+      const execution: SuspendedExecution = {
+        jobId: job.job_id,
+        requestId: null,
+        parked: false,
+        notifyParked,
+        parkedPromise,
+      };
+      this.suspended.set(job.run_id, execution);
+      const completion = this.runs.start(job.run_id, prompt);
+      const outcome = await Promise.race([
+        completion.then(() => "completed" as const),
+        parkedPromise.then(() => "parked" as const),
+      ]);
+      if (outcome !== "parked" && !execution.parked) this.suspended.delete(job.run_id);
     } catch (error) {
+      const execution = this.suspended.get(job.run_id);
+      if (!execution?.parked) this.suspended.delete(job.run_id);
       const now = new Date().toISOString();
       const message = error instanceof Error ? error.message : String(error);
-      this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ?
-        WHERE id = ? AND status = 'QUEUED'`)
-        .run(now, message, job.run_id);
-      this.db.prepare(`UPDATE run_inputs SET delivery_status = 'UNDELIVERED', failure_reason = ?
-        WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(message, job.run_id);
+      const claimed = this.db.prepare("SELECT status FROM agent_jobs WHERE id = ?").get(job.job_id) as
+        { status: string } | undefined;
+      if (claimed?.status === "CLAIMED") {
+        const failed = this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ?
+          WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`).run(now, message, job.run_id);
+        if (failed.changes) {
+          this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'RUN_FAILED', updated_at = ?
+            WHERE id = ?`).run(now, job.task_id);
+          this.db.prepare(`UPDATE run_inputs SET delivery_status = 'UNDELIVERED', failure_reason = ?
+            WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(message, job.run_id);
+          this.db.prepare(`UPDATE human_requests SET status = 'CANCELLED'
+            WHERE run_id = ? AND status = 'PENDING'`).run(job.run_id);
+        }
+      }
     } finally {
       const now = new Date().toISOString();
-      this.db.prepare("UPDATE agent_jobs SET status = 'FINISHED', completed_at = ? WHERE id = ? AND status = 'CLAIMED'")
-        .run(now, job.job_id);
+      this.db.prepare(`UPDATE agent_jobs SET status = 'FINISHED', completed_at = ?
+        WHERE id = ? AND status = 'CLAIMED'`).run(now, job.job_id);
       this.normalizeQueuePositions();
+    }
+  }
+
+  private markHumanWaitStopped(runId: string): void {
+    const now = new Date().toISOString();
+    const run = this.db.prepare("SELECT task_id, stage FROM task_runs WHERE id = ?").get(runId) as
+      { task_id: string; stage: string };
+    const validation = run.stage === "VALIDATION_REVIEW";
+    if (validation) {
+      this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'USER_STOPPED', interrupted_at = ?,
+        completed_at = ?, error_message = 'Run stopped by user.' WHERE id = ?`).run(now, now, runId);
+    } else {
+      this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'USER_STOPPED', interrupted_at = ?,
+        error_message = 'Run stopped by user.' WHERE id = ?`).run(now, runId);
+    }
+    this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?`)
+      .run(validation ? "VALIDATION_FAILED" : "INTERRUPTED", now, run.task_id);
+  }
+
+  private markBackendInterrupted(runId: string, taskId: string, jobId: string | null, now: string): void {
+    this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'BACKEND_INTERRUPTED',
+      interrupted_at = ?, error_message = 'Backend restarted while run was active.' WHERE id = ? AND status = 'RUNNING'`)
+      .run(now, runId);
+    this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
+      WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END,
+      failure_reason = 'Backend restarted before transcript delivery could be confirmed.'
+      WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
+    this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
+      .run(now, taskId);
+    if (jobId) {
+      this.db.prepare(`UPDATE agent_jobs SET status = 'FINISHED', completed_at = ?
+        WHERE id = ? AND status NOT IN ('CANCELLED', 'FINISHED')`).run(now, jobId);
     }
   }
 

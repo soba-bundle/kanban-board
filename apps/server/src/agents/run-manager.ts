@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { RunInput, ReviewTag } from "@kanban-board/shared";
 import { AgentManager } from "./agent-manager.js";
 import type { RunPrompt } from "./prompt-builder.js";
 import { readHandover } from "./handover-tool.js";
+import type { HumanRequestService } from "./human-requests.js";
 
 const HANDOVER_RETRY_PROMPT = [
   "You ended the run without calling submit_handover.",
@@ -11,6 +13,10 @@ const HANDOVER_RETRY_PROMPT = [
 const HANDOVER_UPDATE_PROMPT = [
   "Additional user guidance was processed after your current handover.",
   "Update and resubmit the authoritative handover to account for all accepted guidance.",
+].join(" ");
+const HUMAN_REQUEST_RESTART_PROMPT = [
+  "A human has answered the pending questionnaire in this session.",
+  "Continue from the current transcript, incorporate that answer, and do not repeat earlier work or ask the same question again.",
 ].join(" ");
 
 const COMPLETION_TAG: Record<string, ReviewTag> = {
@@ -37,17 +43,118 @@ export class RunManager {
   private readonly activeRuns = new Map<string, Promise<void>>();
   private readonly steeringQueues = new Map<string, Promise<void>>();
 
-  constructor(private readonly db: Database.Database, private readonly agents: AgentManager) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly agents: AgentManager,
+    private readonly humanRequests?: HumanRequestService,
+  ) {}
 
-  start(runId: string, prompt: RunPrompt): Promise<void> {
+  start(runId: string, prompt?: RunPrompt, humanRequestId?: string): Promise<void> {
+    if (humanRequestId) return this.resume(runId, humanRequestId);
     const run = this.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found.`);
-    if (run.status !== "QUEUED") throw new Error(`Run ${runId} is not queued.`);
-
+    if (run.status !== "QUEUED" || !prompt) throw new Error(`Run ${runId} is not queued.`);
     const claimed = this.db.prepare("UPDATE task_runs SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'QUEUED'")
       .run(new Date().toISOString(), runId);
     if (claimed.changes !== 1) throw new Error(`Run ${runId} is not queued.`);
     const completion = this.execute(runId, run.task_id, prompt);
+    this.activeRuns.set(runId, completion);
+    void completion.finally(() => this.activeRuns.delete(runId));
+    return completion;
+  }
+
+  resume(runId: string, humanRequestId: string): Promise<void> {
+    const run = this.getRun(runId);
+    const active = this.activeRuns.get(runId);
+    if (!run) throw new Error(`Run ${runId} not found.`);
+    if (this.stopRequested.has(runId)) throw new Error(`Run ${runId} is stopping.`);
+    if (!active || run.status !== "QUEUED") throw new Error(`Run ${runId} has no suspended Human Request execution.`);
+    if (!this.humanRequests) throw new Error("Human Request continuation is not configured.");
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      const changed = this.db.prepare(`UPDATE task_runs SET status = 'RUNNING'
+        WHERE id = ? AND status = 'QUEUED' AND EXISTS (
+          SELECT 1 FROM agent_jobs WHERE task_run_id = ? AND status = 'CLAIMED')`).run(runId, runId);
+      if (changed.changes !== 1) throw new Error(`Run ${runId} is not queued for continuation.`);
+      this.db.prepare(`UPDATE tasks SET workflow_state = 'IN_PROGRESS', review_tag = NULL, updated_at = ?
+        WHERE id = ? AND workflow_state = 'REQUIRES_HUMAN'`).run(now, run.task_id);
+    })();
+    this.humanRequests.resume(humanRequestId);
+    return active;
+  }
+
+  async reconcileHumanRequests(): Promise<void> {
+    const runs = this.db.prepare(`SELECT r.id AS run_id, r.task_id, r.status, j.id AS job_id, j.status AS job_status
+      FROM task_runs r LEFT JOIN agent_jobs j ON j.id = (
+        SELECT candidate.id FROM agent_jobs candidate WHERE candidate.task_run_id = r.id
+        ORDER BY candidate.created_at, candidate.id LIMIT 1)
+      WHERE r.status IN ('RUNNING', 'WAITING_FOR_HUMAN', 'QUEUED')
+        AND EXISTS (SELECT 1 FROM human_requests h WHERE h.run_id = r.id AND h.status IN ('PENDING', 'ANSWERED'))
+      ORDER BY COALESCE(j.created_at, r.id), r.id`).all() as Array<{
+        run_id: string; task_id: string; status: string; job_id: string | null; job_status: string | null;
+      }>;
+
+    for (const run of runs) {
+      if (run.job_status === "CANCELLED") {
+        this.humanRequests?.cancelForRun(run.run_id);
+        this.markStopped(run.run_id, run.task_id);
+        continue;
+      }
+      const requests = this.db.prepare(`SELECT session_id, tool_call_id, status FROM human_requests
+        WHERE run_id = ? AND status IN ('PENDING', 'ANSWERED') ORDER BY created_at, id`).all(run.run_id) as Array<{
+          session_id: string; tool_call_id: string; status: string;
+        }>;
+      const hasPendingRequest = requests.some((request) => request.status === "PENDING");
+      const session = await this.agents.getOrCreateWorkingSession(run.task_id).catch(() => undefined);
+      if (!session) {
+        if (hasPendingRequest) this.parkRecoveredRun(run.run_id, run.task_id, run.job_id);
+        continue;
+      }
+      const states = requests.map((request) => request.session_id === session.sessionId
+        ? this.agents.questionnaireCallState(run.task_id, request.session_id, request.tool_call_id)
+        : "MISSING");
+      const allAnsweredCallsHaveResults = requests.length > 0 && requests.every((request, index) =>
+        request.status === "ANSWERED" && states[index] === "RESULT");
+
+      if (hasPendingRequest) {
+        this.parkRecoveredRun(run.run_id, run.task_id, run.job_id);
+      } else if (allAnsweredCallsHaveResults) {
+        this.queueRecoveredRun(run.run_id, run.job_id);
+      }
+    }
+  }
+
+  async resumeAfterRestart(runId: string, humanRequestId: string): Promise<void> {
+    const run = this.getRun(runId);
+    const request = this.db.prepare(`SELECT status FROM human_requests
+      WHERE id = ? AND run_id = ?`).get(humanRequestId, runId) as { status: string } | undefined;
+    if (!run || run.status !== "QUEUED" || this.activeRuns.has(runId)) {
+      throw new Error(`Run ${runId} is not queued for restart continuation.`);
+    }
+    if (!request || request.status !== "ANSWERED") throw new Error("Restart continuation requires an answered Human Request.");
+    const session = await this.agents.getOrCreateWorkingSession(run.task_id);
+    const requests = this.db.prepare(`SELECT session_id, tool_call_id, status FROM human_requests
+      WHERE run_id = ? AND status IN ('PENDING', 'ANSWERED')`).all(runId) as Array<{
+        session_id: string; tool_call_id: string; status: string;
+      }>;
+    if (requests.some((item) => item.status !== "ANSWERED" || item.session_id !== session.sessionId ||
+      this.agents.questionnaireCallState(run.task_id, item.session_id, item.tool_call_id) !== "RESULT")) {
+      throw new Error("All Human Requests must be answered and matched to results in the saved session before continuation.");
+    }
+    const current = this.getRun(runId);
+    if (!current || current.status !== "QUEUED" || this.stopRequested.has(runId)) {
+      throw new Error(`Run ${runId} stopped before restart continuation.`);
+    }
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      const updated = this.db.prepare(`UPDATE task_runs SET status = 'RUNNING'
+        WHERE id = ? AND status = 'QUEUED' AND EXISTS (
+          SELECT 1 FROM agent_jobs WHERE task_run_id = ? AND status = 'CLAIMED')`).run(runId, runId);
+      if (updated.changes !== 1) throw new Error(`Run ${runId} is no longer queued for restart continuation.`);
+      this.db.prepare(`UPDATE tasks SET workflow_state = 'IN_PROGRESS', review_tag = NULL, updated_at = ?
+        WHERE id = ? AND workflow_state = 'REQUIRES_HUMAN'`).run(now, run.task_id);
+    })();
+    const completion = this.execute(runId, run.task_id, { text: HUMAN_REQUEST_RESTART_PROMPT, inputIds: [] });
     this.activeRuns.set(runId, completion);
     void completion.finally(() => this.activeRuns.delete(runId));
     return completion;
@@ -107,10 +214,52 @@ export class RunManager {
   async stop(runId: string): Promise<void> {
     const run = this.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found.`);
-    if (run.status !== "RUNNING") throw new Error(`Run ${runId} is not running.`);
+    if (!['RUNNING', 'WAITING_FOR_HUMAN', 'QUEUED'].includes(run.status)) {
+      throw new Error(`Run ${runId} is not running.`);
+    }
     this.stopRequested.add(runId);
-    await this.agents.abort(run.task_id);
-    await this.activeRuns.get(runId);
+    this.humanRequests?.cancelForRun(runId);
+    const active = this.activeRuns.get(runId);
+    if (active) {
+      await this.agents.abort(run.task_id);
+      await active;
+    } else {
+      this.markStopped(runId, run.task_id);
+      this.stopRequested.delete(runId);
+    }
+  }
+
+  private parkRecoveredRun(runId: string, taskId: string, jobId: string | null): void {
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE task_runs SET status = 'WAITING_FOR_HUMAN'
+        WHERE id = ? AND status IN ('RUNNING', 'WAITING_FOR_HUMAN', 'QUEUED')`).run(runId);
+      if (jobId) {
+        this.db.prepare(`UPDATE agent_jobs SET status = 'WAITING_FOR_HUMAN', queue_position = NULL
+          WHERE id = ? AND status <> 'CANCELLED'`).run(jobId);
+      } else {
+        this.db.prepare(`INSERT INTO agent_jobs (id, task_run_id, status, created_at)
+          VALUES (?, ?, 'WAITING_FOR_HUMAN', ?)`).run(randomUUID(), runId, now);
+      }
+      this.db.prepare(`UPDATE tasks SET workflow_state = 'REQUIRES_HUMAN', review_tag = NULL, updated_at = ?
+        WHERE id = ?`).run(now, taskId);
+    })();
+  }
+
+  private queueRecoveredRun(runId: string, jobId: string | null): void {
+    this.db.transaction(() => {
+      const position = (this.db.prepare(`SELECT COALESCE(MAX(queue_position), 0) + 1 AS next
+        FROM agent_jobs WHERE status IN ('QUEUED', 'CLAIMED')`).get() as { next: number }).next;
+      this.db.prepare(`UPDATE task_runs SET status = 'QUEUED'
+        WHERE id = ? AND status IN ('RUNNING', 'WAITING_FOR_HUMAN', 'QUEUED')`).run(runId);
+      if (jobId) {
+        this.db.prepare(`UPDATE agent_jobs SET status = 'QUEUED', queue_position = ?, started_at = NULL
+          WHERE id = ? AND status <> 'CANCELLED'`).run(position, jobId);
+      } else {
+        this.db.prepare(`INSERT INTO agent_jobs (id, task_run_id, queue_position, status, created_at)
+          VALUES (?, ?, ?, 'QUEUED', ?)`).run(randomUUID(), runId, position, new Date().toISOString());
+      }
+    })();
   }
 
   private async execute(runId: string, taskId: string, prompt: RunPrompt): Promise<void> {
@@ -151,6 +300,7 @@ export class RunManager {
     } catch (error) {
       if (this.stopRequested.has(runId)) this.markStopped(runId, taskId);
       else {
+        this.humanRequests?.cancelForRun(runId);
         const now = new Date().toISOString();
         this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ? WHERE id = ?`)
           .run(now, error instanceof Error ? error.message : String(error), runId);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createCheckpoint, loadCheckpointDiff, loadCheckpointPreview, loadLiveHistory, loadRuns, openRunEvents, steerRun } from "../src/ticket-api.js";
+import { answerHumanRequest, createCheckpoint, loadCheckpointDiff, loadCheckpointPreview, loadHumanRequests, loadLiveHistory, loadRuns, openRunEvents, steerRun, stopHumanRequest } from "../src/ticket-api.js";
 
 function captureFetch(t, handler = async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) {
   const originalFetch = globalThis.fetch;
@@ -26,6 +26,20 @@ test("ticket API uses the run, history, and steering contracts", async (t) => {
     "POST /api/runs/run%2F1/inputs",
   ]);
   assert.deepEqual(JSON.parse(requests[2].options.body), { input_id: "input-1", text: "focus here" });
+});
+
+test("Human Request API calls list, submit one answer batch, and stop by request ID", async (t) => {
+  const requests = captureFetch(t);
+  await loadHumanRequests("task/1");
+  await answerHumanRequest("request/1", [{ id: "scope", value: "small" }]);
+  await stopHumanRequest("request/1");
+
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "GET /api/tasks/task%2F1/human-requests",
+    "POST /api/human-requests/request%2F1/answer",
+    "POST /api/human-requests/request%2F1/stop",
+  ]);
+  assert.deepEqual(JSON.parse(requests[1].options.body), { answers: [{ id: "scope", value: "small" }] });
 });
 
 test("live event reconnect URL carries its sequence cursor", (t) => {

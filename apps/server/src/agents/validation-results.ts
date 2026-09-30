@@ -110,8 +110,8 @@ export async function recordValidationResult(db: Database.Database, input: Valid
       const reviewTag = finalResult === "VALIDATION_FAILED" ? "VALIDATION_FAILED"
         : finalResult === "STALE" ? "IMPLEMENTATION_COMPLETE"
           : blocksReadiness ? "VALIDATION_ISSUES" : "READY_TO_MERGE";
-      db.prepare(`UPDATE tasks SET review_tag = ?, active_validation_snapshot_id = ?, updated_at = ? WHERE id = ?`)
-        .run(reviewTag, activeSnapshotId, now, input.task_id);
+      db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, active_validation_snapshot_id = ?, updated_at = ?
+        WHERE id = ?`).run(reviewTag, activeSnapshotId, now, input.task_id);
     }
   })();
 }

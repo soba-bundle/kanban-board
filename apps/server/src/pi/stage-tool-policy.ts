@@ -1,3 +1,5 @@
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+
 export type RunStage = "INVESTIGATION" | "IMPLEMENTATION" | "VALIDATION_REVIEW";
 
 export interface StageToolPolicy {
@@ -6,6 +8,15 @@ export interface StageToolPolicy {
 }
 
 const SOURCE_WRITING_TOOLS = new Set(["write", "edit"]);
+
+export function installStageToolCallGuard(agent: AgentSession["agent"], policy: StageToolPolicy): void {
+  const previousBeforeToolCall = agent.beforeToolCall;
+  agent.beforeToolCall = async (context, signal) => {
+    const decision = policy.blockToolCall(context.toolCall.name);
+    if (decision?.blocked) return { block: true, reason: decision.reason };
+    return previousBeforeToolCall?.(context, signal);
+  };
+}
 
 export function createStageToolPolicy(getStage: () => RunStage | undefined): StageToolPolicy {
   return {

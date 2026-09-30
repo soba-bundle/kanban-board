@@ -12,6 +12,8 @@ import { registerHumanRequestRoutes } from "./agents/human-request-routes.js";
 import { registerLiveEventRoutes } from "./agents/live-event-routes.js";
 import { RunManager } from "./agents/run-manager.js";
 import { registerRunRoutes } from "./agents/run-routes.js";
+import { ValidationManager } from "./agents/validation-manager.js";
+import { registerValidationRoutes } from "./agents/validation-routes.js";
 import { QueueManager } from "./queue/queue-manager.js";
 import { WorktreeManager } from "./git/worktree-manager.js";
 import { registerQueueRoutes } from "./queue/queue-routes.js";
@@ -32,7 +34,7 @@ registerProjectRoutes(app, db);
 const worktreeManager = new WorktreeManager(db);
 const taskOperations = new TaskOperationCoordinator();
 registerTaskRoutes(app, db, worktreeManager, taskOperations);
-registerTaskRunRoutes(app, db);
+registerTaskRunRoutes(app, db, worktreeManager);
 let queueManager: QueueManager;
 const humanRequests = new HumanRequestService(db, {
   onWaiting: (request) => queueManager.parkForHuman(request.run_id, request.id),
@@ -42,7 +44,14 @@ const agentManager = new AgentManager(db, undefined, undefined, undefined, human
 await registerLiveEventRoutes(app, db, agentManager);
 const runManager = new RunManager(db, agentManager, humanRequests);
 registerRunRoutes(app, runManager);
-queueManager = new QueueManager(db, runManager, undefined, worktreeManager);
+let validationManager: ValidationManager;
+queueManager = new QueueManager(db, runManager, undefined, worktreeManager, {
+  execute: (runId) => validationManager.execute(runId),
+  stop: (runId) => validationManager.stop(runId),
+});
+validationManager = new ValidationManager(db, worktreeManager, queueManager, agentManager);
+registerValidationRoutes(app, validationManager, taskOperations);
+await validationManager.reconcileCleanup();
 await runManager.reconcileHumanRequests();
 queueManager.initialize();
 registerQueueRoutes(app, queueManager, taskOperations);

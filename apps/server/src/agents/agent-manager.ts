@@ -12,7 +12,7 @@ import { createHandoverTool } from "./handover-tool.js";
 import type { HumanRequestService } from "./human-requests.js";
 import { createKanbanQuestionnaireTool } from "../pi/questionnaire-tool.js";
 import { createKanbanResourceLoader } from "../pi/resource-loader.js";
-import { createStageToolPolicy, type RunStage, type StageToolPolicy } from "../pi/stage-tool-policy.js";
+import { createStageToolPolicy, installStageToolCallGuard, type RunStage, type StageToolPolicy } from "../pi/stage-tool-policy.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -324,14 +324,7 @@ export class AgentManager {
     });
     this.initialToolNames.set(taskId, session.getActiveToolNames?.() ?? []);
     this.stageToolPolicies.set(taskId, policy);
-    if (session.agent) {
-      const previousBeforeToolCall = session.agent.beforeToolCall;
-      session.agent.beforeToolCall = async (context, signal) => {
-        const decision = policy.blockToolCall(context.toolCall.name);
-        if (decision?.blocked) return { block: true, reason: decision.reason };
-        return previousBeforeToolCall?.(context, signal);
-      };
-    }
+    if (session.agent) installStageToolCallGuard(session.agent, policy);
     session.sessionManager ??= manager;
     const workingSession = session;
     this.sessions.set(taskId, workingSession);

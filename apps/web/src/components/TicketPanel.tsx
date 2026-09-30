@@ -12,6 +12,7 @@ import {
   loadRuns,
   openRunEvents,
   steerRun,
+  startValidation,
   stopHumanRequest,
   loadCheckpointPreview,
   createCheckpoint,
@@ -121,6 +122,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [completionStatusError, setCompletionStatusError] = useState<string | null>(null);
   const [checkpointedSha, setCheckpointedSha] = useState<string | null>(null);
   const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string } | null>(null);
+  const [validationNotice, setValidationNotice] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
   const liveCursorRef = useRef(0);
@@ -133,12 +135,24 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const canStartRun = task.workflow_state === "TODO" || (task.workflow_state === "REVIEW" &&
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? ""));
   const canReviewAction = task.workflow_state === "REVIEW" &&
-    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? "");
+    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
   const canCheckpoint = task.workflow_state === "REVIEW" &&
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "");
   const latestCheckpointSha = checkpointedSha ?? task.latest_task_commit_sha;
   const checkpointHasChanges = !!checkpointStatus &&
     (checkpointStatus.tracked_changes.length > 0 || checkpointStatus.untracked_files.length > 0);
+  const canValidateTag = ["IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
+  const validationCheckpointClean = task.review_tag === "VALIDATION_FAILED" || (!!checkpointStatus &&
+    !checkpointHasChanges && checkpointStatus.commit_sha === latestCheckpointSha);
+  const canValidate = task.workflow_state === "REVIEW" && canValidateTag && !!task.base_commit_sha &&
+    !!latestCheckpointSha && !!task.worktree_path && !!task.base_branch && !activeJob && validationCheckpointClean;
+  const showValidateAction = canValidateTag && (task.review_tag === "VALIDATION_FAILED" ||
+    checkpointStatus !== null || checkpointStatusError !== null);
+  const latestValidationRun = runs.slice().reverse().find((item) => item.stage === "VALIDATION_REVIEW");
+  const visibleReviewTag = task.review_tag === "READY_TO_MERGE" &&
+    (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true ||
+      latestValidationRun?.validation_result?.active === false)
+    ? "IMPLEMENTATION_COMPLETE" : task.review_tag;
 
   const refresh = useCallback(async () => {
     try {
@@ -188,6 +202,12 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!activeJob && !runs.some((item) => item.status === "QUEUED" || item.status === "RUNNING")) return;
+    const timer = setInterval(() => { void refresh(); }, ACTIVE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [activeJob, refresh, runs]);
 
   useEffect(() => {
     setCompletionStatus(null);
@@ -454,7 +474,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         <header className="ticket-panel-header">
           <div className="ticket-panel-heading">
             <span className="ticket-state">{task.workflow_state.replaceAll("_", " ")}</span>
-            {task.review_tag && <span className="review-tag">{task.review_tag.replaceAll("_", " ")}</span>}
+            {visibleReviewTag && <span className="review-tag">{visibleReviewTag.replaceAll("_", " ")}</span>}
             <h2>{task.title}</h2>
           </div>
           <button className="icon-button" aria-label="Close ticket" onClick={onClose}>×</button>
@@ -474,6 +494,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
 
         <div className="ticket-panel-body" ref={logRef}>
           {error && <div className="error-banner" role="alert"><span>{error}</span></div>}
+          {validationNotice && <p className="run-empty" role="status">{validationNotice}</p>}
 
           {tab === "live" && (
             <>
@@ -497,6 +518,10 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                       <span className="run-empty">No changes to checkpoint.</span>
                     ))}
                     <button className="button-quiet" disabled={busy} onClick={() => setStartingRun(true)}>Start run</button>
+                    {showValidateAction && <button className="button-primary" disabled={busy || !canValidate} onClick={() => void run(async () => {
+                      const result = await startValidation(task.id);
+                      setValidationNotice(result.status === "QUEUED" ? "Validation queued." : `Validation ${result.status.toLowerCase()}.`);
+                    }, "Validation queued")}>Validate</button>}
                     {completionStatus?.ready ? (
                       <button className="button-primary" disabled={busy || !!activeJob} onClick={() => void run(async () => {
                         await completeTask(task.id);

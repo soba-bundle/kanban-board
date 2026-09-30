@@ -97,11 +97,16 @@ test("task worktree creation records base metadata and leaves primary checkout u
   const checkpointSha = await getHeadSha(worktree.worktreePath);
   assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: false, reason: "BRANCH_CHANGES" });
   const pinnedValidationPath = await manager.createValidationWorktree("task-1", checkpointSha);
+  const pinnedDiff = await manager.getPinnedDiff("task-1", baseSha, checkpointSha);
+  assert.deepEqual(pinnedDiff.changedFiles, ["main.cpp"]);
+  assert.match(pinnedDiff.diff, /return 2/);
   writeFileSync(join(worktree.worktreePath, "main.cpp"), "int main() { return 3; }\n");
   git(worktree.worktreePath, "add", "main.cpp");
   git(worktree.worktreePath, "commit", "-m", "later task change");
   assert.notEqual(await getHeadSha(worktree.worktreePath), checkpointSha);
   assert.equal(await getHeadSha(pinnedValidationPath), checkpointSha);
+  assert.deepEqual(await manager.getPinnedDiff("task-1", baseSha, checkpointSha), pinnedDiff,
+    "diff must stay pinned to the recorded base/candidate even if the task branch moves");
   assert.equal(readFileSync(join(pinnedValidationPath, "main.cpp"), "utf8").replace(/\r\n/g, "\n"),
     "int main() { return 2; }\n");
   await manager.removeValidationWorktree("task-1", pinnedValidationPath);

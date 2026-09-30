@@ -164,6 +164,7 @@ export class RunManager {
   async steer(runId: string, inputId: string, text: string, reusedFromInputId?: string): Promise<InputResult> {
     const run = this.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found.`);
+    if (run.stage === "VALIDATION_REVIEW") throw new Error("Validation Review does not accept live guidance.");
     if (!["QUEUED", "RUNNING"].includes(run.status)) throw new Error(`Run ${runId} is not accepting messages.`);
     if (this.closingRuns.has(runId)) throw new Error(`Run ${runId} is closing; refresh before sending.`);
     const created = this.db.transaction(() => {

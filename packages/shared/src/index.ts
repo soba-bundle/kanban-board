@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { LiveEventSchema } from "./live-events.js";
+import { ValidationFindingSchema, ValidationResultSchema } from "./validation.js";
 export {
   ValidationAttributionSchema,
   ValidationFindingLocationSchema,
@@ -162,6 +163,11 @@ export const TaskSchema = z.object({
   workflow_state: WorkflowStateSchema,
   review_tag: ReviewTagSchema.nullable(),
   latest_task_commit_sha: z.string().nullable(),
+  base_commit_sha: z.string().nullable().optional(),
+  base_branch: z.string().nullable().optional(),
+  worktree_path: z.string().nullable().optional(),
+  active_validation_snapshot_id: z.string().nullable().optional(),
+  validation_snapshot_current: z.boolean().optional(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
 });
@@ -199,6 +205,11 @@ export const TaskRunSummarySchema = z.object({
   started_at: z.string().nullable(),
   completed_at: z.string().nullable(),
   handover: z.unknown().nullable(),
+  validation_result: z.object({
+    result: ValidationResultSchema,
+    findings: z.array(ValidationFindingSchema),
+    active: z.boolean().optional(),
+  }).nullable().optional(),
 });
 export type TaskRunSummary = z.infer<typeof TaskRunSummarySchema>;
 

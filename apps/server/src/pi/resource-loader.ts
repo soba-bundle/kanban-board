@@ -1,8 +1,7 @@
 import { DefaultResourceLoader, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { resolve, sep } from "node:path";
 
-export function createKanbanResourceLoader(cwd: string) {
-  const agentDir = getAgentDir();
+export function createKanbanResourceLoader(cwd: string, agentDir = getAgentDir()) {
   const settingsManager = SettingsManager.create(cwd, agentDir);
   const incompatibleExtensionPath = resolve(agentDir, "extensions", "pi-questions");
   const resourceLoader = new DefaultResourceLoader({

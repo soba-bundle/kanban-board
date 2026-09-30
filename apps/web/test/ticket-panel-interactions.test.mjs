@@ -295,8 +295,8 @@ test("eligible Implementation Complete task exposes Validate and queues an expli
     if (String(url).endsWith("/validation")) return response(url, { run_id: "validation-1", status: "QUEUED" });
     return response(url, []);
   };
-  const eligibleTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), latest_task_commit_sha: "c".repeat(40),
-    worktree_path: "C:/work/task-1", base_branch: "main" };
+  const eligibleTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: eligibleTask, queue: null, onClose() {}, onChanged() {} })));
   const validate = await testing.screen.findByRole("button", { name: "Validate" });
@@ -321,8 +321,8 @@ test("Validate is unavailable for ineligible tasks, missing checkpoints, or conf
     if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
     return response(url, []);
   };
-  const baseTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), latest_task_commit_sha: "c".repeat(40),
-    worktree_path: "C:/work/task-1", base_branch: "main" };
+  const baseTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
   const cases = [
     { task: { ...baseTask, review_tag: "INVESTIGATION_COMPLETE" }, queue: null },
     { task: { ...baseTask, latest_task_commit_sha: null }, queue: null },

@@ -1,6 +1,6 @@
 # Phase 8 — Independent Validation Design Draft
 
-**Status:** Acceptance-test specification approved. The stage-aware Pi tool policy and validation contracts/result persistence are implemented and verified against hosted-session, result, migration, and shared-contract tests. Remaining work includes reviewer prompt/context/session isolation, validation start/queue lifecycle, cleanup orchestration/recovery, pinned worktree integration, and UI/API behavior. Concurrent duplicate-start atomicity and orchestration-level progress/cleanup outcomes remain specified for the planned lifecycle service seam.
+**Status:** Acceptance-test specification approved and implemented through the UI/result-presentation slice. Server and web validation flows, stale-readiness checks, and cleanup reconciliation are covered by tests. Remaining work is a real-provider end-to-end Validation run, independent review, and the integrated Phase 8 gate.
 
 ## Implementation log
 
@@ -16,6 +16,27 @@
 - Added database migration 9 for per-attempt candidate/base SHAs, live-base tips, guidance watermark, implementation-worktree state, validation-worktree path/cleanup state, and failure details.
 - Added transactional result/snapshot persistence. Completed structured reports retain historical snapshots; only current results without direct/uncertain findings activate readiness. Malformed reports, infrastructure failures, and validation-worktree mutations fail without a snapshot. Finalization rechecks live-base and candidate state; post-readiness base/task-worktree changes invalidate the active pointer without rewriting history. Late older attempts cannot override a newer attempt.
 - Verification: validation result, migration, shared-contract, and stage-policy tests passed; all-workspace typecheck passed. The latest full server suite reported 117 passed / 13 failed; remaining failures are acceptance tests for not-yet-implemented context, eligibility, cleanup, prompt, route, restart, and session lifecycle slices.
+
+### Slice 3 — Pinned context and isolated resources
+
+- Added `buildValidationContext`, which copies the task description, completed Implementation handovers through the checkpoint-producing run, delivered guidance through the captured watermark, repository context, and pinned SHA/diff data. It excludes the task title, later/undelivered guidance, and assistant transcript.
+- Added `WorktreeManager.getPinnedDiff` to compute changed files and diff from exact base/candidate SHAs in the repository, independent of later task-branch movement.
+- Added `createValidationSession` to create a fresh Review session in the supplied detached-worktree cwd and session directory, using the Kanban resource loader and the read-only Validation tool policy.
+- Verification: context, session isolation, real-Git worktree, stage-policy, AgentManager, and Human Request tests passed (21/21); all-workspace typecheck passed. At that point the remaining reds concerned lifecycle wiring and cleanup recovery.
+
+### Slice 4 — Validation start, queue, and isolated execution
+
+- Added eligibility checks and an explicit `POST /api/tasks/:taskId/validation` route. The route uses the shared task-operation coordinator; queue insertion rechecks task state/checkpoint and active work transactionally to prevent duplicate starts.
+- Added queue persistence for pinned context and start metadata (migration 10). Validation Review dispatch uses a dedicated `ValidationManager`; it never replaces or prompts the implementation working session. It creates a fresh detached worktree/session per run, publishes events under the validation run ID, accepts one schema-checked `submit_validation_report`, audits tracked worktree mutations, persists the result/snapshot, and attempts cleanup. Live guidance is rejected for Validation runs.
+- Stop aborts the exact isolated session and records Validation Failed; stopping before dispatch never creates a session. Active Validation runs found during restart are marked failed, not replayed. A queued-but-not-started attempt can dispatch from its persisted pinned context. `ValidationCleanupManager` retries persisted cleanup paths at startup without touching the implementation worktree.
+- Verification at completion: all 134 server tests, 11 shared tests, and 29 web tests passed; all-workspace typecheck and full build passed. The root `npm test` command completed successfully. No real-provider end-to-end validation run was performed; that and independent review remain before the integrated Phase 8 gate.
+
+### Slice 5 — Validation UI and result presentation
+
+- Added the web `startValidation` API wrapper and extended task/run contracts with pinned-worktree and validation-result/readiness fields. Task-run history now returns structured findings and whether that report is the current active snapshot.
+- Task and run reads recheck the active snapshot against the live base tip and task worktree; stale snapshots lose active readiness and are not shown as Ready to Merge.
+- Added an eligibility-gated Validate action, queued feedback, Validation run status in Runs, structured findings with evidence/locations, and category-specific copy actions.
+- Verification: the five previously failing Phase 8 web acceptance tests now pass; full shared/server/web suites pass (11/134/29), all-workspace typecheck and full build pass, and `git diff --check` passes.
 
 ## 1. Agreed product behavior
 
@@ -60,19 +81,19 @@ Existing scaffolding is partial:
 - `WorktreeManager.createValidationWorktree()` can create a detached worktree at a supplied commit, and `removeValidationWorktree()` can remove it.
 - Stop handling has some validation-specific behavior.
 
-The end-to-end path is absent:
+At the time this draft was started, the end-to-end path was absent:
 
 - `QueueManager` explicitly excludes `VALIDATION_REVIEW` from accepted run stages; no validation-start API/queue action exists.
 - The current agent lifecycle opens the task's working session in its task worktree. Validation needs a distinct Review session and validation worktree.
 - There is no validation result contract/tool, context builder, result persistence/snapshot lifecycle, stale-state workflow, or validation UI/copy interaction.
 - Restart cleanup/reconciliation does not yet provide validation-specific failure and disposable-worktree recovery semantics.
-- There are no end-to-end Phase 8 validation tests.
+- There was no real-provider end-to-end Phase 8 validation test; hosted session behavior is covered by focused policy tests.
 
 Relevant existing files include `apps/server/src/queue/queue-manager.ts`, `apps/server/src/agents/agent-manager.ts`, `apps/server/src/agents/run-manager.ts`, `apps/server/src/git/worktree-manager.ts`, `apps/server/src/db.ts`, and `apps/web/src/components/TicketPanel.tsx`.
 
 ## 3. Candidate acceptance-test cases
 
-These are the approved acceptance-test specifications. Executable test drafts currently include server tests `stage-tool-policy.test.mjs`, `stage-tool-policy-session.test.mjs`, `validation-policy.test.mjs`, `validation-context.test.mjs`, `validation-prompt.test.mjs`, `validation-results.test.mjs`, `validation-queue.test.mjs`, `validation-routes.test.mjs`, `validation-cleanup.test.mjs`, and `validation-sessions.test.mjs`; web tests `validation-api.test.mjs`; plus extensions to `handover-completion.test.mjs`, `worktree-manager.test.mjs`, `ticket-panel-interactions.test.mjs`, and `ticket-panel.test.mjs`. Concurrent duplicate-start atomicity and orchestrated running/progress lifecycle cases still need explicit start/lifecycle API seams.
+These are the approved acceptance-test specifications. Executable tests include server tests `stage-tool-policy.test.mjs`, `stage-tool-policy-session.test.mjs`, `validation-policy.test.mjs`, `validation-context.test.mjs`, `validation-prompt.test.mjs`, `validation-results.test.mjs`, `validation-queue.test.mjs`, `validation-routes.test.mjs`, `validation-cleanup.test.mjs`, `validation-sessions.test.mjs`, and `validation-lifecycle.test.mjs`; web tests `validation-api.test.mjs`; plus extensions to `handover-completion.test.mjs`, `worktree-manager.test.mjs`, `ticket-panel-interactions.test.mjs`, and `ticket-panel.test.mjs`. Full hosted-provider execution and UI lifecycle presentation remain unverified.
 
 ### Eligibility, queue, and snapshot pinning
 
@@ -145,11 +166,11 @@ Each slice should begin with its tests, be reviewed with the user, then be imple
 1. **Approve the acceptance contract.** Review the cases and resolved policies in this draft; turn accepted cases into executable tests first and verify the intended red baseline. Keep Laya/Bash-policy research optional and separate.
 2. **Stage-aware Pi tool policy (implemented).** The Kanban-owned policy is under `apps/server/src/pi/`; it hides and pre-blocks `write`/`edit` for Investigation and Validation, blocks Human Requests only in Validation, and preserves Implementation writes. Hosted `AgentSession` tests pass. User-global extensions remain untouched.
 3. **Validation contracts and persistence (implemented).** Shared report/finding schemas, result metadata and cleanup fields, migration 9, stale/readiness gates, and transactional result/snapshot persistence are implemented. Historical snapshots are retained for completed structured reports; only current no-direct/no-uncertain results may become active for merge readiness.
-4. **Pinned context and isolated resources.** Build the guidance watermark/context snapshot, exact diff, fresh Review session, and fresh detached worktree per attempt; test that the working session/worktree are untouched.
-5. **Queue/API/run lifecycle.** Add explicit eligibility/start, validation queue stage, structured result submission, outcome transitions, retry rules, Stop behavior, and operation/concurrency protection.
-6. **UI and result presentation.** Add the Validate action/status, show findings, and copy direct/indirect lists separately; gate readiness from persisted current snapshots.
-7. **Staleness, cleanup, and recovery.** Verify candidate/base races, cleanup pending, crash boundaries, and no restart replay; complete real-Git and hosted-Pi integration coverage.
-8. **Integrated Phase 8 gate.** Run full tests/typecheck, focused Git/Pi acceptance, independent review, and document the verified result. Do not start Phase 9 merge-back implementation as part of this phase.
+4. **Pinned context and isolated resources (implemented and wired).** `buildValidationContext`, `createValidationSession`, `WorktreeManager.getPinnedDiff`, and the detached worktree factory are used by the explicit Validation start and isolated executor.
+5. **Queue/API/run lifecycle (implemented; recovery coverage remains).** Explicit eligibility/start, validation queue dispatch, structured result submission, outcome transitions, retry rules, Stop behavior, and operation/concurrency protection are implemented. Startup cleanup recovery and the remaining crash-boundary tests stay in Slice 7.
+6. **UI and result presentation (implemented).** The Validate action/status, findings, category copy controls, and active-snapshot readiness display are implemented.
+7. **Staleness, cleanup, and recovery (core implemented).** Candidate/base races, cleanup pending/reconciliation, and no restart replay have focused coverage. Real-provider end-to-end Validation and remaining crash-boundary review are outstanding.
+8. **Integrated Phase 8 gate (remaining).** Run independent review and any additional focused Git/Pi acceptance, then document the verified result. Do not start Phase 9 merge-back implementation as part of this phase.
 
 ## 5. Decisions recorded and follow-up research
 

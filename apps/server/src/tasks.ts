@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type Database from "better-sqlite3";
 import type { WorktreeManager } from "./git/worktree-manager.js";
 import { TaskOperationCoordinator } from "./task-operation-coordinator.js";
+import { refreshValidationReadiness } from "./agents/validation-readiness.js";
 import { randomUUID } from "node:crypto";
 import {
   CheckpointConfirmationSchema,
@@ -13,20 +14,27 @@ import {
 } from "@kanban-board/shared";
 
 const taskFields = `t.id, t.project_id, t.title, t.description, t.workflow_state, t.review_tag,
-  t.latest_task_commit_sha, t.created_at, t.updated_at`;
+  t.latest_task_commit_sha, t.base_commit_sha, t.base_branch, t.worktree_path,
+  t.active_validation_snapshot_id, t.created_at, t.updated_at`;
 
 export function hasAgentWorkStarted(db: Database.Database, taskId: string): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM task_runs WHERE task_id = ? AND
     (started_at IS NOT NULL OR status NOT IN ('QUEUED', 'CANCELLED')) LIMIT 1`).get(taskId));
 }
 
-function listTasks(db: Database.Database, projectId?: string): Task[] {
+async function listTasks(db: Database.Database, worktrees?: WorktreeManager, projectId?: string): Promise<Task[]> {
   const scope = `FROM tasks t JOIN projects p ON p.id = t.project_id
     WHERE t.is_active = 1 AND p.is_active = 1${projectId ? " AND t.project_id = ?" : ""}
     ORDER BY t.created_at, t.id`;
-  return (projectId
+  const tasks = (projectId
     ? db.prepare(`SELECT ${taskFields} ${scope}`).all(projectId)
     : db.prepare(`SELECT ${taskFields} ${scope}`).all()) as Task[];
+  return Promise.all(tasks.map(async (task) => {
+    const validationCurrent = await refreshValidationReadiness(db, task.id, worktrees);
+    const refreshed = db.prepare("SELECT review_tag, active_validation_snapshot_id FROM tasks WHERE id = ?")
+      .get(task.id) as { review_tag: Task["review_tag"]; active_validation_snapshot_id: string | null };
+    return { ...task, ...refreshed, validation_snapshot_current: validationCurrent };
+  }));
 }
 
 export function registerTaskRoutes(
@@ -36,7 +44,7 @@ export function registerTaskRoutes(
   operations = new TaskOperationCoordinator(),
 ) {
   app.get<{ Querystring: { project_id?: string } }>("/api/tasks", async (request) => {
-    return listTasks(db, request.query.project_id);
+    return listTasks(db, worktrees, request.query.project_id);
   });
 
   app.post("/api/tasks", async (request, reply) => {
@@ -295,7 +303,7 @@ export function registerTaskRoutes(
       REVIEW: [],
       DONE: [],
     };
-    for (const task of listTasks(db)) {
+    for (const task of await listTasks(db, worktrees)) {
       const state = WorkflowStateSchema.parse(task.workflow_state);
       columns[state].push(task);
     }

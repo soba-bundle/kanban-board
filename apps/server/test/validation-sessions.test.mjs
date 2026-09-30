@@ -52,11 +52,19 @@ test("each validation attempt gets a fresh Review session, distinct from task an
   agents = new AgentManager(db, sessionDir);
   const implementationSession = await agents.getOrCreateWorkingSession("t");
 
-  first = await createValidationSession({ cwd: firstValidationWorktree, sessionDir, agentDir, stage: "VALIDATION_REVIEW" });
+  first = await createValidationSession({ cwd: firstValidationWorktree, sessionDir, agentDir, stage: "VALIDATION_REVIEW", onReport() {} });
   second = await createValidationSession({ cwd: secondValidationWorktree, sessionDir, agentDir, stage: "VALIDATION_REVIEW" });
 
   assert.notEqual(first.sessionId, implementationSession.sessionId);
   assert.notEqual(second.sessionId, implementationSession.sessionId);
   assert.notEqual(second.sessionId, first.sessionId, "a retry must not resume the earlier Review session");
   assert.notEqual(first.sessionFile, second.sessionFile);
+  for (const session of [first, second]) {
+    const tools = session.getActiveToolNames();
+    assert.ok(!tools.includes("write"));
+    assert.ok(!tools.includes("edit"));
+    assert.ok(!tools.includes("kanban_questionnaire"));
+  }
+  assert.ok(first.getActiveToolNames().includes("submit_validation_report"),
+    "the fresh Validation session exposes its structured result tool");
 });

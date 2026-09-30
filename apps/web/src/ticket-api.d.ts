@@ -1,6 +1,7 @@
 import type { CheckpointConfirmation, CheckpointDiff, CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveEvent, TaskRunSummary } from "@kanban-board/shared";
 
 export function loadRuns(taskId: string): Promise<TaskRunSummary[]>;
+export function startValidation(taskId: string): Promise<{ run_id: string; status: string }>;
 export function loadLiveHistory(taskId: string): Promise<import("@kanban-board/shared").LiveHistorySnapshot>;
 export function loadHumanRequests(taskId: string): Promise<HumanRequest[]>;
 export function answerHumanRequest(requestId: string, answers: HumanRequestAnswerInput[]): Promise<HumanRequest>;

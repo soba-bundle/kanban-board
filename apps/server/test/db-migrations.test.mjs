@@ -49,7 +49,7 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
   legacy.close();
 
   db = openDatabase(path);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 9);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 10);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("SELECT transcript_start_entry_id, transcript_end_entry_id FROM task_runs WHERE id = 'r1'").get(), {
     transcript_start_entry_id: null,
@@ -82,13 +82,18 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
     VALUES ('i1', 't1', 'r1', 1, 'k1', 'text', 'STEERING', 'NOPE', '2025-01-01T00:00:00.000Z')`).run(), /CHECK constraint failed/);
 });
 
-test("fresh databases apply migrations through the validation result schema", (t) => {
+test("fresh databases apply migrations through validation result and run schemas", (t) => {
   const db = openDatabase(":memory:");
   t.after(() => db.close());
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 9);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 10);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "task_id", "validation_run_id", "validated_task_sha", "validated_base_sha",
     "result", "created_at", "messages_watermark",
   ]);
+  for (const column of ["validation_context_json", "validation_base_tip_sha", "validation_guidance_watermark",
+    "validation_task_head_sha", "validation_worktree_path"]) {
+    assert.ok(db.prepare("PRAGMA table_info(task_runs)").all().some((entry) => entry.name === column),
+      `task_runs must persist ${column} to dispatch a queued validation without replaying the working session`);
+  }
 });

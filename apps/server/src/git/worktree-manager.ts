@@ -22,6 +22,7 @@ interface TaskProjectRow {
   worktree_path: string | null;
   agent_branch: string | null;
   base_commit_sha: string | null;
+  base_branch: string | null;
   root_path: string;
   worktree_root: string | null;
   ide_command: string | null;
@@ -73,6 +74,7 @@ export class WorktreeManager {
       tasks.worktree_path AS worktree_path,
       tasks.agent_branch AS agent_branch,
       tasks.base_commit_sha AS base_commit_sha,
+      tasks.base_branch AS base_branch,
       projects.root_path AS root_path,
       projects.worktree_root AS worktree_root,
       projects.ide_command AS ide_command
@@ -150,6 +152,33 @@ export class WorktreeManager {
     return getStatus(path);
   }
 
+  async getTaskWorktreeState(taskId: string): Promise<{ head_sha: string; dirty: boolean }> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const [headSha, status] = await Promise.all([getHeadSha(path), getStatus(path)]);
+    return { head_sha: headSha, dirty: status.length > 0 };
+  }
+
+  async getBaseBranchTip(taskId: string): Promise<string> {
+    const row = this.getTaskProject(taskId);
+    if (!row.base_branch) throw new Error("Task has no recorded base branch.");
+    const result = await runGit(["rev-parse", "--verify", `refs/heads/${row.base_branch}`], { cwd: realpathSync(row.root_path) });
+    if (result.exitCode !== 0) throw gitFailure(result, "Unable to read the current base branch tip.");
+    return result.stdout.trim();
+  }
+
+  async getValidationWorktreeStatus(taskId: string, worktreePath: string): Promise<GitFileStatus[]> {
+    const row = this.getTaskProject(taskId);
+    const expectedRoot = this.getWorktreeRoot(row);
+    const path = resolve(worktreePath);
+    const expectedPrefix = `validation-${taskSegment(taskId)}-`;
+    if (dirname(path) !== expectedRoot || !basename(path).startsWith(expectedPrefix)) {
+      throw new Error("Validation path does not belong to this task.");
+    }
+    const canonicalPath = realpathSync(path);
+    if (dirname(canonicalPath) !== expectedRoot) throw new Error("Validation path is outside the configured worktree root.");
+    return getStatus(canonicalPath);
+  }
+
   async getTaskCompletionStatus(taskId: string): Promise<{
     ready: boolean;
     reason: "WORKTREE_CHANGES" | "BRANCH_CHANGES" | "GIT_STATE_UNAVAILABLE" | null;
@@ -212,6 +241,19 @@ export class WorktreeManager {
   async getDiff(taskId: string, from?: string, to?: string): Promise<string> {
     const { path } = this.getTaskWorktreePath(taskId);
     return getDiff(path, from, to);
+  }
+
+  async getPinnedDiff(taskId: string, baseSha: string, candidateSha: string): Promise<{ changedFiles: string[]; diff: string }> {
+    if (!/^[0-9a-f]{40}$/i.test(baseSha) || !/^[0-9a-f]{40}$/i.test(candidateSha)) {
+      throw new Error("Pinned diff requires full commit SHAs.");
+    }
+    const row = this.getTaskProject(taskId);
+    const repositoryRoot = realpathSync(row.root_path);
+    const [changedFiles, diff] = await Promise.all([
+      getChangedFiles(repositoryRoot, baseSha, candidateSha),
+      getDiff(repositoryRoot, baseSha, candidateSha),
+    ]);
+    return { changedFiles, diff };
   }
 
   async getChangedFiles(taskId: string, from?: string, to?: string): Promise<string[]> {

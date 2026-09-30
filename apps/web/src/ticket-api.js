@@ -30,6 +30,12 @@ export function loadRuns(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/runs`);
 }
 
+export function startValidation(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/validation`, {
+    method: "POST", ...json({}),
+  });
+}
+
 export function loadLiveHistory(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/live/history`);
 }

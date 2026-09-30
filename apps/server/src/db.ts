@@ -285,5 +285,19 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const validationRunsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 10").get();
+  if (!validationRunsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE task_runs ADD COLUMN validation_context_json TEXT;
+        ALTER TABLE task_runs ADD COLUMN validation_base_tip_sha TEXT;
+        ALTER TABLE task_runs ADD COLUMN validation_guidance_watermark INTEGER;
+        ALTER TABLE task_runs ADD COLUMN validation_task_head_sha TEXT;
+        ALTER TABLE task_runs ADD COLUMN validation_worktree_path TEXT;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

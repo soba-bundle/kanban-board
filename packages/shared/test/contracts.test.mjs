@@ -25,6 +25,10 @@ import {
   TaskSchema,
   UpdateTaskSchema,
   WorkflowStateSchema,
+  ValidationAttributionSchema,
+  ValidationFindingSchema,
+  ValidationReportSchema,
+  ValidationResultSchema,
 } from "../dist/index.js";
 
 const timestamp = "2025-01-01T00:00:00.000Z";
@@ -34,6 +38,24 @@ test("workflow enums accept declared values and reject unknown values", () => {
   assert.equal(WorkflowStateSchema.safeParse("ARCHIVED").success, false);
   assert.equal(RunStatusSchema.safeParse("WAITING_FOR_HUMAN").success, true);
   assert.equal(RunStatusSchema.safeParse("PAUSED").success, false);
+});
+
+test("Validation contracts require evidence, locations, and unambiguous finding attribution", () => {
+  const finding = {
+    id: "finding-1", attribution: "DIRECT", summary: "Parser rejects valid input",
+    rationale: "The changed parser path introduces the rejection.", evidence: "The supplied reproduction fails.",
+    locations: [{ file: "src/parser.ts", line: 12 }],
+  };
+  assert.equal(ValidationAttributionSchema.safeParse("UNCERTAIN").success, true);
+  assert.equal(ValidationAttributionSchema.safeParse("POSSIBLE").success, false);
+  assert.equal(ValidationFindingSchema.safeParse(finding).success, true);
+  assert.equal(ValidationFindingSchema.safeParse({ ...finding, evidence: "" }).success, false);
+  assert.equal(ValidationFindingSchema.safeParse({ ...finding, locations: [] }).success, false);
+  assert.equal(ValidationFindingSchema.safeParse({ ...finding, locations: [{ file: "src/parser.ts" }] }).success, false);
+  assert.equal(ValidationReportSchema.safeParse({ findings: [finding] }).success, true);
+  assert.equal(ValidationReportSchema.safeParse({ findings: [finding, finding] }).success, false);
+  assert.equal(ValidationReportSchema.safeParse({ findings: [{ attribution: "DIRECT" }] }).success, false);
+  assert.deepEqual(ValidationResultSchema.options, ["PASSED", "ISSUES_FOUND", "VALIDATION_FAILED", "STALE"]);
 });
 
 test("Human Request contracts validate multi-question prompts and normalized answer batches", () => {

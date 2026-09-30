@@ -30,6 +30,9 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
       question TEXT NOT NULL, options_json TEXT, answer TEXT, status TEXT NOT NULL,
       created_at TEXT NOT NULL, answered_at TEXT);
     CREATE TABLE ticket_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), content TEXT NOT NULL);
+    CREATE TABLE validation_results (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+      run_id TEXT NOT NULL REFERENCES task_runs(id), result TEXT NOT NULL, findings_json TEXT,
+      build_result_json TEXT, test_result_json TEXT, created_at TEXT NOT NULL);
     CREATE TABLE validation_snapshots (
       id TEXT PRIMARY KEY, comments_watermark TEXT, result TEXT NOT NULL, created_at TEXT NOT NULL
     );
@@ -46,12 +49,18 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
   legacy.close();
 
   db = openDatabase(path);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 9);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("SELECT transcript_start_entry_id, transcript_end_entry_id FROM task_runs WHERE id = 'r1'").get(), {
     transcript_start_entry_id: null,
     transcript_end_entry_id: null,
   });
+  assert.deepEqual(db.prepare("PRAGMA table_info(validation_results)").all().map((column) => column.name), [
+    "id", "task_id", "run_id", "result", "findings_json", "build_result_json", "test_result_json", "created_at",
+    "candidate_sha", "base_sha", "base_tip_at_start", "base_tip_at_finish", "guidance_watermark",
+    "task_head_at_start", "task_head_at_finish", "task_worktree_clean_at_start", "task_worktree_clean_at_finish",
+    "validation_worktree_clean", "validation_worktree_path", "cleanup_status", "failure_kind", "failure_message",
+  ]);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "result", "created_at", "messages_watermark",
   ]);
@@ -73,10 +82,10 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
     VALUES ('i1', 't1', 'r1', 1, 'k1', 'text', 'STEERING', 'NOPE', '2025-01-01T00:00:00.000Z')`).run(), /CHECK constraint failed/);
 });
 
-test("fresh databases apply migrations through the structured Human Request schema", (t) => {
+test("fresh databases apply migrations through the validation result schema", (t) => {
   const db = openDatabase(":memory:");
   t.after(() => db.close());
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 8);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 9);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "task_id", "validation_run_id", "validated_task_sha", "validated_base_sha",

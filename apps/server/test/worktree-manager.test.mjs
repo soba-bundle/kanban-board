@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -71,12 +71,19 @@ test("task worktree creation records base metadata and leaves primary checkout u
   await assert.rejects(manager.openInIDE("task-1"), /Configure an IDE executable/);
 
   const validationPath = await manager.createValidationWorktree("task-1", baseSha);
-  assert.equal(await getCurrentBranch(validationPath), null);
-  assert.equal(await getHeadSha(validationPath), baseSha);
+  const retryValidationPath = await manager.createValidationWorktree("task-1", baseSha);
+  assert.notEqual(retryValidationPath, validationPath, "each validation attempt gets a fresh worktree");
+  for (const path of [validationPath, retryValidationPath]) {
+    assert.equal(await getCurrentBranch(path), null);
+    assert.equal(await getHeadSha(path), baseSha);
+  }
   writeFileSync(join(validationPath, "build-output.txt"), "validation artifact");
   await assert.rejects(manager.removeValidationWorktree("task-1", worktree.worktreePath), /Refusing to remove/);
   await manager.removeValidationWorktree("task-1", validationPath);
   assert.equal(existsSync(validationPath), false);
+  assert.equal(existsSync(retryValidationPath), true, "removing one attempt must not remove another");
+  await manager.removeValidationWorktree("task-1", retryValidationPath);
+  assert.equal(existsSync(retryValidationPath), false);
   assert.equal(await getHeadSha(worktree.worktreePath), baseSha);
   assert.match(await manager.getDiff("task-1"), /return 1/);
   await assert.rejects(manager.removeTaskWorktree("task-1"), /uncommitted changes/);
@@ -87,7 +94,17 @@ test("task worktree creation records base metadata and leaves primary checkout u
   assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: true, reason: null });
   writeFileSync(join(worktree.worktreePath, "main.cpp"), "int main() { return 2; }\n");
   await manager.createCheckpoint("task-1");
+  const checkpointSha = await getHeadSha(worktree.worktreePath);
   assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: false, reason: "BRANCH_CHANGES" });
+  const pinnedValidationPath = await manager.createValidationWorktree("task-1", checkpointSha);
+  writeFileSync(join(worktree.worktreePath, "main.cpp"), "int main() { return 3; }\n");
+  git(worktree.worktreePath, "add", "main.cpp");
+  git(worktree.worktreePath, "commit", "-m", "later task change");
+  assert.notEqual(await getHeadSha(worktree.worktreePath), checkpointSha);
+  assert.equal(await getHeadSha(pinnedValidationPath), checkpointSha);
+  assert.equal(readFileSync(join(pinnedValidationPath, "main.cpp"), "utf8").replace(/\r\n/g, "\n"),
+    "int main() { return 2; }\n");
+  await manager.removeValidationWorktree("task-1", pinnedValidationPath);
   await manager.removeTaskWorktree("task-1");
   assert.equal(existsSync(worktree.worktreePath), false);
   assert.equal(db.prepare("SELECT worktree_path FROM tasks WHERE id = 'task-1'").get().worktree_path, null);

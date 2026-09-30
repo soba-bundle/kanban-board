@@ -41,6 +41,7 @@ async function loadComponents(t) {
   return {
     ...(await vite.ssrLoadModule("/src/components/TicketPanel.tsx")),
     ...(await vite.ssrLoadModule("/src/components/ToastContext.tsx")),
+    ...(await vite.ssrLoadModule("/src/components/ToastViewport.tsx")),
   };
 }
 
@@ -277,4 +278,137 @@ test("concurrent ticket panels render only their own conversation history", asyn
   await testing.within(secondPanel).findByText("Response for task-2");
   assert.equal(testing.within(firstPanel).queryByText("Response for task-2"), null);
   assert.equal(testing.within(secondPanel).queryByText("Response for task-1"), null);
+});
+
+test("eligible Implementation Complete task exposes Validate and queues an explicit validation", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, { tracked_changes: [], untracked_files: [],
+      branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean" });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
+    if (String(url).endsWith("/validation")) return response(url, { run_id: "validation-1", status: "QUEUED" });
+    return response(url, []);
+  };
+  const eligibleTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), latest_task_commit_sha: "c".repeat(40),
+    worktree_path: "C:/work/task-1", base_branch: "main" };
+  testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: eligibleTask, queue: null, onClose() {}, onChanged() {} })));
+  const validate = await testing.screen.findByRole("button", { name: "Validate" });
+  assert.equal(validate.disabled, false);
+  testing.fireEvent.click(validate);
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.url.endsWith("/validation"))));
+  const post = requests.find((request) => request.url.endsWith("/validation"));
+  assert.equal(post.options.method, "POST");
+  assert.deepEqual(JSON.parse(post.options.body), {});
+  await testing.screen.findByText(/validation.*queued/i);
+});
+
+test("Validate is unavailable for ineligible tasks, missing checkpoints, or conflicting queued work", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, { tracked_changes: [], untracked_files: [],
+      branch: "agent/task-1", commit_sha: String(url).includes("/task-1/") ? null : "c".repeat(40), state_token: "clean" });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
+    return response(url, []);
+  };
+  const baseTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), latest_task_commit_sha: "c".repeat(40),
+    worktree_path: "C:/work/task-1", base_branch: "main" };
+  const cases = [
+    { task: { ...baseTask, review_tag: "INVESTIGATION_COMPLETE" }, queue: null },
+    { task: { ...baseTask, latest_task_commit_sha: null }, queue: null },
+    { task: { ...baseTask, review_tag: "VALIDATION_ISSUES" }, queue: null },
+    { task: baseTask, queue: { jobs: [{ task_id: "task-3", run_id: "running", run_status: "RUNNING" }] } },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const view = testing.render(createElement(ToastProvider, null,
+      createElement(TicketPanel, { task: { ...item.task, id: `task-${index}` }, queue: item.queue,
+        onClose() {}, onChanged() {} })));
+    const action = testing.screen.queryByRole("button", { name: "Validate" });
+    assert.ok(!action || action.disabled, `ineligible case ${index} must not offer enabled validation`);
+    view.unmount();
+  }
+});
+
+test("validation findings are visible in Runs and copied by attribution category", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider, ToastViewport } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const priorClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+  const copied = [];
+  Object.defineProperty(globalThis.navigator, "clipboard", {
+    configurable: true, value: { writeText: async (text) => { copied.push(text); } },
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (priorClipboard) Object.defineProperty(globalThis.navigator, "clipboard", priorClipboard);
+    else delete globalThis.navigator.clipboard;
+  });
+  const findings = [
+    { id: "direct-1", attribution: "DIRECT", summary: "Changed parser rejects valid input",
+      rationale: "The implementation changed this path.", evidence: "Reproduction fails after the checkpoint.", locations: [{ file: "src/parser.ts", line: 12 }] },
+    { id: "indirect-1", attribution: "INDIRECT", summary: "Existing timeout is too short",
+      rationale: "This behavior predates the change.", evidence: "The unchanged caller times out under load.", locations: [{ file: "src/client.ts", line: 44 }] },
+  ];
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/runs")) return response(url, [{
+      id: "validation-1", stage: "VALIDATION_REVIEW", sequence: 3, status: "COMPLETED",
+      reason_code: null, error_message: null, started_at: new Date().toISOString(), completed_at: new Date().toISOString(),
+      handover: { summary: "Validation completed." }, validation_result: { result: "ISSUES_FOUND", findings },
+    }]);
+    if (path.endsWith("/checkpoint-preview")) return response(url, { tracked_changes: [], untracked_files: [],
+      branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean" });
+    if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
+    return response(url, []);
+  };
+  testing.render(createElement(ToastProvider, null, createElement("div", null,
+    createElement(TicketPanel, { task: { ...task("REVIEW", "VALIDATION_ISSUES"), latest_task_commit_sha: "c".repeat(40) },
+      queue: null, onClose() {}, onChanged() {} }), createElement(ToastViewport))));
+  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Runs (1)" }));
+  await testing.screen.findByText("Changed parser rejects valid input");
+  await testing.screen.findByText("Existing timeout is too short");
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Copy direct findings" }));
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Copy indirect findings" }));
+  await testing.waitFor(() => assert.equal(copied.length, 2));
+  await testing.screen.findByText(/copied/i);
+  assert.match(copied[0], /Changed parser rejects valid input/);
+  assert.doesNotMatch(copied[0], /Existing timeout is too short/);
+  assert.match(copied[1], /Existing timeout is too short/);
+  assert.doesNotMatch(copied[1], /Changed parser rejects valid input/);
+});
+
+test("Validation Review progress is identified in the Runs history while it is running", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/runs")) return response(url, [{
+      id: "validation-running", stage: "VALIDATION_REVIEW", sequence: 4, status: "RUNNING",
+      reason_code: null, error_message: null, started_at: new Date().toISOString(), completed_at: null,
+      handover: null,
+    }]);
+    if (path.endsWith("/checkpoint-preview")) return response(url, { tracked_changes: [], untracked_files: [],
+      branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean" });
+    if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
+    return response(url, []);
+  };
+  testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
+  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Runs (1)" }));
+  await testing.screen.findByText("Validation #4");
+  await testing.screen.findByText("RUNNING");
 });

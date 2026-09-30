@@ -79,3 +79,26 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.match(messageCard, /Tool calls/);
   assert.match(messageCard, /local · coder · in 14 · out 7 tokens/);
 });
+
+test("stale or inactive validation snapshots are not rendered as Ready to Merge", async (t) => {
+  const vite = await createServer({
+    root: webRoot,
+    configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => vite.close());
+  const { TicketPanel } = await vite.ssrLoadModule("/src/components/TicketPanel.tsx");
+  const { ToastProvider } = await vite.ssrLoadModule("/src/components/ToastContext.tsx");
+  const staleTask = {
+    id: "task-1", project_id: "project-1", title: "Validation task", description: "Context",
+    workflow_state: "REVIEW", review_tag: "READY_TO_MERGE", active_validation_snapshot_id: null,
+    validation_snapshot_current: false, latest_task_commit_sha: "c".repeat(40),
+    worktree_path: "C:/work/task-1", working_session_id: null, working_session_file: null,
+    base_branch: "main", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  };
+  const markup = renderToStaticMarkup(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: staleTask, queue: null, onClose() {}, onChanged() {} })));
+  assert.doesNotMatch(markup, /Ready to Merge/i,
+    "an inactive/stale snapshot must not be presented as current merge readiness");
+});

@@ -5,7 +5,7 @@ import { AgentManager } from "../dist/agents/agent-manager.js";
 import { RunManager } from "../dist/agents/run-manager.js";
 
 function makeFixture(t, options = {}) {
-  const { stage = "INVESTIGATION", submitOn = [] } = options;
+  const { stage = "INVESTIGATION", submitOn = [], pausePrompt = false } = options;
   const db = openDatabase(":memory:");
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO projects (id, name, root_path, created_at, updated_at)
@@ -16,6 +16,7 @@ function makeFixture(t, options = {}) {
     VALUES ('run-1', 'task-1', ?, 1, 'QUEUED')`).run(stage);
 
   const prompts = [];
+  let releasePrompt;
   const agents = new AgentManager(db, "/tmp/handover-test", async (_cwd, manager) => ({
     sessionId: manager.getSessionId(),
     sessionFile: manager.getSessionFile(),
@@ -23,13 +24,14 @@ function makeFixture(t, options = {}) {
     // submitOn lists the prompt indexes on which the agent calls submit_handover.
     prompt: async (text) => {
       prompts.push(text);
+      if (pausePrompt) await new Promise((resolve) => { releasePrompt = resolve; });
       if (submitOn.includes(prompts.length - 1)) {
         db.prepare("UPDATE task_runs SET handover_json = ? WHERE id = 'run-1'")
           .run(JSON.stringify({ stage, summary: "done" }));
       }
     },
     steer: async () => {},
-    abort: async () => {},
+    abort: async () => { releasePrompt?.(); },
     dispose() {},
   }));
   const runs = new RunManager(db, agents);
@@ -89,6 +91,18 @@ test("validation review runs complete without requiring a handover", async (t) =
   assert.equal(run(db).status, "COMPLETED");
   // Phase 8 owns validation outcomes, so the board is untouched here.
   assert.deepEqual(task(db), { workflow_state: "IN_PROGRESS", review_tag: null });
+});
+
+test("stopping an active Validation Review records Validation Failed", async (t) => {
+  const { db, runs, prompts } = makeFixture(t, { stage: "VALIDATION_REVIEW", pausePrompt: true });
+  const started = runs.start("run-1", { text: "validate", inputIds: [] });
+  for (let index = 0; prompts.length === 0 && index < 100; index++) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(prompts.length, 1);
+  await runs.stop("run-1");
+  await started;
+  assert.equal(run(db).status, "FAILED");
+  assert.equal(run(db).reason_code, "USER_STOPPED");
+  assert.deepEqual(task(db), { workflow_state: "REVIEW", review_tag: "VALIDATION_FAILED" });
 });
 
 test("a stop during the handover retry is recorded as interrupted, not handover failure", async (t) => {

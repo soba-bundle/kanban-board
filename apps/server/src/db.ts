@@ -262,5 +262,28 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const validationResultsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 9").get();
+  if (!validationResultsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE validation_results ADD COLUMN candidate_sha TEXT;
+        ALTER TABLE validation_results ADD COLUMN base_sha TEXT;
+        ALTER TABLE validation_results ADD COLUMN base_tip_at_start TEXT;
+        ALTER TABLE validation_results ADD COLUMN base_tip_at_finish TEXT;
+        ALTER TABLE validation_results ADD COLUMN guidance_watermark TEXT;
+        ALTER TABLE validation_results ADD COLUMN task_head_at_start TEXT;
+        ALTER TABLE validation_results ADD COLUMN task_head_at_finish TEXT;
+        ALTER TABLE validation_results ADD COLUMN task_worktree_clean_at_start INTEGER;
+        ALTER TABLE validation_results ADD COLUMN task_worktree_clean_at_finish INTEGER;
+        ALTER TABLE validation_results ADD COLUMN validation_worktree_clean INTEGER;
+        ALTER TABLE validation_results ADD COLUMN validation_worktree_path TEXT;
+        ALTER TABLE validation_results ADD COLUMN cleanup_status TEXT;
+        ALTER TABLE validation_results ADD COLUMN failure_kind TEXT;
+        ALTER TABLE validation_results ADD COLUMN failure_message TEXT;`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (9, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

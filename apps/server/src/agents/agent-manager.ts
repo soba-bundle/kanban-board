@@ -1,4 +1,4 @@
-import { createAgentSession, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type Database from "better-sqlite3";
 import {
   HumanRequestQuestionsSchema,
@@ -12,6 +12,7 @@ import { createHandoverTool } from "./handover-tool.js";
 import type { HumanRequestService } from "./human-requests.js";
 import { createKanbanQuestionnaireTool } from "../pi/questionnaire-tool.js";
 import { createKanbanResourceLoader } from "../pi/resource-loader.js";
+import { createStageToolPolicy, type RunStage, type StageToolPolicy } from "../pi/stage-tool-policy.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -23,6 +24,9 @@ export interface WorkingSession {
   abort(): Promise<void>;
   subscribe(handler: (event: AgentSessionEvent) => void): () => void;
   dispose(): void;
+  agent?: AgentSession["agent"];
+  getActiveToolNames?(): string[];
+  setActiveToolsByName?(toolNames: string[]): void;
 }
 type SessionFactory = (
   cwd: string,
@@ -49,6 +53,8 @@ export class AgentManager {
   private readonly replayBuffers = new Map<string, LiveEvent[]>();
   private readonly runSequences = new Map<string, number>();
   private readonly durableSequences = new Map<string, number>();
+  private readonly initialToolNames = new Map<string, string[]>();
+  private readonly stageToolPolicies = new Map<string, StageToolPolicy>();
 
   constructor(
     private readonly db: Database.Database,
@@ -91,10 +97,19 @@ export class AgentManager {
   async prompt(taskId: string, runId: string, prompt: string): Promise<void> {
     const session = this.requireSession(taskId);
     this.activeRuns.set(taskId, runId);
+    const policy = this.stageToolPolicies.get(taskId);
+    const initialToolNames = this.initialToolNames.get(taskId);
+    if (policy && initialToolNames && session.setActiveToolsByName) {
+      session.setActiveToolsByName(policy.filterActiveTools(initialToolNames));
+    }
     try {
       await session.prompt(prompt);
     } finally {
-      if (this.activeRuns.get(taskId) === runId) this.activeRuns.delete(taskId);
+      if (this.activeRuns.get(taskId) === runId) {
+        this.activeRuns.delete(taskId);
+        const initialToolNames = this.initialToolNames.get(taskId);
+        if (initialToolNames && session.setActiveToolsByName) session.setActiveToolsByName(initialToolNames);
+      }
     }
   }
 
@@ -284,6 +299,8 @@ export class AgentManager {
     this.sessions.get(taskId)?.dispose();
     this.sessions.delete(taskId);
     this.activeRuns.delete(taskId);
+    this.initialToolNames.delete(taskId);
+    this.stageToolPolicies.delete(taskId);
     this.listeners.delete(taskId);
   }
 
@@ -299,6 +316,22 @@ export class AgentManager {
         sessionId: manager.getSessionId(),
       }),
     ]);
+    const policy = createStageToolPolicy(() => {
+      const runId = this.activeRuns.get(taskId);
+      if (!runId) return undefined;
+      const run = this.db.prepare("SELECT stage FROM task_runs WHERE id = ?").get(runId) as { stage: RunStage } | undefined;
+      return run?.stage;
+    });
+    this.initialToolNames.set(taskId, session.getActiveToolNames?.() ?? []);
+    this.stageToolPolicies.set(taskId, policy);
+    if (session.agent) {
+      const previousBeforeToolCall = session.agent.beforeToolCall;
+      session.agent.beforeToolCall = async (context, signal) => {
+        const decision = policy.blockToolCall(context.toolCall.name);
+        if (decision?.blocked) return { block: true, reason: decision.reason };
+        return previousBeforeToolCall?.(context, signal);
+      };
+    }
     session.sessionManager ??= manager;
     const workingSession = session;
     this.sessions.set(taskId, workingSession);

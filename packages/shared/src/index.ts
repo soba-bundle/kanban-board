@@ -1,5 +1,13 @@
 import { z } from "zod";
 import { LiveEventSchema } from "./live-events.js";
+export {
+  ValidationAttributionSchema,
+  ValidationFindingLocationSchema,
+  ValidationFindingSchema,
+  ValidationReportSchema,
+  ValidationResultSchema,
+} from "./validation.js";
+export type { ValidationAttribution, ValidationFinding, ValidationReport, ValidationResult } from "./validation.js";
 export { LiveEventSchema } from "./live-events.js";
 export type { LiveEvent } from "./live-events.js";
 export {

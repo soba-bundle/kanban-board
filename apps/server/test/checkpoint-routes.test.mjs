@@ -59,6 +59,12 @@ test("checkpoint API requires the exact untracked-file approval and persists the
   });
 
   worktreePath = (await worktrees.createTaskWorktree("t")).worktreePath;
+  db.prepare("UPDATE tasks SET review_tag = 'VALIDATION_FAILED' WHERE id = 't'").run();
+  const retryPreview = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-preview" });
+  assert.equal(retryPreview.statusCode, 200, "failed validation may inspect the worktree before retrying");
+  const retryCheckpoint = await app.inject({ method: "POST", url: "/api/tasks/t/checkpoint", payload: confirmation(retryPreview.json()) });
+  assert.equal(retryCheckpoint.statusCode, 409, "failed validation preview must not authorize a checkpoint");
+  db.prepare("UPDATE tasks SET review_tag = 'IMPLEMENTATION_COMPLETE' WHERE id = 't'").run();
   writeFileSync(join(worktreePath, "new.txt"), "new file\n");
   const preview = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-preview" });
   assert.equal(preview.statusCode, 200);

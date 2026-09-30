@@ -138,16 +138,16 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
   const canCheckpoint = task.workflow_state === "REVIEW" &&
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "");
+  const needsCheckpointPreview = canCheckpoint || (task.workflow_state === "REVIEW" && task.review_tag === "VALIDATION_FAILED");
   const latestCheckpointSha = checkpointedSha ?? task.latest_task_commit_sha;
   const checkpointHasChanges = !!checkpointStatus &&
     (checkpointStatus.tracked_changes.length > 0 || checkpointStatus.untracked_files.length > 0);
   const canValidateTag = ["IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
-  const validationCheckpointClean = task.review_tag === "VALIDATION_FAILED" || (!!checkpointStatus &&
-    !checkpointHasChanges && checkpointStatus.commit_sha === latestCheckpointSha);
+  const validationCheckpointClean = !!checkpointStatus && !checkpointHasChanges &&
+    checkpointStatus.commit_sha === latestCheckpointSha;
   const canValidate = task.workflow_state === "REVIEW" && canValidateTag && !!task.base_commit_sha &&
     !!latestCheckpointSha && !!task.worktree_path && !!task.base_branch && !activeJob && validationCheckpointClean;
-  const showValidateAction = canValidateTag && (task.review_tag === "VALIDATION_FAILED" ||
-    checkpointStatus !== null || checkpointStatusError !== null);
+  const showValidateAction = canValidateTag && (checkpointStatus !== null || checkpointStatusError !== null);
   const latestValidationRun = runs.slice().reverse().find((item) => item.stage === "VALIDATION_REVIEW");
   const visibleReviewTag = task.review_tag === "READY_TO_MERGE" &&
     (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true ||
@@ -236,7 +236,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setCheckpointedSha(null);
     setCheckpointStatus(null);
     setCheckpointStatusError(null);
-    if (!canCheckpoint) return;
+    if (!needsCheckpointPreview) return;
     let current = true;
     const load = () => {
       void loadCheckpointPreview(task.id).then((preview) => {
@@ -254,7 +254,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     load();
     const timer = setInterval(load, 5000);
     return () => { current = false; clearInterval(timer); };
-  }, [canCheckpoint, task.id, task.latest_task_commit_sha]);
+  }, [needsCheckpointPreview, task.id, task.latest_task_commit_sha]);
 
   useEffect(() => {
     let current = true;

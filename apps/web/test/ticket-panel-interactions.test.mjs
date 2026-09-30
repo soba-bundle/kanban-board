@@ -309,6 +309,32 @@ test("eligible Implementation Complete task exposes Validate and queues an expli
   await testing.screen.findByText(/validation.*queued/i);
 });
 
+test("failed Validation retries require a clean worktree at the saved checkpoint", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: String(url).includes("task-dirty") ? ["changed.ts"] : [],
+      untracked_files: [], branch: "agent/task-1",
+      commit_sha: String(url).includes("task-stale") ? "d".repeat(40) : "c".repeat(40), state_token: "clean",
+    });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
+    return response(url, []);
+  };
+  const baseTask = { ...task("REVIEW", "VALIDATION_FAILED"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
+  for (const [id, shouldEnable] of [["task-clean", true], ["task-dirty", false], ["task-stale", false]]) {
+    const view = testing.render(createElement(ToastProvider, null,
+      createElement(TicketPanel, { task: { ...baseTask, id }, queue: null, onClose() {}, onChanged() {} })));
+    const validate = await testing.screen.findByRole("button", { name: "Validate" });
+    await testing.waitFor(() => assert.equal(validate.disabled, !shouldEnable));
+    view.unmount();
+  }
+});
+
 test("Validate is unavailable for ineligible tasks, missing checkpoints, or conflicting queued work", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);

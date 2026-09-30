@@ -1,6 +1,6 @@
 # Phase 8 — Independent Validation Design Draft
 
-**Status:** Acceptance-test specification approved and implemented through the UI/result-presentation slice. Server and web validation flows, stale-readiness checks, and cleanup reconciliation are covered by tests. Remaining work is a real-provider end-to-end Validation run, independent review, and the integrated Phase 8 gate.
+**Status:** Phase 8 acceptance-test specification and implementation are complete. The real-provider Validation run passed, the independent review follow-up found no actionable issues, and the integrated suite passed. Phase 9 merge-back remains separate.
 
 ## Implementation log
 
@@ -157,11 +157,12 @@ These are the approved acceptance-test specifications. Executable tests include 
 - **V8-UI-02:** Validation outcomes and findings are shown in Runs/Live; Ready to Merge with indirect findings still displays them.
 - **V8-UI-03:** Direct/indirect copy actions copy the intended category and provide feedback.
 - **V8-UI-04:** A passing/indirect-only result is not shown as merge-ready if its snapshot is stale or invalidated.
+- **V8-UI-05:** Board and ticket views fail closed when current readiness cannot be verified; Validation Failed retries require a clean worktree at the saved checkpoint.
 - **V8-GATE-01:** Shared/server/web tests, typecheck, real-Git worktree tests, hosted Pi session tests, and the integrated suite cover the accepted behaviors.
 
-## 4. Proposed implementation breakdown (after test cases are approved)
+## 4. Implementation breakdown and status
 
-Each slice should begin with its tests, be reviewed with the user, then be implemented and verified before moving to the next slice.
+This records the original slices and the final Phase 8 gate status.
 
 1. **Approve the acceptance contract.** Review the cases and resolved policies in this draft; turn accepted cases into executable tests first and verify the intended red baseline. Keep Laya/Bash-policy research optional and separate.
 2. **Stage-aware Pi tool policy (implemented).** The Kanban-owned policy is under `apps/server/src/pi/`; it hides and pre-blocks `write`/`edit` for Investigation and Validation, blocks Human Requests only in Validation, and preserves Implementation writes. Hosted `AgentSession` tests pass. User-global extensions remain untouched.
@@ -169,8 +170,8 @@ Each slice should begin with its tests, be reviewed with the user, then be imple
 4. **Pinned context and isolated resources (implemented and wired).** `buildValidationContext`, `createValidationSession`, `WorktreeManager.getPinnedDiff`, and the detached worktree factory are used by the explicit Validation start and isolated executor.
 5. **Queue/API/run lifecycle (implemented; recovery coverage remains).** Explicit eligibility/start, validation queue dispatch, structured result submission, outcome transitions, retry rules, Stop behavior, and operation/concurrency protection are implemented. Startup cleanup recovery and the remaining crash-boundary tests stay in Slice 7.
 6. **UI and result presentation (implemented).** The Validate action/status, findings, category copy controls, and active-snapshot readiness display are implemented.
-7. **Staleness, cleanup, and recovery (core implemented).** Candidate/base races, cleanup pending/reconciliation, and no restart replay have focused coverage. Real-provider end-to-end Validation and remaining crash-boundary review are outstanding.
-8. **Integrated Phase 8 gate (remaining).** Run independent review and any additional focused Git/Pi acceptance, then document the verified result. Do not start Phase 9 merge-back implementation as part of this phase.
+7. **Staleness, cleanup, and recovery (implemented).** Candidate/base races, cleanup pending/reconciliation, and no restart replay have focused coverage.
+8. **Integrated Phase 8 gate (passed).** The real-provider run, independent review follow-up, and integrated verification are recorded below. Phase 9 merge-back remains separate.
 
 ## 5. Decisions recorded and follow-up research
 
@@ -180,3 +181,10 @@ Each slice should begin with its tests, be reviewed with the user, then be imple
 - Validation Review does not issue Human Requests in the first version; missing information is reported without parking.
 - The initial Phase 8 policy blocks `write`/`edit` and audits tracked changes; it does not claim arbitrary Bash is read-only. The correct project is [`receptron/laya`](https://github.com/receptron/laya), a typed decision/classification model. Treat it as optional follow-up research, not an authorization boundary. Assess false negatives on Windows shell commands, latency/dependency cost, and fail-closed behavior before any integration.
 - **Cleanup persistence resolved:** persist the validation worktree path and cleanup status on each `validation_results` attempt row. Startup can retry cleanup and the UI can surface pending cleanup; keep task `cleanup_status` dedicated to the implementation worktree.
+
+## 6. Integrated Phase 8 gate follow-up
+
+- **Real-provider run:** the user’s “Write a readme” ticket completed Validation run #2 with status `COMPLETED`, result `PASSED`, and zero findings. The report’s candidate SHA matched the latest checkpoint (`80fe4eadd27a4bb637bf02464a23705649e15546`); its recorded base SHA and live base tip were stable (`a51bba3eee32ba48a794345d5ca5f6a8cbe9f7db`). The result snapshot was active, and a read-only check confirmed the task worktree was clean and at the checkpoint.
+- **Review follow-up:** the board now substitutes “Implementation Complete” unless the active snapshot exists and readiness is current. Failed-validation retries require a successful checkpoint-preview response with no changes and an exact checkpoint SHA match. The preview endpoint permits read-only inspection for `VALIDATION_FAILED`; checkpoint creation remains disallowed in that state. Regression tests cover these paths. Independent review of this follow-up diff found no actionable findings.
+- **Verification after follow-up:** `npm test` passed: 11 shared, 134 server, and 31 web tests; it also built all workspaces. `git diff --check` passed. (The web tests emitted a Vite WebSocket port-in-use warning, but all tests passed.)
+- **Phase boundary:** Phase 8 validation does not merge. Phase 9 remains the separate merge-back implementation and must sync/revalidate if the base has moved.

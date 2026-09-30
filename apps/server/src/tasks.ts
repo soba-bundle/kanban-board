@@ -194,10 +194,10 @@ export function registerTaskRoutes(
     const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
       .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
     if (!task) return reply.code(404).send({ error: "Task not found." });
-    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
-      return reply.code(409).send({ error: "Only completed work in Review can be checkpointed." });
+    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "")) {
+      return reply.code(409).send({ error: "This task is not eligible for a worktree preview." });
     }
-    if (!worktrees) return reply.code(503).send({ error: "Checkpointing is unavailable." });
+    if (!worktrees) return reply.code(503).send({ error: "Worktree preview is unavailable." });
     try {
       const preview = await worktrees.previewCheckpoint(request.params.taskId);
       return {

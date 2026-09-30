@@ -80,6 +80,32 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.match(messageCard, /local · coder · in 14 · out 7 tokens/);
 });
 
+test("the task board only displays Ready to Merge for a current active snapshot", async (t) => {
+  const vite = await createServer({
+    root: webRoot,
+    configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => vite.close());
+  const { TaskBoard } = await vite.ssrLoadModule("/src/components/TaskBoard.tsx");
+  const baseTask = {
+    id: "task-1", project_id: "project-1", title: "Validation task", description: "Context",
+    workflow_state: "REVIEW", review_tag: "READY_TO_MERGE", active_validation_snapshot_id: "snapshot-1",
+    latest_task_commit_sha: "c".repeat(40), validation_snapshot_current: false,
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  };
+  const renderBoard = (task) => renderToStaticMarkup(createElement(TaskBoard, {
+    board: { columns: { TODO: [], IN_PROGRESS: [], REQUIRES_HUMAN: [], REVIEW: [task], DONE: [] } },
+    queue: null, projects: [], projectId: "all", onStartTask() {}, onOpenTask() {}, onCreateTask() {}, onDeleteTask() {}, onCancelTask() {},
+  }));
+  const staleMarkup = renderBoard(baseTask);
+  assert.match(staleMarkup, /IMPLEMENTATION COMPLETE/);
+  assert.doesNotMatch(staleMarkup, /READY TO MERGE/);
+  assert.match(renderBoard({ ...baseTask, validation_snapshot_current: true }), /READY TO MERGE/);
+  assert.doesNotMatch(renderBoard({ ...baseTask, active_validation_snapshot_id: null, validation_snapshot_current: true }), /READY TO MERGE/);
+});
+
 test("stale or inactive validation snapshots are not rendered as Ready to Merge", async (t) => {
   const vite = await createServer({
     root: webRoot,

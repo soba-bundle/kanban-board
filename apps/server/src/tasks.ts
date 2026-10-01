@@ -180,7 +180,7 @@ export function registerTaskRoutes(
       }
 
       const now = new Date().toISOString();
-      const updated = db.prepare(`UPDATE tasks SET workflow_state = 'DONE', review_tag = NULL,
+      const updated = db.prepare(`UPDATE tasks SET workflow_state = 'DONE', resolution = 'CLOSED', review_tag = NULL,
         cleanup_status = NULL, updated_at = ? WHERE id = ? AND is_active = 1 AND workflow_state = 'REVIEW'`)
         .run(now, request.params.taskId);
       if (updated.changes !== 1) return reply.code(409).send({ error: "Task state changed; refresh before closing it." });
@@ -194,10 +194,10 @@ export function registerTaskRoutes(
     const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
       .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
     if (!task) return reply.code(404).send({ error: "Task not found." });
-    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
-      return reply.code(409).send({ error: "Only completed work in Review can be checkpointed." });
+    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "")) {
+      return reply.code(409).send({ error: "This task is not eligible for a worktree preview." });
     }
-    if (!worktrees) return reply.code(503).send({ error: "Checkpointing is unavailable." });
+    if (!worktrees) return reply.code(503).send({ error: "Worktree preview is unavailable." });
     try {
       const preview = await worktrees.previewCheckpoint(request.params.taskId);
       return {
@@ -285,11 +285,10 @@ export function registerTaskRoutes(
     }
     if (!worktrees) return reply.code(503).send({ error: "Diff viewing is unavailable." });
     try {
-      const [diff, files] = await Promise.all([
-        worktrees.getDiff(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
-        worktrees.getChangedFiles(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
-      ]);
-      return { from_sha: row.base_commit_sha, to_sha: row.latest_task_commit_sha, files, diff };
+      const { changedFiles, diff } = await worktrees.getPinnedDiff(
+        request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha,
+      );
+      return { from_sha: row.base_commit_sha, to_sha: row.latest_task_commit_sha, files: changedFiles, diff };
     } catch (error) {
       return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
     }

@@ -123,7 +123,11 @@ CREATE TABLE merge_attempts (
   status TEXT NOT NULL,
   started_at TEXT,
   completed_at TEXT,
-  error_reason TEXT
+  error_reason TEXT,
+  base_branch TEXT,
+  priority_validation_run_id TEXT,
+  sync_base_sha TEXT,
+  sync_candidate_sha TEXT
 );
 `;
 
@@ -295,6 +299,25 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
         ALTER TABLE task_runs ADD COLUMN validation_worktree_path TEXT;`);
       db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?)")
         .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
+  const mergeAttemptsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 11").get();
+  if (!mergeAttemptsApplied) {
+    const migrate = db.transaction(() => {
+      const columns = new Set((db.prepare("PRAGMA table_info(merge_attempts)").all() as Array<{ name: string }>).map((column) => column.name));
+      if (columns.size === 0) {
+        db.exec(`CREATE TABLE merge_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+          validation_snapshot_id TEXT REFERENCES validation_snapshots(id), approval_status TEXT NOT NULL,
+          validated_base_sha TEXT NOT NULL, validated_task_sha TEXT NOT NULL, status TEXT NOT NULL,
+          started_at TEXT, completed_at TEXT, error_reason TEXT)`);
+      }
+      for (const [name, type] of [["base_branch", "TEXT"], ["priority_validation_run_id", "TEXT"],
+        ["sync_base_sha", "TEXT"], ["sync_candidate_sha", "TEXT"]] as const) {
+        if (!columns.has(name)) db.exec(`ALTER TABLE merge_attempts ADD COLUMN ${name} ${type}`);
+      }
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (11, ?)").run(new Date().toISOString());
     });
     migrate();
   }

@@ -59,6 +59,9 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                 {tasks.map((task) => {
                   const agent = agentFor(task, queue);
                   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
+                  const reviewTag = task.review_tag === "READY_TO_MERGE" &&
+                    (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true)
+                    ? "IMPLEMENTATION_COMPLETE" : task.review_tag;
                   return (
                     <article
                       className="task-card task-card-clickable"
@@ -74,7 +77,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                           <ProjectMark name={projectNames.get(task.project_id) ?? "Project"} colorIndex={projectColors.get(task.project_id) ?? 0} />
                           <span className="task-project">{projectNames.get(task.project_id) ?? "Project"}</span>
                         </div>
-                        {task.review_tag && <span className="review-tag">{task.review_tag.replaceAll("_", " ")}</span>}
+                        {reviewTag && <span className="review-tag">{reviewTag.replaceAll("_", " ")}</span>}
                       </div>
                       <h3>{task.title}</h3>
                       {task.description && <p className="task-description">{task.description}</p>}

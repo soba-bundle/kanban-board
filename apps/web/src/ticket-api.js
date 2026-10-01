@@ -71,6 +71,18 @@ export function loadCheckpointDiff(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint-diff`);
 }
 
+export function loadMergePreview(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/merge-preview`);
+}
+
+export function startMerge(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/merge`, { method: "POST", ...json({ confirmed: true }) });
+}
+
+export function mergeAction(taskId, action) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/merge/${action}`, { method: "POST", ...json({}) });
+}
+
 export function createCheckpoint(taskId, confirmation) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint`, {
     method: "POST", ...json(confirmation),

@@ -56,7 +56,7 @@ export class ValidationManager {
     return this.cleanup.reconcilePending();
   }
 
-  async start(taskId: string): Promise<{ run_id: string; status: string }> {
+  async start(taskId: string, options: { priority?: boolean } = {}): Promise<{ run_id: string; status: string }> {
     const task = this.db.prepare(`SELECT t.id, t.title, t.description, t.workflow_state, t.review_tag,
         t.latest_task_commit_sha, t.base_commit_sha, t.base_branch, p.root_path
       FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -159,6 +159,7 @@ export class ValidationManager {
       base_tip_sha: baseTip,
       guidance_watermark: guidanceWatermark,
       task_head_sha: worktree.head_sha,
+      priority: options.priority,
     });
     return { run_id: queued.run_id, status: "QUEUED" };
   }

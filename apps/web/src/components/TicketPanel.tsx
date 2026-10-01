@@ -17,6 +17,9 @@ import {
   loadCheckpointPreview,
   createCheckpoint,
   loadCheckpointDiff,
+  loadMergePreview,
+  startMerge,
+  mergeAction,
 } from "../ticket-api.js";
 
 type Tab = "runs" | "live";
@@ -45,6 +48,17 @@ function textContent(entry: LiveHistoryEntry): string {
   return message.content.filter((part): part is { type: string; text: string } =>
     !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
     .map((part) => part.text).join("");
+}
+
+function diffSections(diff: string): string[] {
+  return diff.split(/(?=^diff --git )/m).filter((section) => section.startsWith("diff --git "));
+}
+
+function sideBySideLines(diff: string): Array<{ left: string; right: string }> {
+  return diff.split("\n").map((line) => ({
+    left: line.startsWith("+") && !line.startsWith("+++") ? "" : line.startsWith("-") && !line.startsWith("---") ? line : line,
+    right: line.startsWith("-") && !line.startsWith("---") ? "" : line.startsWith("+") && !line.startsWith("+++") ? line : line,
+  }));
 }
 
 function inputStatusLabel(status: string): string {
@@ -121,7 +135,13 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   } | null>(null);
   const [completionStatusError, setCompletionStatusError] = useState<string | null>(null);
   const [checkpointedSha, setCheckpointedSha] = useState<string | null>(null);
-  const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string } | null>(null);
+  const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string; from_sha?: string } | null>(null);
+  const [selectedDiffFile, setSelectedDiffFile] = useState(0);
+  const [diffView, setDiffView] = useState<"unified" | "side-by-side">("unified");
+  const [mergePreview, setMergePreview] = useState<Awaited<ReturnType<typeof loadMergePreview>> | null>(null);
+  const [mergeConfirmation, setMergeConfirmation] = useState(false);
+  const [mergeStatus, setMergeStatus] = useState<string | null>(null);
+  const diffRequestIdRef = useRef(0);
   const [validationNotice, setValidationNotice] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
@@ -135,7 +155,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const canStartRun = task.workflow_state === "TODO" || (task.workflow_state === "REVIEW" &&
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? ""));
   const canReviewAction = task.workflow_state === "REVIEW" &&
-    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
+    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED", "READY_TO_MERGE", "MERGE_CONFLICT"].includes(task.review_tag ?? "");
   const canCheckpoint = task.workflow_state === "REVIEW" &&
     ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "");
   const needsCheckpointPreview = canCheckpoint || (task.workflow_state === "REVIEW" && task.review_tag === "VALIDATION_FAILED");
@@ -153,6 +173,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true ||
       latestValidationRun?.validation_result?.active === false)
     ? "IMPLEMENTATION_COMPLETE" : task.review_tag;
+  const showMergeControls = task.workflow_state === "REVIEW";
+  const diffPatches = checkpointDiff ? diffSections(checkpointDiff.diff) : [];
+  const selectedDiffPatch = checkpointDiff?.files.length ? diffPatches[selectedDiffFile] ?? "" : checkpointDiff?.diff ?? "";
 
   const refresh = useCallback(async () => {
     try {
@@ -255,6 +278,19 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     const timer = setInterval(load, 5000);
     return () => { current = false; clearInterval(timer); };
   }, [needsCheckpointPreview, task.id, task.latest_task_commit_sha]);
+
+  useEffect(() => {
+    let current = true;
+    setMergePreview(null);
+    setMergeStatus(null);
+    setMergeConfirmation(false);
+    diffRequestIdRef.current++;
+    setCheckpointDiff(null);
+    if (task.workflow_state !== "REVIEW") return;
+    void loadMergePreview(task.id).then((preview) => { if (current) setMergePreview(preview); })
+      .catch((caught) => { if (current) setMergePreview({ eligible: false, reason: caught instanceof Error ? caught.message : String(caught) }); });
+    return () => { current = false; };
+  }, [task.id, task.workflow_state, task.base_branch, task.base_commit_sha, task.latest_task_commit_sha, task.review_tag]);
 
   useEffect(() => {
     let current = true;
@@ -381,6 +417,41 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     } finally {
       setBusy(false);
     }
+  }
+
+  async function openCheckpointDiff() {
+    const requestId = ++diffRequestIdRef.current;
+    const taskId = task.id;
+    setSelectedDiffFile(0);
+    setDiffView("unified");
+    setCheckpointDiff({ files: [], diff: "", to_sha: task.latest_task_commit_sha ?? "", from_sha: task.base_commit_sha ?? "" });
+    try {
+      const result = await loadCheckpointDiff(taskId);
+      if (diffRequestIdRef.current === requestId && liveTaskIdRef.current === taskId) setCheckpointDiff(result);
+    } catch (caught) {
+      if (diffRequestIdRef.current === requestId && liveTaskIdRef.current === taskId) {
+        setCheckpointDiff(null);
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    }
+  }
+
+  async function runMergeAction(action: "start" | "abort" | "retry" | "view-conflicts") {
+    setBusy(true);
+    setMergeStatus(null);
+    try {
+      const result = action === "start" ? await startMerge(task.id) : await mergeAction(task.id, action);
+      setMergeConfirmation(false);
+      setMergeStatus(result.status === "MERGED" ? "Merged successfully." :
+        result.status === "VALIDATION_QUEUED" ? "Base synced. Fresh Validation is queued; merging still requires a new approval if interrupted." :
+          result.status === "ABORTED" ? "Merge aborted; task changes were preserved." :
+            result.status === "OPENED" ? "Opened the task worktree in the IDE." : `Merge status: ${result.status}`);
+      if (action === "start" || action === "abort") onChanged();
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setMergeStatus(message);
+      pushToast({ title: "Merge action failed", description: message, variant: "danger" });
+    } finally { setBusy(false); }
   }
 
   const activeHumanRequest = humanRequests.find((request) => request.status === "PENDING") ?? humanRequests.slice().reverse()[0];
@@ -513,11 +584,20 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                         setCheckpointPreview(await loadCheckpointPreview(task.id));
                       })}>Commit changes</button>
                     ) : latestCheckpointSha ? (
-                      <button className="button-quiet" disabled>Merge back (unavailable until Phase 9)</button>
+                      <span className="run-empty">Checkpoint {latestCheckpointSha.slice(0, 12)} is ready for review.</span>
                     ) : (
                       <span className="run-empty">No changes to checkpoint.</span>
                     ))}
                     <button className="button-quiet" disabled={busy} onClick={() => setStartingRun(true)}>Start run</button>
+                    {showMergeControls && task.review_tag !== "MERGE_CONFLICT" && <>
+                      <button className="button-primary" disabled={busy || mergePreview?.eligible === false || !task.active_validation_snapshot_id}
+                        title={mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? undefined}
+                        onClick={() => { setMergeStatus(null); setMergeConfirmation(true); }}>Merge back to working branch</button>
+                      {((mergePreview?.eligible === false) || !task.active_validation_snapshot_id) && <span className="run-error">
+                        {(mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? "Validation required").replaceAll("_", " ")}
+                      </span>}
+                    </>}
+                    {mergeStatus && <p className="run-empty" role="status">{mergeStatus}</p>}
                     {showValidateAction && <button className="button-primary" disabled={busy || !canValidate} onClick={() => void run(async () => {
                       const result = await startValidation(task.id);
                       setValidationNotice(result.status === "QUEUED" ? "Validation queued." : `Validation ${result.status.toLowerCase()}.`);
@@ -535,9 +615,12 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                     ) : completionStatusError ? (
                       <span className="run-error">Cannot verify task Git state: {completionStatusError}</span>
                     ) : <button className="button-quiet" disabled>Checking Git status…</button>}
-                    <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
-                      setCheckpointDiff(await loadCheckpointDiff(task.id));
-                    })}>View checkpoint diff</button>
+                    {showMergeControls && task.review_tag === "MERGE_CONFLICT" && <>
+                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("view-conflicts")}>View Conflicts</button>
+                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("retry")}>Retry</button>
+                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("abort")}>Abort merge</button>
+                    </>}
+                    <button className="button-quiet" disabled={busy} onClick={() => void openCheckpointDiff()}>View checkpoint diff</button>
                   </div>
                 </section>
               )}
@@ -548,11 +631,43 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             <div className="dialog-backdrop" role="presentation">
               <section className="dialog checkpoint-diff-dialog" role="dialog" aria-modal="true" aria-labelledby="checkpoint-diff-title" onClick={(event) => event.stopPropagation()}>
                 <h2 id="checkpoint-diff-title">Checkpoint diff</h2>
-                <p>Commit {checkpointDiff.to_sha.slice(0, 12)}</p>
-                <p><strong>Changed files</strong></p>
-                <ul>{checkpointDiff.files.map((file) => <li key={file}>{file}</li>)}</ul>
-                <pre className="checkpoint-diff-content">{checkpointDiff.diff || "No differences."}</pre>
-                <div className="dialog-actions"><button className="button-quiet" onClick={() => setCheckpointDiff(null)}>Close</button></div>
+                <p>Base {checkpointDiff.from_sha?.slice(0, 12) ?? "unknown"} → checkpoint {checkpointDiff.to_sha.slice(0, 12)}</p>
+                {checkpointDiff.files.length === 0 ? <p>No changed files or differences.</p> : <>
+                  <p><strong>Changed files</strong></p>
+                  <div className="checkpoint-diff-files" aria-label="Changed files">
+                    {checkpointDiff.files.map((file, index) => <button key={`${index}:${file}`} className="button-quiet"
+                      aria-pressed={selectedDiffFile === index} onClick={() => setSelectedDiffFile(index)}>{file}</button>)}
+                  </div>
+                  <div className="dialog-actions">
+                    <button className="button-quiet" aria-pressed={diffView === "unified"} onClick={() => setDiffView("unified")}>Unified</button>
+                    <button className="button-quiet" aria-pressed={diffView === "side-by-side"} onClick={() => setDiffView("side-by-side")}>Side by side</button>
+                  </div>
+                  {diffView === "unified" ? <pre className="checkpoint-diff-content">{selectedDiffPatch || "No differences for this file."}</pre> :
+                    <div className="checkpoint-diff-side-by-side" role="table" aria-label="Side-by-side diff">
+                      {sideBySideLines(selectedDiffPatch).map((line, index) => <div role="row" key={index}>
+                        <pre role="cell">{line.left}</pre><pre role="cell">{line.right}</pre>
+                      </div>)}
+                    </div>}
+                </>}
+                <div className="dialog-actions"><button className="button-quiet" onClick={() => {
+                  diffRequestIdRef.current++;
+                  setCheckpointDiff(null);
+                }}>Close</button></div>
+              </section>
+            </div>
+          )}
+
+          {mergeConfirmation && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="merge-confirm-title" onClick={(event) => event.stopPropagation()}>
+                <h2 id="merge-confirm-title">Confirm merge back</h2>
+                <p>Merge the validated checkpoint into <strong>{task.base_branch}</strong>?</p>
+                {mergePreview?.base_moved && <p>The base moved since Validation: {mergePreview.validated_base_sha?.slice(0, 12)} → {(mergePreview.current_base_sha ?? mergePreview.live_base_sha)?.slice(0, 12)}. Approval will sync the new base and queue fresh Validation; it will not merge automatically.</p>}
+                {mergePreview?.candidate_sha && <p>Checkpoint {mergePreview.candidate_sha.slice(0, 12)}</p>}
+                <div className="dialog-actions">
+                  <button className="button-primary" disabled={busy || mergePreview?.eligible !== true} onClick={() => void runMergeAction("start")}>Confirm merge</button>
+                  <button className="button-quiet" disabled={busy} onClick={() => setMergeConfirmation(false)}>Cancel</button>
+                </div>
               </section>
             </div>
           )}

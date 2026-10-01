@@ -26,6 +26,7 @@ export interface ValidationQueueMetadata {
   base_tip_sha: string;
   guidance_watermark: number;
   task_head_sha: string;
+  priority?: boolean;
 }
 
 interface NewQueueJob {
@@ -196,7 +197,7 @@ export class QueueManager {
         VALUES (?, ?, ?, 1, ?, ?, 'INITIAL_PROMPT', 'PENDING', ?)`)
         .run(inputId, taskId, job.run_id, idempotencyKey, prompt, now);
       this.db.prepare(`INSERT INTO agent_jobs (id, task_run_id, queue_position, priority, status, created_at)
-        VALUES (?, ?, ?, 0, 'QUEUED', ?)`).run(job.job_id, job.run_id, job.queue_position, now);
+        VALUES (?, ?, ?, ?, 'QUEUED', ?)`).run(job.job_id, job.run_id, job.queue_position, metadata.priority ? 1 : 0, now);
       this.db.prepare(`UPDATE tasks SET workflow_state = 'IN_PROGRESS', review_tag = NULL, updated_at = ? WHERE id = ?`)
         .run(now, taskId);
       return job;

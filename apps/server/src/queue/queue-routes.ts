@@ -10,16 +10,23 @@ function statusFor(error: unknown): number {
   return 409;
 }
 
+export interface QueueRouteLifecycle {
+  onRunStopped?(runId: string): Promise<void> | void;
+  onJobRemoved?(jobId: string): Promise<void> | void;
+}
+
 export function registerQueueRoutes(
   app: FastifyInstance,
   queue: QueueManager,
   operations = new TaskOperationCoordinator(),
+  lifecycle: QueueRouteLifecycle = {},
 ) {
   app.get("/api/queue", async () => queue.getSnapshot());
 
   app.post<{ Params: { runId: string } }>("/api/runs/:runId/stop", async (request, reply) => {
     try {
       await queue.stopRun(request.params.runId);
+      await lifecycle.onRunStopped?.(request.params.runId);
       return { status: "stopped" };
     } catch (error) {
       return reply.code(statusFor(error)).send({ error: error instanceof Error ? error.message : String(error) });
@@ -65,6 +72,7 @@ export function registerQueueRoutes(
   app.delete<{ Params: { jobId: string } }>("/api/queue/:jobId", async (request, reply) => {
     try {
       queue.remove(request.params.jobId);
+      await lifecycle.onJobRemoved?.(request.params.jobId);
       return reply.code(204).send();
     } catch (error) {
       return reply.code(statusFor(error)).send({ error: error instanceof Error ? error.message : String(error) });

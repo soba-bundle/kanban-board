@@ -101,6 +101,9 @@ test("checkpoint API requires the exact untracked-file approval and persists the
   assert.deepEqual(git(worktreePath, "show", "--pretty=format:", "--name-only").trim().split("\n").sort(), ["appeared-after-preview.txt", "new.txt"]);
   assert.equal(git(repo, "status", "--porcelain"), "");
 
+  git(worktreePath, "commit", "--allow-empty", "-m", "move task branch after checkpoint");
+  const movedBranchDiff = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(movedBranchDiff.json().to_sha, sha, "later branch movement must not retarget the saved diff");
   writeFileSync(join(worktreePath, "new.txt"), "later uncommitted edit\n");
   const diff = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
   assert.equal(diff.statusCode, 200);
@@ -109,6 +112,49 @@ test("checkpoint API requires the exact untracked-file approval and persists the
   assert.deepEqual(diff.json().files, ["appeared-after-preview.txt", "new.txt"]);
   assert.match(diff.json().diff, /new file/);
   assert.doesNotMatch(diff.json().diff, /later uncommitted edit/);
+
+  const unusualName = "odd café [tag] file.txt";
+  writeFileSync(join(worktreePath, unusualName), "unusual path\n");
+  const unusualPreview = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-preview" });
+  const unusualCommit = await app.inject({ method: "POST", url: "/api/tasks/t/checkpoint", payload: confirmation(unusualPreview.json()) });
+  assert.equal(unusualCommit.statusCode, 200);
+  const unusualDiff = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(unusualDiff.statusCode, 200);
+  assert.ok(unusualDiff.json().files.includes(unusualName));
+  assert.match(unusualDiff.json().diff, /unusual path/);
+
+  const largeName = "large-patch.txt";
+  writeFileSync(join(worktreePath, largeName), "large line\n".repeat(6000));
+  writeFileSync(join(worktreePath, "binary-content.bin"), Buffer.from([0, 1, 2, 3, 255]));
+  const contentPreview = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-preview" });
+  const contentCommit = await app.inject({ method: "POST", url: "/api/tasks/t/checkpoint", payload: confirmation(contentPreview.json()) });
+  assert.equal(contentCommit.statusCode, 200);
+  const contentDiff = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(contentDiff.statusCode, 200);
+  assert.ok(contentDiff.json().files.includes(largeName));
+  assert.ok(contentDiff.json().diff.length > 50_000, "large checkpoint patches are returned without truncation");
+  assert.match(contentDiff.json().diff, /Binary files .* differ/);
+
+  const emptySha = db.prepare("SELECT base_commit_sha FROM tasks WHERE id = 't'").get().base_commit_sha;
+  db.prepare("UPDATE tasks SET latest_task_commit_sha = ? WHERE id = 't'").run(emptySha);
+  const emptyDiff = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(emptyDiff.statusCode, 200);
+  assert.deepEqual(emptyDiff.json().files, []);
+  assert.equal(emptyDiff.json().diff, "");
+  const headBeforeInvalid = git(worktreePath, "rev-parse", "HEAD");
+  const statusBeforeInvalid = git(worktreePath, "status", "--porcelain");
+  db.prepare("UPDATE tasks SET latest_task_commit_sha = ? WHERE id = 't'").run("f".repeat(40));
+  const missingObject = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(missingObject.statusCode, 409);
+  assert.match(missingObject.json().error, /diff|commit|object/i);
+  assert.equal(git(worktreePath, "rev-parse", "HEAD"), headBeforeInvalid);
+  assert.equal(git(worktreePath, "status", "--porcelain"), statusBeforeInvalid);
+  db.prepare("UPDATE tasks SET latest_task_commit_sha = 'not-a-sha' WHERE id = 't'").run();
+  const invalidSha = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-diff" });
+  assert.equal(invalidSha.statusCode, 409);
+  assert.match(invalidSha.json().error, /SHA|commit|diff/i);
+  assert.equal(git(worktreePath, "rev-parse", "HEAD"), headBeforeInvalid);
+  assert.equal(git(worktreePath, "status", "--porcelain"), statusBeforeInvalid);
 });
 
 test("checkpoint lock rejects concurrent start and delete operations for the same task", async (t) => {

@@ -49,7 +49,7 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
   legacy.close();
 
   db = openDatabase(path);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 10);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 11);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("SELECT transcript_start_entry_id, transcript_end_entry_id FROM task_runs WHERE id = 'r1'").get(), {
     transcript_start_entry_id: null,
@@ -85,7 +85,7 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
 test("fresh databases apply migrations through validation result and run schemas", (t) => {
   const db = openDatabase(":memory:");
   t.after(() => db.close());
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 10);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 11);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "task_id", "validation_run_id", "validated_task_sha", "validated_base_sha",

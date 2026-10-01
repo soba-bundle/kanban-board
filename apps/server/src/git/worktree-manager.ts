@@ -249,10 +249,8 @@ export class WorktreeManager {
     }
     const row = this.getTaskProject(taskId);
     const repositoryRoot = realpathSync(row.root_path);
-    const [changedFiles, diff] = await Promise.all([
-      getChangedFiles(repositoryRoot, baseSha, candidateSha),
-      getDiff(repositoryRoot, baseSha, candidateSha),
-    ]);
+    const changedFiles = await getChangedFiles(repositoryRoot, baseSha, candidateSha);
+    const diff = await getDiff(repositoryRoot, baseSha, candidateSha);
     return { changedFiles, diff };
   }
 

@@ -105,7 +105,8 @@ test("Mark as done moves a satisfied Review task to Done and removes only a clea
   assert.deepEqual(preview.json(), { ready: true, reason: null });
   const done = await app.inject({ method: "POST", url: "/api/tasks/clean-task/complete" });
   assert.equal(done.statusCode, 200);
-  assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'clean-task'").get().workflow_state, "DONE");
+  assert.deepEqual(db.prepare("SELECT workflow_state, resolution FROM tasks WHERE id = 'clean-task'").get(),
+    { workflow_state: "DONE", resolution: "CLOSED" });
   assert.equal(db.prepare("SELECT worktree_path FROM tasks WHERE id = 'clean-task'").get().worktree_path, null);
   assert.deepEqual(removed, ["clean-task"]);
   assert.equal((await app.inject({ method: "GET", url: "/api/board" })).json().columns.DONE[0].id, "clean-task");
@@ -114,6 +115,7 @@ test("Mark as done moves a satisfied Review task to Done and removes only a clea
   assert.equal(dirty.statusCode, 409);
   assert.match(dirty.json().error, /uncommitted Git changes/);
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'dirty-task'").get().workflow_state, "REVIEW");
+  assert.equal(db.prepare("SELECT resolution FROM tasks WHERE id = 'dirty-task'").get().resolution, null);
   assert.equal(db.prepare("SELECT worktree_path FROM tasks WHERE id = 'dirty-task'").get().worktree_path, "/tmp/dirty-worktree");
   assert.equal((await app.inject({ method: "POST", url: "/api/tasks/branch-task/complete" })).statusCode, 409);
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'branch-task'").get().workflow_state, "REVIEW");

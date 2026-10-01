@@ -345,6 +345,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .link-danger:hover:not(:disabled) { color: #ffb8be; }
 .checkpoint-diff-dialog { width: min(900px, calc(100vw - 32px)); max-height: 85vh; overflow: auto; }
 .checkpoint-diff-content { max-height: 48vh; overflow: auto; padding: 14px; border: 1px solid var(--line); border-radius: 8px; color: #d6dbe7; background: rgba(0, 0, 0, 0.2); font: 11px/1.55 ui-monospace, monospace; white-space: pre; }
+.checkpoint-diff-files { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.checkpoint-diff-files [aria-pressed="true"] { border-color: var(--accent); }
+.checkpoint-diff-side-by-side { max-height: 48vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.checkpoint-diff-side-by-side [role="row"] { display: grid; grid-template-columns: 1fr 1fr; }
+.checkpoint-diff-side-by-side [role="cell"] { margin: 0; min-width: 0; overflow: auto; padding: 4px 8px; font: 11px/1.55 ui-monospace, monospace; white-space: pre; }
 .run-card { margin-bottom: 12px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(30, 35, 50, 0.7); }
 .run-card-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 7px; margin-bottom: 8px; }
 .run-stage { color: #e2e5ed; font-size: 12px; font-weight: 700; }

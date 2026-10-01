@@ -180,7 +180,7 @@ export function registerTaskRoutes(
       }
 
       const now = new Date().toISOString();
-      const updated = db.prepare(`UPDATE tasks SET workflow_state = 'DONE', review_tag = NULL,
+      const updated = db.prepare(`UPDATE tasks SET workflow_state = 'DONE', resolution = 'CLOSED', review_tag = NULL,
         cleanup_status = NULL, updated_at = ? WHERE id = ? AND is_active = 1 AND workflow_state = 'REVIEW'`)
         .run(now, request.params.taskId);
       if (updated.changes !== 1) return reply.code(409).send({ error: "Task state changed; refresh before closing it." });
@@ -285,11 +285,10 @@ export function registerTaskRoutes(
     }
     if (!worktrees) return reply.code(503).send({ error: "Diff viewing is unavailable." });
     try {
-      const [diff, files] = await Promise.all([
-        worktrees.getDiff(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
-        worktrees.getChangedFiles(request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha),
-      ]);
-      return { from_sha: row.base_commit_sha, to_sha: row.latest_task_commit_sha, files, diff };
+      const { changedFiles, diff } = await worktrees.getPinnedDiff(
+        request.params.taskId, row.base_commit_sha, row.latest_task_commit_sha,
+      );
+      return { from_sha: row.base_commit_sha, to_sha: row.latest_task_commit_sha, files: changedFiles, diff };
     } catch (error) {
       return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
     }

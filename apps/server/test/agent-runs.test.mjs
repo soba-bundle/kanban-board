@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Fastify from "fastify";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -11,7 +11,7 @@ import { RunManager } from "../dist/agents/run-manager.js";
 import { QueueManager } from "../dist/queue/queue-manager.js";
 import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
 import { openDatabase } from "../dist/db.js";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 class FakeSession {
   constructor(sessionManager) {
@@ -120,6 +120,101 @@ test("production AgentManager excludes the configured pi-questions extension whi
     "production hosted sessions must not expose the incompatible global TUI questionnaire");
   assert.ok(session.getToolDefinition("kanban_questionnaire"), "the repo-owned hosted questionnaire must be registered");
   assert.equal(session.extensionRunner.createContext().mode, "print");
+});
+
+test("Kanban SDK sessions force auto-compaction without changing Pi user settings", async (t) => {
+  const agentDir = mkdtempSync(join(tmpdir(), "kanban-pi-user-settings-"));
+  const sessionDir = mkdtempSync(join(tmpdir(), "kanban-pi-session-"));
+  const cwd = mkdtempSync(join(tmpdir(), "kanban-pi-project-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const globalSettingsPath = join(agentDir, "settings.json");
+  const projectSettingsPath = join(cwd, ".pi", "settings.json");
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  writeFileSync(globalSettingsPath, JSON.stringify({
+    compaction: { enabled: false, reserveTokens: 7000, keepRecentTokens: 9000 },
+  }));
+  writeFileSync(projectSettingsPath, JSON.stringify({
+    compaction: { enabled: false, reserveTokens: 8000, keepRecentTokens: 10000 },
+  }));
+  const globalSettingsBefore = readFileSync(globalSettingsPath, "utf8");
+  const projectSettingsBefore = readFileSync(projectSettingsPath, "utf8");
+  let db;
+  let agents;
+  t.after(() => {
+    try { agents?.dispose("task-1"); } finally {
+      try { db?.close(); } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+        rmSync(agentDir, { recursive: true, force: true });
+        rmSync(sessionDir, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  db = openDatabase(":memory:");
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO projects (id, name, root_path, created_at, updated_at)
+    VALUES ('project-1', 'Project', ?, ?, ?)`).run(cwd, now, now);
+  db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
+    VALUES ('task-1', 'project-1', 'Task', '', 'IN_PROGRESS', ?, ?)`).run(now, now);
+
+  agents = new AgentManager(db, sessionDir);
+  const first = await agents.getOrCreateWorkingSession("task-1");
+  assert.equal(first.autoCompactionEnabled, true, "Kanban sessions must force Pi auto-compaction on");
+  assert.deepEqual(first.settingsManager.getCompactionSettings(), {
+    enabled: true, reserveTokens: 8000, keepRecentTokens: 10000,
+  }, "Kanban overrides enablement but preserve the Pi native reserve settings");
+  assert.equal(readFileSync(globalSettingsPath, "utf8"), globalSettingsBefore);
+  assert.equal(readFileSync(projectSettingsPath, "utf8"), projectSettingsBefore);
+  assert.equal(SettingsManager.create(cwd, agentDir).getCompactionEnabled(), false,
+    "normal Pi console settings must remain unchanged");
+
+  agents.dispose("task-1");
+  agents = new AgentManager(db, sessionDir);
+  const restored = await agents.restoreWorkingSession("task-1");
+  assert.equal(restored.autoCompactionEnabled, true, "restored Kanban sessions must reapply the SDK-only override");
+  assert.deepEqual(restored.settingsManager.getCompactionSettings(), {
+    enabled: true, reserveTokens: 8000, keepRecentTokens: 10000,
+  });
+  assert.equal(readFileSync(globalSettingsPath, "utf8"), globalSettingsBefore);
+  assert.equal(readFileSync(projectSettingsPath, "utf8"), projectSettingsBefore);
+});
+
+test("resolved Pi prompt with failed compaction is durably failed, not completed", async (t) => {
+  const sessionDir = mkdtempSync(join(tmpdir(), "kanban-compaction-failure-"));
+  const { db, agents } = makeFixture(sessionDir);
+  t.after(() => { agents.dispose("task-1"); db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
+  const session = await agents.getOrCreateWorkingSession("task-1");
+  session.prompt = async () => {
+    for (const handler of session.listeners) handler({ type: "compaction_end", reason: "overflow",
+      aborted: false, willRetry: false, errorMessage: "Summarization failed: generation hit the token cap" });
+  };
+  await new RunManager(db, agents).start("run-1", { text: "continue", inputIds: [] });
+  await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-1'").get().status !== "RUNNING");
+  assert.deepEqual(db.prepare("SELECT status, error_message FROM task_runs WHERE id = 'run-1'").get(), {
+    status: "FAILED", error_message: "Summarization failed: generation hit the token cap",
+  });
+  assert.equal(db.prepare("SELECT review_tag FROM tasks WHERE id = 'task-1'").get().review_tag, "RUN_FAILED");
+  assert.equal(agents.replay("run-1").length, 0, "failure survives replay cleanup in the run record");
+});
+
+for (const recovered of [false, true]) test(`truncated response ${recovered ? "recovers once" : "cannot complete without recovery"}`, async (t) => {
+  const sessionDir = mkdtempSync(join(tmpdir(), "kanban-length-recovery-"));
+  const { db, agents } = makeFixture(sessionDir);
+  t.after(() => { agents.dispose("task-1"); db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
+  const session = await agents.getOrCreateWorkingSession("task-1");
+  session.prompt = async () => {
+    const emit = (event) => { for (const handler of session.listeners) handler(event); };
+    emit({ type: "message_end", message: { role: "assistant", stopReason: "length" } });
+    if (recovered) {
+      emit({ type: "compaction_end", aborted: false, willRetry: true, result: { summary: "Context retained." } });
+      emit({ type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+    }
+  };
+  await new RunManager(db, agents).start("run-1", { text: "continue", inputIds: [] });
+  await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-1'").get().status !== "RUNNING");
+  assert.equal(db.prepare("SELECT status FROM task_runs WHERE id = 'run-1'").get().status, recovered ? "COMPLETED" : "FAILED");
 });
 
 test("successive runs reuse the persisted task session", async (t) => {
@@ -467,7 +562,7 @@ test("run WebSocket receives normalized live events from its task session", asyn
   assert.equal(event.taskId, "task-1");
   assert.equal(event.runId, runId);
   assert.equal(event.type, "message_update");
-  assert.match(event.data.delta, /^Work on this task/);
+  assert.equal(event.data.delta, "Investigate the issue");
   socket.terminate();
   // Let normal run completion settle without a handover retry.
   await waitFor(() => !["QUEUED", "RUNNING"].includes(

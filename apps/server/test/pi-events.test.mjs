@@ -66,6 +66,47 @@ test("preserves tool update arguments and partial results", () => {
   });
 });
 
+test("normalizes compaction lifecycle and keeps the summary separate from assistant output", () => {
+  const start = normalizePiEvent({ type: "compaction_start", reason: "threshold" });
+  assert.deepEqual(start, { type: "compaction_start", data: { reason: "threshold" } });
+
+  const end = normalizePiEvent({
+    type: "compaction_end", reason: "overflow", result: {
+      summary: "Sensitive task summary", tokensBefore: 90000, estimatedTokensAfter: 24000,
+    }, aborted: false, willRetry: true,
+  });
+  assert.equal(end.type, "compaction_end");
+  assert.equal(end.data.reason, "overflow");
+  assert.equal(end.data.aborted, false);
+  assert.equal(end.data.willRetry, true);
+  assert.equal(end.data.tokensBefore, 90000);
+  assert.equal(end.data.estimatedTokensAfter, 24000);
+  assert.equal(end.data.summary, "Sensitive task summary", "the UI may show this only in its collapsed compaction disclosure");
+  assert.equal(end.data.text, undefined, "compaction summary is not an assistant text delta");
+});
+
+test("preserves compaction failure details for the Live panel", () => {
+  const end = normalizePiEvent({
+    type: "compaction_end", reason: "overflow", result: undefined, aborted: false,
+    willRetry: false, errorMessage: "Context overflow recovery failed: summary request exceeded the model context window.",
+  });
+  assert.equal(end.data.errorMessage, "Context overflow recovery failed: summary request exceeded the model context window.");
+  assert.equal(end.data.summary, undefined);
+});
+
+test("preserves Pi retry attempt metadata for Live recovery", () => {
+  const start = normalizePiEvent({
+    type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "HTTP 503",
+  });
+  assert.deepEqual(start, {
+    type: "auto_retry_start",
+    data: { attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "HTTP 503" },
+  });
+  const end = normalizePiEvent({ type: "auto_retry_end", success: true, attempt: 1 });
+  assert.deepEqual(end, { type: "auto_retry_end", data: { success: true, attempt: 1, finalError: undefined } });
+  assert.equal(normalizePiEvent({ type: "agent_end", willRetry: true }).data.willRetry, true);
+});
+
 test("normalizes tool lifecycle identifiers", () => {
   const normalized = normalizePiEvent({
     type: "tool_execution_end",

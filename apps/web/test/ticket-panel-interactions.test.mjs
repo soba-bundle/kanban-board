@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
@@ -57,7 +58,7 @@ function task(workflowState = "TODO", reviewTag = null) {
 function history(inputs = []) {
   return {
     task_id: "task-1", session_id: null, active_run_id: null, cursor: 0, provisional_truncated: false,
-    entries: [], inputs, provisional_events: [],
+    entries: [], inputs, provisional_events: [], compaction_summaries: [],
   };
 }
 
@@ -1138,6 +1139,242 @@ test("validation findings are visible in Runs and copied by attribution category
   assert.doesNotMatch(copied[0], /Existing timeout is too short/);
   assert.match(copied[1], /Existing timeout is too short/);
   assert.doesNotMatch(copied[1], /Changed parser rejects valid input/);
+});
+
+async function mountPanelWithHistorySnapshot(t, snapshot, runs = []) {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => response(url, String(url).endsWith("/live/history") ? snapshot
+    : String(url).endsWith("/runs") ? runs : []);
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const view = testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: task("IN_PROGRESS", "WORK_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
+  t.after(() => view.unmount());
+  return { testing, view };
+}
+
+async function mountPanelWithRunningSocket(t) {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const sockets = [];
+  class FakeWebSocket {
+    constructor(url) { this.url = url; this.listeners = new Map(); sockets.push(this); }
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) ?? new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
+    }
+    close() { for (const listener of this.listeners.get("close") ?? []) listener({}); }
+    emit(frame) {
+      for (const listener of this.listeners.get("message") ?? []) listener({ data: JSON.stringify(frame) });
+    }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  Object.defineProperty(globalThis, "location", { configurable: true, value: sharedDom.window.location });
+  const snapshot = { ...history(), session_id: "session-1", active_run_id: "run-1" };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.endsWith("/live/history")) return response(url, snapshot);
+    if (path.endsWith("/runs")) return response(url, [{
+      id: "run-1", stage: "WORK", sequence: 1, status: "RUNNING", reason_code: null,
+      error_message: null, started_at: new Date().toISOString(), completed_at: null, handover: null,
+    }]);
+    return response(url, []);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else delete globalThis.location;
+  });
+  const view = testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: { ...task("IN_PROGRESS", "WORK_COMPLETE"), working_session_id: "session-1" },
+    queue: { max_concurrent_agents: 1, active_count: 1, jobs: [{
+      job_id: "job-1", run_id: "run-1", task_id: "task-1", title: "Task", stage: "WORK",
+      queue_position: null, job_status: "CLAIMED", run_status: "RUNNING",
+    }] },
+    onClose() {}, onChanged() {},
+  })));
+  t.after(() => view.unmount());
+  await testing.waitFor(() => assert.ok(sockets.length > 0));
+  await testing.waitFor(() => assert.ok(sockets.at(-1).listeners.get("message")?.size));
+  return { testing, socket: sockets.at(-1), view };
+}
+
+test("Live history removes failed-attempt deltas when Pi schedules a retry", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const events = [
+    { sequence: 1, type: "message_update", data: { subtype: "text_delta", delta: "discard this partial answer" } },
+    { sequence: 2, type: "auto_retry_start", data: { attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "HTTP 503" } },
+    { sequence: 3, type: "message_update", data: { subtype: "text_delta", delta: "final answer" } },
+  ].map((event) => ({
+    ...event, eventId: `event-${event.sequence}`, taskId: "task-1", runId: "run-1",
+    timestamp: new Date().toISOString(),
+  }));
+  const snapshot = { ...history(), session_id: "session-1", cursor: 3, provisional_events: events };
+  globalThis.fetch = async (url) => response(url, String(url).endsWith("/live/history") ? snapshot : []);
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const view = testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: task("IN_PROGRESS", "WORK_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
+  t.after(() => view.unmount());
+
+  await testing.screen.findByText(/final answer/);
+  assert.equal(view.container.querySelector(".live-provisional")?.textContent, "final answer");
+  assert.equal(testing.screen.queryByText(/discard this partial answer/), null);
+});
+
+test("Live shows compaction while active, then a collapsed expandable summary", async (t) => {
+  const { testing, socket } = await mountPanelWithRunningSocket(t);
+  await testing.act(async () => socket.emit({ sequence: 1, type: "compaction_start", data: { reason: "threshold" } }));
+  const status = await testing.screen.findByText(/Compacting context/i);
+  assert.ok(status.classList.contains("compaction-status"));
+  const appCss = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
+  assert.match(appCss, /\.compaction-status::after\s*\{[^}]*animation:\s*compaction-shimmer/);
+  const summary = "Goal: keep retries bounded. Next: run the regression tests.";
+  await testing.act(async () => socket.emit({ sequence: 2, type: "compaction_end", data: {
+    reason: "threshold", aborted: false, willRetry: false, summary,
+  } }));
+  await testing.waitFor(() => assert.equal(testing.screen.queryByText(/Compacting context/i), null));
+  const disclosure = await testing.screen.findByText("Compaction summary");
+  const details = disclosure.closest("details");
+  assert.ok(details);
+  assert.equal(details.open, false);
+  testing.fireEvent.click(disclosure);
+  assert.equal(details.open, true);
+  await testing.screen.findByText(summary);
+  assert.equal(testing.screen.queryByText(summary, { selector: ".live-provisional" }), null);
+});
+
+test("Live shows persisted compaction failure after refresh without replay events", async (t) => {
+  const { testing } = await mountPanelWithHistorySnapshot(t, history(), [{
+    id: "run-1", stage: "WORK", sequence: 1, status: "FAILED", reason_code: null,
+    error_message: "Summarization failed: generation hit the token cap", started_at: new Date().toISOString(),
+    completed_at: new Date().toISOString(), handover: null,
+  }]);
+  const alert = await testing.screen.findByRole("alert");
+  assert.match(alert.textContent, /Summarization failed: generation hit the token cap/);
+});
+
+test("Live explains when Pi's compaction ends without producing a summary", async (t) => {
+  const { testing, socket, view } = await mountPanelWithRunningSocket(t);
+  await testing.act(async () => socket.emit({ sequence: 1, type: "compaction_start", data: { reason: "overflow" } }));
+  await testing.screen.findByText(/Compacting context/i);
+  await testing.act(async () => socket.emit({ sequence: 2, type: "compaction_end", data: {
+    reason: "overflow", aborted: false, willRetry: false,
+    errorMessage: "Context overflow recovery failed: summary request exceeded the model context window.",
+  } }));
+  await testing.waitFor(() => assert.equal(testing.screen.queryByText(/Compacting context/i), null));
+  const alert = await testing.screen.findByRole("alert");
+  assert.match(alert.textContent, /summary request exceeded the model context window/);
+  assert.equal(view.container.querySelectorAll(".compaction-summary").length, 0);
+});
+
+test("Live history shows compaction as active work after reconnecting mid-compaction", async (t) => {
+  const snapshot = {
+    ...history(), session_id: "session-1", provisional_events: [{
+      eventId: "event-1", sequence: 1, taskId: "task-1", runId: "run-1",
+      timestamp: new Date().toISOString(), type: "compaction_start", data: { reason: "threshold" },
+    }],
+  };
+  const { testing } = await mountPanelWithHistorySnapshot(t, snapshot);
+  await testing.screen.findByText(/Compacting context/i);
+});
+
+test("persisted compaction summaries appear in transcript order after Live history refresh", async (t) => {
+  const timestamp = new Date().toISOString();
+  const summary1 = "First Pi compaction summary.";
+  const summary2 = "Second Pi compaction summary.";
+  const entry = (id, role, text) => ({
+    id: `session-1:${id}`, entry_id: id, session_id: "session-1", run_id: "run-1", timestamp, role,
+    message: { role, content: [{ type: "text", text }] },
+  });
+  const snapshot = {
+    ...history(), session_id: "session-1", entries: [
+      entry("assistant-1", "assistant", "Response before first compaction."),
+      entry("user-2", "user", "Follow-up after first compaction."),
+      entry("assistant-2", "assistant", "Response before second compaction."),
+      entry("user-3", "user", "Follow-up after second compaction."),
+    ],
+    compaction_summaries: [
+      { id: "session-1:compaction-1", timestamp, summary: summary1, tokens_before: 4704, after_entry_id: "session-1:assistant-1" },
+      { id: "session-1:compaction-2", timestamp, summary: summary2, tokens_before: 8192, after_entry_id: "session-1:assistant-2" },
+    ],
+    provisional_events: [{ eventId: "event-compact-1", sequence: 1, taskId: "task-1", runId: "run-1",
+      timestamp, type: "compaction_end", data: { reason: "threshold", aborted: false, summary: summary1, tokensBefore: 4704 } }],
+  };
+  const { testing, view } = await mountPanelWithHistorySnapshot(t, snapshot);
+  await testing.screen.findAllByText("Compaction summary");
+  const details = view.container.querySelectorAll(".compaction-summary");
+  assert.equal(details.length, 2, "the persisted summary and its live event are rendered once");
+  assert.equal(details[0].open, false);
+  assert.equal(details[1].open, false);
+  const timeline = [...view.container.querySelectorAll(".live-conversation > .live-message, .live-conversation > .compaction-summary")]
+    .map((item) => item.classList.contains("compaction-summary")
+      ? `summary:${item.querySelector(".compaction-summary-text")?.textContent}`
+      : item.querySelector(".live-message-text")?.textContent);
+  assert.deepEqual(timeline, [
+    "Response before first compaction.",
+    `summary:${summary1}`,
+    "Follow-up after first compaction.",
+    "Response before second compaction.",
+    `summary:${summary2}`,
+    "Follow-up after second compaction.",
+  ]);
+  testing.fireEvent.click(details[0].querySelector("summary"));
+  assert.equal(details[0].open, true);
+  await testing.screen.findByText(summary1);
+});
+
+test("Live places an older-server compaction summary by timestamp when its transcript anchor is absent", async (t) => {
+  const base = Date.now();
+  const timestamp = (offset) => new Date(base + offset).toISOString();
+  const entry = (id, role, text, at) => ({
+    id: `session-1:${id}`, entry_id: id, session_id: "session-1", run_id: "run-1", timestamp: timestamp(at), role,
+    message: { role, content: [{ type: "text", text }] },
+  });
+  const snapshot = {
+    ...history(), session_id: "session-1", entries: [
+      entry("assistant-1", "assistant", "Response before compaction.", 0),
+      entry("user-2", "user", "Follow-up after compaction.", 2000),
+    ],
+    compaction_summaries: [{ id: "session-1:compaction-1", timestamp: timestamp(1000),
+      summary: "Legacy server summary.", tokens_before: 4704 }],
+  };
+  const { testing, view } = await mountPanelWithHistorySnapshot(t, snapshot);
+  await testing.screen.findByText("Compaction summary");
+  const timeline = [...view.container.querySelectorAll(".live-conversation > .live-message, .live-conversation > .compaction-summary")]
+    .map((item) => item.classList.contains("compaction-summary")
+      ? `summary:${item.querySelector(".compaction-summary-text")?.textContent}`
+      : item.querySelector(".live-message-text")?.textContent);
+  assert.deepEqual(timeline, ["Response before compaction.", "summary:Legacy server summary.", "Follow-up after compaction."]);
+});
+
+test("completed compaction summary is collapsed by default and expandable", async (t) => {
+  const summary = "Goal: keep retries bounded. Next: verify the retry regression.";
+  const snapshot = {
+    ...history(), session_id: "session-1", provisional_events: [
+      { eventId: "event-1", sequence: 1, taskId: "task-1", runId: "run-1",
+        timestamp: new Date().toISOString(), type: "compaction_start", data: { reason: "threshold" } },
+      { eventId: "event-2", sequence: 2, taskId: "task-1", runId: "run-1",
+        timestamp: new Date().toISOString(), type: "compaction_end", data: { reason: "threshold", aborted: false, summary } },
+    ],
+  };
+  const { testing, view } = await mountPanelWithHistorySnapshot(t, snapshot);
+  const disclosure = await testing.screen.findByText("Compaction summary");
+  const details = disclosure.closest("details");
+  assert.ok(details);
+  assert.equal(details.open, false);
+  testing.fireEvent.click(disclosure);
+  assert.equal(details.open, true);
+  await testing.screen.findByText(summary);
+  assert.equal(view.container.querySelector(".live-provisional")?.textContent ?? "", "");
 });
 
 test("Validation Review progress is identified in the Runs history while it is running", async (t) => {

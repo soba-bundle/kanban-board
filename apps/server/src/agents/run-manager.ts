@@ -282,7 +282,11 @@ export class RunManager {
       this.closingRuns.add(runId);
       await this.steeringQueues.get(runId);
       if (this.stopRequested.has(runId)) this.markStopped(runId, taskId);
-      else await this.finishRun(runId, taskId);
+      else {
+        const failure = watcher.failure();
+        if (failure) throw new Error(failure);
+        await this.finishRun(runId, taskId);
+      }
     } catch (error) {
       if (this.stopRequested.has(runId)) this.markStopped(runId, taskId);
       else {
@@ -291,6 +295,8 @@ export class RunManager {
         this.db.prepare(`UPDATE task_runs SET status = 'FAILED', completed_at = ?, error_message = ? WHERE id = ?`)
           .run(now, error instanceof Error ? error.message : String(error), runId);
         this.markInputsUnresolved(runId);
+        this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'RUN_FAILED', updated_at = ? WHERE id = ?")
+          .run(now, taskId);
       }
     } finally {
       watcher.unsubscribe();
@@ -393,9 +399,21 @@ export class RunManager {
       .run(now, taskId);
   }
 
-  private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void } {
+  private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void; failure: () => string | null } {
     let initialDelivered = false;
+    let compactionFailure: string | null = null;
+    let responseFailure: string | null = null;
     const unsubscribe = this.agents.subscribe(taskId, runId, (event) => {
+      if (event.type === "compaction_end") {
+        compactionFailure = typeof event.data.errorMessage === "string" ? event.data.errorMessage
+          : event.data.aborted ? "Context compaction was aborted."
+          : typeof event.data.summary === "string" ? null : "Context compaction ended without a summary.";
+      }
+      if (event.type === "message_end" && event.data.role === "assistant") {
+        responseFailure = event.data.stopReason === "length"
+          ? "The response hit its token limit and did not successfully resume."
+          : event.data.stopReason === "error" ? "The model response failed." : null;
+      }
       if (event.type !== "entry_appended") return;
       const entryId = typeof event.data.entryId === "string" ? event.data.entryId : null;
       if (!entryId) return;
@@ -434,7 +452,7 @@ export class RunManager {
       }
       this.markInputDelivered(next.id, sessionId, entryId);
     });
-    return { unsubscribe };
+    return { unsubscribe, failure: () => compactionFailure ?? responseFailure };
   }
 
   private markInputDelivered(inputId: string, sessionId: string | null, entryId: string): void {

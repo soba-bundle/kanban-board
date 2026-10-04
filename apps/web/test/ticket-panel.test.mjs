@@ -136,4 +136,6 @@ test("legacy Validation tags are not rendered as active merge readiness", async 
     createElement(TicketPanel, { task: staleTask, queue: null, onClose() {}, onChanged() {} })));
   assert.doesNotMatch(markup, /Ready to Merge/i,
     "historical Validation metadata must not be presented as current merge readiness");
+  assert.doesNotMatch(markup, /Compact & Continue/i, "automatic compaction must not add a manual choice");
+  assert.doesNotMatch(markup, /<button[^>]*>[^<]*Compact/i, "there must be no explicit compact button");
 });

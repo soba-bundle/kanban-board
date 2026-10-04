@@ -222,9 +222,11 @@ test("Live history contracts carry stable transcript identities and sequenced cu
       message: { role: "user", content: [{ type: "text", text: "hello" }] },
     }],
     inputs: [], provisional_events: [event],
+    compaction_summaries: [{ id: "s1:c1", timestamp, summary: "Keep the native reserve setting.", tokens_before: 4704, after_entry_id: "s1:e1" }],
   };
   assert.equal(LiveHistorySnapshotSchema.safeParse(snapshot).success, true);
   assert.equal(LiveHistorySnapshotSchema.safeParse({ ...snapshot, cursor: -1 }).success, false);
+  assert.equal(LiveHistorySnapshotSchema.safeParse({ ...snapshot, compaction_summaries: [{ ...snapshot.compaction_summaries[0], tokens_before: -1 }] }).success, false);
 });
 
 test("handover schemas enforce stage-specific contracts and default lists", () => {

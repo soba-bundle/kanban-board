@@ -63,6 +63,19 @@ export function normalizePiEvent(event: AgentSessionEvent): NormalizedPiEvent {
   } else if (event.type === "queue_update") {
     data.steeringCount = (source.steering as unknown[] | undefined)?.length ?? 0;
     data.followUpCount = (source.followUp as unknown[] | undefined)?.length ?? 0;
+  } else if (event.type === "compaction_start") {
+    data.reason = source.reason;
+  } else if (event.type === "compaction_end") {
+    data.reason = source.reason;
+    data.aborted = source.aborted;
+    data.willRetry = source.willRetry;
+    if (typeof source.errorMessage === "string") data.errorMessage = source.errorMessage;
+    const result = source.result as Record<string, unknown> | undefined;
+    if (result) {
+      if (typeof result.summary === "string") data.summary = result.summary;
+      if (typeof result.tokensBefore === "number") data.tokensBefore = result.tokensBefore;
+      if (typeof result.estimatedTokensAfter === "number") data.estimatedTokensAfter = result.estimatedTokensAfter;
+    }
   } else if (event.type === "agent_end") {
     data.willRetry = source.willRetry;
   } else if (event.type === "auto_retry_start") {

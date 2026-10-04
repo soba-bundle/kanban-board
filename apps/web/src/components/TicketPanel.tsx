@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
+import type { CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveCompactionSummary, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
 import { HandoverCard } from "./HandoverCard.js";
 import { HumanRequestPanel } from "./HumanRequestPanel.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
@@ -43,10 +43,84 @@ const ACTIVE_POLL_MS = 3000;
 const DEVELOPER_TEST_REMINDER = "Before merging, test the app in the task worktree and review the implemented code and diff. Check sync verifies Git state only; it does not test the app.";
 
 function formatProvisional(snapshot: LiveHistorySnapshot): string {
-  const provisional = snapshot.provisional_events.map(describeEvent).filter((text): text is string => !!text).join("");
+  let provisional = "";
+  for (const event of snapshot.provisional_events) {
+    if (event.type === "auto_retry_start") {
+      provisional = "";
+      continue;
+    }
+    provisional += describeEvent(event) ?? "";
+  }
   return snapshot.provisional_truncated
     ? `${provisional}\n[Some recent live output is unavailable; refresh to load persisted history.]\n`
     : provisional;
+}
+
+function compactionSummaryFromEvent(event: LiveEvent, afterEntryId: string | null): LiveCompactionSummary | null {
+  if (event.type !== "compaction_end") return null;
+  const data = event.data as Record<string, unknown>;
+  if (data.aborted || typeof data.summary !== "string" || !data.summary) return null;
+  return {
+    id: event.eventId,
+    timestamp: event.timestamp,
+    summary: data.summary,
+    tokens_before: typeof data.tokensBefore === "number" ? data.tokensBefore : 0,
+    after_entry_id: afterEntryId,
+  };
+}
+
+function compactionState(snapshot: LiveHistorySnapshot): { active: boolean; error: string | null; summaries: LiveCompactionSummary[] } {
+  let active = false;
+  let error: string | null = null;
+  const summaries = [...(snapshot.compaction_summaries ?? [])];
+  const seenSummaries = new Set(summaries.map((summary) => summary.summary));
+  for (const event of snapshot.provisional_events) {
+    if (event.type === "compaction_start") {
+      active = true;
+      error = null;
+    }
+    if (event.type === "compaction_end") {
+      active = false;
+      const data = event.data as Record<string, unknown>;
+      error = typeof data.errorMessage === "string" ? data.errorMessage : null;
+      const summary = compactionSummaryFromEvent(event, snapshot.entries.at(-1)?.id ?? null);
+      if (summary && !seenSummaries.has(summary.summary)) {
+        seenSummaries.add(summary.summary);
+        summaries.push(summary);
+      }
+    }
+  }
+  summaries.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  return { active, error, summaries };
+}
+
+type LiveTimelineItem = { type: "entry"; entry: LiveHistoryEntry } | { type: "compaction"; summary: LiveCompactionSummary };
+
+function buildLiveTimeline(entries: LiveHistoryEntry[], summaries: LiveCompactionSummary[]): LiveTimelineItem[] {
+  const entryIds = new Set(entries.map((entry) => entry.id));
+  const afterEntry = new Map<string, LiveCompactionSummary[]>();
+  const unanchored: LiveCompactionSummary[] = [];
+  for (const summary of summaries) {
+    const anchor = summary.after_entry_id;
+    if (!anchor || !entryIds.has(anchor)) {
+      unanchored.push(summary);
+      continue;
+    }
+    const matching = afterEntry.get(anchor) ?? [];
+    matching.push(summary);
+    afterEntry.set(anchor, matching);
+  }
+
+  const timeline: LiveTimelineItem[] = [];
+  for (const entry of entries) {
+    timeline.push({ type: "entry", entry });
+    for (const summary of afterEntry.get(entry.id) ?? []) timeline.push({ type: "compaction", summary });
+  }
+  for (const summary of unanchored) {
+    const nextEntry = timeline.findIndex((item) => item.type === "entry" && item.entry.timestamp > summary.timestamp);
+    timeline.splice(nextEntry < 0 ? timeline.length : nextEntry, 0, { type: "compaction", summary });
+  }
+  return timeline;
 }
 
 function textContent(entry: LiveHistoryEntry): string {
@@ -132,6 +206,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [error, setError] = useState<string | null>(null);
   const [liveLog, setLiveLog] = useState("");
   const [liveHistory, setLiveHistory] = useState<LiveHistorySnapshot | null>(null);
+  const [compactionActive, setCompactionActive] = useState(false);
+  const [compactionError, setCompactionError] = useState<string | null>(null);
+  const [compactionSummaries, setCompactionSummaries] = useState<LiveCompactionSummary[]>([]);
   const [streamState, setStreamState] = useState<"idle" | "open" | "closed" | "error">("idle");
   const [historyRecoveryFailed, setHistoryRecoveryFailed] = useState(false);
   const [historyRetry, setHistoryRetry] = useState(0);
@@ -252,11 +329,19 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     return () => clearInterval(timer);
   }, [activeJob, humanRequests, refreshHumanRequests, task.workflow_state]);
 
+  function applyLiveHistorySnapshot(snapshot: LiveHistorySnapshot) {
+    setLiveHistory(snapshot);
+    setLiveLog(formatProvisional(snapshot));
+    const compaction = compactionState(snapshot);
+    setCompactionActive(compaction.active);
+    setCompactionError(compaction.error);
+    setCompactionSummaries(compaction.summaries);
+  }
+
   async function refreshLiveHistory() {
     const snapshot = await loadLiveHistory(task.id);
     if (!mountedRef.current || liveTaskIdRef.current !== task.id) return;
-    setLiveHistory(snapshot);
-    setLiveLog(formatProvisional(snapshot));
+    applyLiveHistorySnapshot(snapshot);
   }
 
   useEffect(() => {
@@ -367,12 +452,14 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     let current = true;
     setLiveHistory(null);
     setLiveLog("");
+    setCompactionActive(false);
+    setCompactionError(null);
+    setCompactionSummaries([]);
     setHistoryRecoveryFailed(false);
     void loadLiveHistory(task.id).then((snapshot) => {
       if (!current) return;
       liveCursorRef.current = snapshot.active_run_id === runningRunId ? snapshot.cursor : 0;
-      setLiveHistory(snapshot);
-      setLiveLog(formatProvisional(snapshot));
+      applyLiveHistorySnapshot(snapshot);
       setHistoryRecoveryFailed(false);
       setError(null);
     }).catch((caught) => {
@@ -404,8 +491,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         if (disposed) return;
         recoveryAttempts = 0;
         liveCursorRef.current = snapshot.active_run_id === runningRunId ? snapshot.cursor : 0;
-        setLiveHistory(snapshot);
-        setLiveLog(formatProvisional(snapshot));
+        applyLiveHistorySnapshot(snapshot);
         setHistoryRecoveryFailed(false);
         setError(null);
       }).catch((caught) => {
@@ -432,6 +518,21 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
           return;
         }
         liveCursorRef.current = event.sequence;
+        if (event.type === "compaction_start") {
+          setCompactionActive(true);
+          setCompactionError(null);
+        }
+        if (event.type === "compaction_end") {
+          setCompactionActive(false);
+          const data = event.data as Record<string, unknown>;
+          setCompactionError(typeof data.errorMessage === "string" ? data.errorMessage : null);
+          const summary = compactionSummaryFromEvent(event, liveHistory.entries.at(-1)?.id ?? null);
+          if (summary) setCompactionSummaries((current) => {
+            if (current.some((item) => item.summary === summary.summary)) return current;
+            return [...current, summary].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+          });
+        }
+        if (event.type === "auto_retry_start") setLiveLog("");
         const text = describeEvent(event);
         if (text) setLiveLog((value) => value + text);
         if (event.type === "run_input_status") {
@@ -600,6 +701,10 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }
 
   const history = liveHistory?.task_id === task.id ? liveHistory : null;
+  const latestRun = runsTaskId === task.id
+    ? runs.reduce<TaskRunSummary | null>((latest, run) => !latest || run.sequence > latest.sequence ? run : latest, null)
+    : null;
+  const persistedRunError = latestRun?.status === "FAILED" ? latestRun.error_message : null;
   const transcriptInputByEntry = new Map((history?.inputs ?? [])
     .filter((input) => input.transcript_entry_id && input.session_id)
     .map((input) => [`${input.session_id}:${input.transcript_entry_id}`, input]));
@@ -978,16 +1083,22 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                   ? (streamState === "open" ? "Streaming." : streamState === "error" ? "Live stream unavailable; reconnecting…" : "Connecting to live output…")
                   : `Run is ${activeJob.run_status.toLowerCase().replaceAll("_", " ")}.`}
               </p>}
+
               {historyRecoveryFailed && <button className="button-quiet" onClick={() => {
                 setHistoryRecoveryFailed(false);
                 setHistoryRetry((value) => value + 1);
               }}>Retry history</button>}
               {!history && <p className="run-empty">Loading conversation…</p>}
-              {history?.entries.map((entry) => <LiveMessageCard
-                key={entry.id}
-                entry={entry}
-                input={transcriptInputByEntry.get(`${entry.session_id}:${entry.entry_id}`)}
-              />)}
+              {history && buildLiveTimeline(history.entries, compactionSummaries).map((item) => item.type === "entry"
+                ? <LiveMessageCard
+                    key={item.entry.id}
+                    entry={item.entry}
+                    input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
+                  />
+                : <details className="compaction-summary" key={item.summary.id}>
+                    <summary>Compaction summary</summary>
+                    <div className="compaction-summary-text">{item.summary.summary}</div>
+                  </details>)}
               {unattachedInputs.map((input) => <article className="live-input-status" key={input.id}>
                 <header><strong>You</strong><span className={`input-status input-status-${input.delivery_status.toLowerCase()}`}>{inputStatusLabel(input.delivery_status)}</span></header>
                 <p>{input.content}</p>
@@ -997,6 +1108,8 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                   <button className="button-quiet" disabled={busy} onClick={() => reuseInput(input)}>Reuse / Send again</button>}
               </article>)}
               {liveLog && <pre className="live-log live-provisional">{liveLog}</pre>}
+              {compactionActive && <p className="run-empty live-state compaction-status" role="status">Compacting context…</p>}
+              {(persistedRunError || compactionError) && <p className="run-error live-state" role="alert">{persistedRunError || compactionError}</p>}
               {history && history.entries.length === 0 && unattachedInputs.length === 0 && !activeJob &&
                 <p className="run-empty">No agent messages yet.</p>}
             </section>

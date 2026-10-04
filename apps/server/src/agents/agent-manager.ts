@@ -4,6 +4,7 @@ import {
   HumanRequestQuestionsSchema,
   type HumanRequestAnswer,
   type HumanRequestQuestion,
+  type LiveCompactionSummary,
   type LiveEvent,
   type LiveHistorySnapshot,
 } from "@kanban-board/shared";
@@ -11,6 +12,7 @@ import { normalizePiEvent } from "./pi-events.js";
 import type { HumanRequestService } from "./human-requests.js";
 import { createKanbanQuestionnaireTool } from "../pi/questionnaire-tool.js";
 import { createKanbanResourceLoader } from "../pi/resource-loader.js";
+import { applyKanbanSettings, loadKanbanConfig } from "../kanban-config.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -55,6 +57,7 @@ export class AgentManager {
     private readonly sessionFactory: SessionFactory = async (cwd, manager, customTools) => {
       const { agentDir, settingsManager, resourceLoader } = createKanbanResourceLoader(cwd);
       await resourceLoader.reload();
+      applyKanbanSettings(settingsManager, loadKanbanConfig());
       const { session } = await createAgentSession({
         cwd, agentDir, settingsManager, resourceLoader, sessionManager: manager, customTools,
       });
@@ -200,7 +203,9 @@ export class AgentManager {
     if (task.working_session_file && !files.has(task.working_session_file)) files.set(task.working_session_file, []);
 
     const history: LiveHistorySnapshot["entries"] = [];
+    const compactionSummaries: LiveCompactionSummary[] = [];
     const seen = new Set<string>();
+    const seenCompactions = new Set<string>();
     const orderedGroups = [...files.entries()].sort(([, left], [, right]) =>
       (left[0]?.sequence ?? Number.MAX_SAFE_INTEGER) - (right[0]?.sequence ?? Number.MAX_SAFE_INTEGER));
     for (const [sessionFile, sessionRuns] of orderedGroups) {
@@ -227,8 +232,24 @@ export class AgentManager {
           if (!runByEntry.has(entryId)) runByEntry.set(entryId, run.id);
         }
       }
+      let previousMessageId: string | null = null;
       for (const entry of branch) {
+        if (entry.type === "compaction") {
+          const id = `${sessionId}:${entry.id}`;
+          if (entry.summary && !seenCompactions.has(id)) {
+            seenCompactions.add(id);
+            compactionSummaries.push({
+              id,
+              timestamp: entry.timestamp,
+              summary: entry.summary,
+              tokens_before: entry.tokensBefore,
+              after_entry_id: previousMessageId ? `${sessionId}:${previousMessageId}` : null,
+            });
+          }
+          continue;
+        }
         if (entry.type !== "message" || !entry.message || typeof entry.message.role !== "string") continue;
+        previousMessageId = entry.id;
         const id = `${sessionId}:${entry.id}`;
         if (seen.has(id)) continue;
         seen.add(id);
@@ -243,6 +264,7 @@ export class AgentManager {
         });
       }
     }
+    compactionSummaries.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
     const stream = activeRun ? this.streamSnapshot(activeRun.id) : undefined;
     const provisionalEvents = stream
       ? stream.events.filter((event) => event.sequence > stream.durableCursor)
@@ -256,6 +278,7 @@ export class AgentManager {
       cursor: stream?.cursor ?? 0,
       provisional_truncated: truncated,
       entries: history,
+      compaction_summaries: compactionSummaries,
       inputs: inputRows as LiveHistorySnapshot["inputs"],
       provisional_events: provisionalEvents,
     };

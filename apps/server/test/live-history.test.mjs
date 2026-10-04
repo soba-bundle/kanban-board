@@ -134,6 +134,38 @@ test("Live history reconstructs the active Pi branch after manager restart and s
   restored.dispose("task-1");
 });
 
+test("completed history snapshots retain Pi compaction summaries after manager restart", async (t) => {
+  const db = openDatabase(":memory:");
+  const sessionDir = mkdtempSync(join(tmpdir(), "kanban-live-history-"));
+  t.after(() => { db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
+  seed(db);
+  const { agents, managers } = createAgents(db, sessionDir);
+  const session = await agents.getOrCreateWorkingSession("task-1");
+  const manager = managers.get(session.sessionId);
+  appendMessage(manager, "user", "Keep the chosen reserve setting.");
+  const assistantEntryId = appendMessage(manager, "assistant", "Using the native reserve.");
+  const expectedSummary = "Decision: keep Pi's native reserveTokens; next: verify Live history.";
+  manager.appendCompaction(expectedSummary, assistantEntryId, 4704);
+  db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, session_id, session_file,
+    transcript_start_entry_id, transcript_end_entry_id)
+    VALUES ('run-compact', 'task-1', 'WORK', 1, 'COMPLETED', ?, ?, NULL, ?)`)
+    .run(session.sessionId, session.sessionFile, assistantEntryId);
+
+  const first = agents.historySnapshot("task-1");
+  assert.equal(first.compaction_summaries.length, 1);
+  assert.equal(first.compaction_summaries[0].summary, expectedSummary);
+  assert.equal(first.compaction_summaries[0].tokens_before, 4704);
+  assert.equal(first.compaction_summaries[0].after_entry_id, `${session.sessionId}:${assistantEntryId}`);
+  assert.ok(first.compaction_summaries[0].id);
+  assert.equal(first.active_run_id, null);
+
+  agents.dispose("task-1");
+  const restored = createAgents(db, sessionDir).agents;
+  const afterRestart = restored.historySnapshot("task-1");
+  assert.deepEqual(afterRestart.compaction_summaries, first.compaction_summaries);
+  restored.dispose("task-1");
+});
+
 test("active snapshots expose only provisional events newer than persisted transcript entries", async (t) => {
   const db = openDatabase(":memory:");
   const sessionDir = mkdtempSync(join(tmpdir(), "kanban-live-history-"));

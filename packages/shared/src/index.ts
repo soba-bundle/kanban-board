@@ -285,6 +285,15 @@ export const LiveHistoryEntrySchema = z.object({
   role: z.string().min(1),
   message: z.record(z.unknown()),
 });
+export const LiveCompactionSummarySchema = z.object({
+  id: z.string().min(1),
+  timestamp: z.string().datetime(),
+  summary: z.string(),
+  tokens_before: z.number().int().nonnegative(),
+  after_entry_id: z.string().min(1).nullable(),
+});
+export type LiveCompactionSummary = z.infer<typeof LiveCompactionSummarySchema>;
+
 export const LiveHistorySnapshotSchema = z.object({
   task_id: z.string().min(1),
   session_id: z.string().min(1).nullable(),
@@ -294,6 +303,7 @@ export const LiveHistorySnapshotSchema = z.object({
   entries: z.array(LiveHistoryEntrySchema),
   inputs: z.array(RunInputSchema),
   provisional_events: z.array(LiveEventSchema),
+  compaction_summaries: z.array(LiveCompactionSummarySchema),
 });
 export type LiveHistoryEntry = z.infer<typeof LiveHistoryEntrySchema>;
 export type LiveHistorySnapshot = z.infer<typeof LiveHistorySnapshotSchema>;

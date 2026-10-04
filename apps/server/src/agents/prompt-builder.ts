@@ -7,12 +7,14 @@ export interface RunPrompt {
 }
 
 interface PromptRow {
-  title: string;
   description: string;
+  is_first_run: number;
 }
 
 export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt {
-  const row = db.prepare(`SELECT t.title, t.description FROM task_runs r
+  const row = db.prepare(`SELECT t.description, NOT EXISTS (
+    SELECT 1 FROM task_runs previous WHERE previous.task_id = r.task_id AND previous.sequence < r.sequence
+  ) AS is_first_run FROM task_runs r
     JOIN tasks t ON t.id = r.task_id WHERE r.id = ?`).get(runId) as PromptRow | undefined;
   if (!row) throw new Error(`Run ${runId} not found.`);
 
@@ -24,12 +26,9 @@ export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt 
   if (!initialPrompt) throw new Error(`Run ${runId} has no initial prompt.`);
   const queuedInputs = inputs.filter((input) => input.delivery_type === "QUEUED_INPUT");
 
-  const sections = [
-    "Work on this task.",
-    `Title: ${row.title}`,
-    `User's initial instructions:\n${initialPrompt.content}`,
-    `Task description:\n${row.description}`,
-  ];
+  const sections = [row.is_first_run
+    ? `Based on this task description:\n${row.description}\n\n${initialPrompt.content}`
+    : initialPrompt.content];
   if (queuedInputs.length > 0) {
     sections.push(`Additional queued guidance:\n${queuedInputs.map((input) => `- ${input.content}`).join("\n")}`);
   }

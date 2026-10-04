@@ -1,13 +1,14 @@
 # Local Agent Kanban — Implementation Plan v2
 
-**Status:** Historical v2 implementation reference; current runtime/workflow superseded by W-01–W-16.
+**Status:** Historical v2 implementation reference; current runtime/workflow superseded by W-01–W-18.
 **Current source of truth:** [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md).
 
 > This plan preserves the design and implementation history of earlier phases. Where it describes stage selection, mandatory handover, automated Validation/readiness, or priority Validation, those paths are retired. Current work is prompt-driven (`WORK`); checkpointing is explicit; Sync with main and Git-only Check sync are distinct; developers test/review; merge-back requires current sync and explicit confirmation. Legacy records remain readable.
 **Requirements:** [PRD v2](local-agent-kanban-prd-v2.md)
 
-This replaces `local-agent-kanban-implementation-plan.md` for future work. Preserve
-the original as history. This plan describes target behavior, not completed code.
+This document preserves earlier implementation history and the remaining roadmap.
+Phases 10–13 below are not a current completion report; consult the linked workflow
+plan for completed work and current acceptance status.
 
 ## 1. Current baseline and where to resume
 
@@ -526,12 +527,15 @@ sessions at >=60% context. Verify failure classes and consistent reconstructed L
 
 ## 8. Phase 11 — Backend Recovery and Git Reconciliation
 
-Acquire lock, open DB, inspect jobs/worktrees/Git markers, drop stale approval,
-preserve queue order, classify orphaned working runs Interrupted and validation
-runs Failed, rebuild human requests, restore sessions/rebind subscriptions, expose
-authoritative snapshot. MERGE_HEAD routes to conflict; unexpected rebase/cherry-pick/
-revert needs manual recovery. Browser reconstruction from 6A is not a substitute
-for backend crash reconciliation.
+This section predates the simplified workflow. Sync-conflict recovery and merge
+restart reconciliation are implemented as recorded in W-11 and W-14 of the
+current workflow plan. Validation runs are no longer resumed or classified as a
+current runtime path: Migration 14 retires in-flight Validation work while
+preserving history. Future recovery work must preserve queue order, rebuild Human
+Requests, restore sessions/rebind subscriptions, and expose an authoritative
+snapshot. MERGE_HEAD routes to conflict; unexpected rebase/cherry-pick/revert
+needs manual recovery. Browser reconstruction from 6A is not a substitute for
+backend crash reconciliation.
 
 Reconcile message delivery against actual transcript entries using the persisted
 per-session input sequence and Pi entry IDs. Compare only against the recorded
@@ -543,48 +547,48 @@ delivery-unknown and are exposed for explicit user resolution/reuse, not silentl
 retried or attached to another run. No silent resurrection of cancelled runs or
 approval. Verify crashes before the call, after the call, after transcript append,
 and before SQLite delivery metadata commits, as well as checkpoint persistence,
-questionnaire, validation and merge.
+Human Request and merge/sync recovery. Do not add automated Validation recovery.
 
 ## 9. Phase 12 — Session Rendering and UI Polish
 
 Build on already functional durable Live: collapsed reasoning/tools with previews,
 per-response Model/Input Tokens/Output Tokens, richer tool renderers, changed-file
 sidebar, project filter, Settings, toasts and recovery messaging. Do not reintroduce
-Timeline or ticket comments. Keep board primary and Runs handover behavior intact.
+Timeline or ticket comments. Keep the board primary; preserve historical handovers
+in Runs, but do not require handovers for new WORK runs.
 
-### Per-agent Pi capability profiles — future settings implementation
+### Pi capability profile — future settings implementation
 
-Add an application Settings page for role-specific Pi capabilities. Investigation,
-Implementation, and Validation/Review agents must be able to load different sets
-of built-in/custom tools, skills, and extensions. Make the profiles user-editable
-in the Settings page and persist them in an application-owned JSON settings file.
-Resolve each profile dynamically when creating the corresponding hosted Pi
-session; do not mutate or duplicate the user's global extension directory. Keep
-the Kanban-only `pi-questions` exclusion mandatory regardless of profile.
+Add an application Settings page for Pi capabilities if still needed. The current
+workflow has one Work agent role; do not design separate Investigation,
+Implementation, or Validation/Review profiles unless those roles are deliberately
+reintroduced. Profiles may select built-in/custom tools, skills, and extensions;
+keep settings application-owned and do not mutate or duplicate the user's global
+extension directory. Keep the Kanban-only `pi-questions` exclusion mandatory.
 
-Before implementing, specify the JSON schema and path, role-to-profile mapping,
-extension/skill source resolution and trust rules. Test settings round-trip,
-role-specific resource/tool exposure, session isolation (no resources leaking
-between roles), and behavior when a profile changes between runs. This is a
-separate future step, not part of Phase 7 queue integration.
+Before implementing, specify the JSON schema and path, the Work-profile mapping,
+extension/skill source resolution, and trust rules. Test settings round-trip,
+resource/tool exposure, session isolation, and behavior when a profile changes
+between runs. This remains separate future work.
 
 ## 10. Phase 13 — End-to-End Hardening
 
-- Todo prompt + stage + confirmation → queue → stream → handover → Review.
-- Review prompt + stage → cancel (inert) or confirm → same-session iteration.
-- Multiple queued messages → combined prompt → one final handover.
+- TODO prompt-only start + confirmation → queue → unified WORK stream → Review; no stage choice or required handover.
+- Review prompt → cancel (inert) or confirm → same-session work continuation.
+- Multiple queued messages → combined prompt with explicit delivery reconciliation; no final-handover gate.
 - Late steering/finalization races; Stop exposes undelivered guidance.
 - Two concurrent tickets; refresh/reconnect/switch with correct output attribution.
-- Commit tracked-only and new files; cancel preserves work; dirty-again requires checkpoint.
+- Checkpoint the exact previewed tracked and untracked changes; require explicit confirmation, and preserve work on cancel or failure.
 - Checkpoint diff unchanged by later uncommitted edits.
-- Validation pass/issues/infrastructure failure and fresh-session retry.
+- Check sync IN_SYNC/STALE/BLOCKED states; this Git-only check creates no agent run or Validation snapshot.
+- Explicit Sync with main and conflict recovery; a revoked merge approval requires fresh Check sync, preview, and confirmation.
+- Developer app testing/code-review reminder before merge; no acknowledgement gate or automated test claim.
 - Questionnaire capacity release, answer, Stop and unmatched-history crash repair.
 - Windows nested process cleanup; worktree lock → Cleanup Pending.
 - Merge conflicts, base moving once/twice, dirty primary, compare-and-swap and crash.
 - Inference retries/overflow/compaction and provisional text rollback.
 - Single-instance exclusion, localhost Host/Origin protection and no cross-task access.
-- Clean database initialization contains no ticket-comments schema or data; reset
-does not delete session files, worktrees or unrelated databases.
+- Preserve historical runs, handovers, Validation reports/findings, and worktree-path records; never reset a database automatically. Any separately authorized development reset must identify the exact database path and data impact, and must not delete session files, worktrees or unrelated databases.
 
 ## 11. Verification commands and engineering invariants
 
@@ -594,6 +598,7 @@ and real session history/rebinding as required; mocks alone do not establish SDK
 or OS behavior.
 
 Browser state is never authoritative. Persisted intent is not delivered history.
-Git operations are scoped, confirmed and serialized. No automatic checkpoint on
-handover, no destructive discard, no auto-resolution/rebase/squash, no approval
-surviving crash/manual conflict repair, and no claim that worktrees are a sandbox.
+Git operations are scoped, confirmed and serialized. No automatic checkpoint,
+no destructive discard, no auto-resolution/rebase/squash, no merge approval
+surviving crash/manual conflict repair, developer-owned app testing and code
+review, and no claim that worktrees are a sandbox.

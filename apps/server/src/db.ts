@@ -322,5 +322,92 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const gitSyncAttemptsApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 12").get();
+  if (!gitSyncAttemptsApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`CREATE TABLE git_sync_attempts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        status TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        prior_base_sha TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        task_branch TEXT NOT NULL,
+        prior_task_sha TEXT NOT NULL,
+        prior_task_recorded_sha TEXT,
+        candidate_sha TEXT,
+        conflict_state_token TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        error_message TEXT
+      );
+      CREATE INDEX git_sync_attempts_task ON git_sync_attempts(task_id, started_at);
+      CREATE UNIQUE INDEX git_sync_attempts_one_active ON git_sync_attempts(task_id)
+        WHERE status IN ('PREPARED', 'MERGING', 'RUNNING', 'CONFLICT', 'ABORTING', 'INTERRUPTED');`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (12, ?)").run(new Date().toISOString());
+    });
+    migrate();
+  }
+
+  const syncRecoveryApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 13").get();
+  if (!syncRecoveryApplied) {
+    const migrate = db.transaction(() => {
+      db.exec(`DROP INDEX IF EXISTS git_sync_attempts_one_active;
+        UPDATE git_sync_attempts SET status = 'INTERRUPTED',
+          error_message = COALESCE(error_message, 'Sync attempt was interrupted during application upgrade.')
+          WHERE status = 'RUNNING';
+        CREATE UNIQUE INDEX git_sync_attempts_one_active ON git_sync_attempts(task_id)
+          WHERE status IN ('PREPARED', 'MERGING', 'RUNNING', 'CONFLICT', 'ABORTING', 'INTERRUPTED');`);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (13, ?)").run(new Date().toISOString());
+    });
+    migrate();
+  }
+
+  const validationRuntimeRetired = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 14").get();
+  if (!validationRuntimeRetired) {
+    const migrate = db.transaction(() => {
+      const now = new Date().toISOString();
+      const activeRuns = db.prepare(`SELECT id, task_id, sequence, status, return_review_tag FROM task_runs
+        WHERE stage = 'VALIDATION_REVIEW' AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_HUMAN')
+        ORDER BY task_id, sequence DESC`).all() as Array<{
+          id: string; task_id: string; sequence: number; status: string; return_review_tag: string | null;
+        }>;
+      const restoredTasks = new Set<string>();
+      for (const run of activeRuns) {
+        const queued = run.status === "QUEUED";
+        db.prepare(`UPDATE agent_jobs SET status = ?, queue_position = NULL, completed_at = ?
+          WHERE task_run_id = ? AND status IN ('QUEUED', 'CLAIMED', 'WAITING_FOR_HUMAN')`)
+          .run(queued ? "CANCELLED" : "FINISHED", now, run.id);
+        db.prepare(`UPDATE task_runs SET status = ?, reason_code = ?, interrupted_at = ?, completed_at = ?,
+          error_message = 'Automated Validation was retired; this in-flight run was not resumed.' WHERE id = ?`)
+          .run(queued ? "CANCELLED" : "FAILED", queued ? null : "BACKEND_INTERRUPTED", queued ? null : now, now, run.id);
+        db.prepare(`UPDATE run_inputs SET delivery_status = CASE WHEN delivery_status = 'ACCEPTED' AND ? = 0
+          THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END,
+          failure_reason = 'Automated Validation was retired before delivery could be confirmed.'
+          WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(queued ? 1 : 0, run.id);
+        db.prepare("UPDATE human_requests SET status = 'CANCELLED' WHERE run_id = ? AND status = 'PENDING'").run(run.id);
+        if (!restoredTasks.has(run.task_id)) {
+          const tag = ["VALIDATION_FAILED", "VALIDATION_ISSUES", "READY_TO_MERGE"].includes(run.return_review_tag ?? "")
+            ? "WORK_COMPLETE" : run.return_review_tag ?? "WORK_COMPLETE";
+          db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ?
+            WHERE id = ? AND workflow_state IN ('IN_PROGRESS', 'REQUIRES_HUMAN')
+              AND NOT EXISTS (SELECT 1 FROM task_runs newer WHERE newer.task_id = ?
+                AND newer.sequence > ? AND newer.stage <> 'VALIDATION_REVIEW')`)
+            .run(tag, now, run.task_id, run.task_id, run.sequence);
+          restoredTasks.add(run.task_id);
+        }
+      }
+      db.prepare(`UPDATE agent_jobs SET status = 'CANCELLED', queue_position = NULL, completed_at = ?
+        WHERE status IN ('QUEUED', 'CLAIMED', 'WAITING_FOR_HUMAN') AND task_run_id IN
+          (SELECT id FROM task_runs WHERE stage = 'VALIDATION_REVIEW')`).run(now);
+      db.prepare(`UPDATE merge_attempts SET approval_status = 'REVOKED', status = 'VALIDATION_RETIRED',
+        error_reason = 'Automated Validation was retired.'
+        WHERE (priority_validation_run_id IS NOT NULL OR validation_snapshot_id IS NOT NULL)
+          AND approval_status = 'APPROVED'`).run();
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (14, ?)").run(now);
+    });
+    migrate();
+  }
+
   return db;
 }

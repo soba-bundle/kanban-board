@@ -1,6 +1,9 @@
 # Local Agent Kanban — Implementation Plan v2
 
-**Status:** Authoritative v2 implementation reference
+**Status:** Historical v2 implementation reference; current runtime/workflow superseded by W-01–W-16.
+**Current source of truth:** [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md).
+
+> This plan preserves the design and implementation history of earlier phases. Where it describes stage selection, mandatory handover, automated Validation/readiness, or priority Validation, those paths are retired. Current work is prompt-driven (`WORK`); checkpointing is explicit; Sync with main and Git-only Check sync are distinct; developers test/review; merge-back requires current sync and explicit confirmation. Legacy records remain readable.
 **Requirements:** [PRD v2](local-agent-kanban-prd-v2.md)
 
 This replaces `local-agent-kanban-implementation-plan.md` for future work. Preserve

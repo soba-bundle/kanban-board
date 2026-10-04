@@ -65,7 +65,7 @@ function response(_url, body) {
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 }
 
-test("composer gates on prompt/stage, keeps Shift+Enter, and preserves draft through confirmation cancel", async (t) => {
+test("composer gates on prompt, keeps Shift+Enter, and preserves draft through confirmation cancel", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   globalThis.fetch = async (url) => response(url, String(url).includes("/live/history") ? history() : []);
@@ -75,9 +75,8 @@ test("composer gates on prompt/stage, keeps Shift+Enter, and preserves draft thr
   const composer = await testing.screen.findByPlaceholderText("What should the agent do?");
   const startButton = testing.screen.getByRole("button", { name: "Start run" });
   assert.equal(startButton.disabled, true);
+  assert.equal(testing.screen.queryByRole("radio", { name: /Investigation|Implementation/ }), null);
   testing.fireEvent.change(composer, { target: { value: "Fix retries" } });
-  assert.equal(startButton.disabled, true);
-  testing.fireEvent.click(testing.screen.getByRole("radio", { name: "Investigation" }));
   assert.equal(startButton.disabled, false);
 
   testing.fireEvent.keyDown(composer, { key: "Enter", shiftKey: true });
@@ -87,11 +86,155 @@ test("composer gates on prompt/stage, keeps Shift+Enter, and preserves draft thr
   assert.equal(testing.within(startDialog).getByLabelText("Initial prompt").value, "Fix retries");
   testing.fireEvent.click(testing.within(startDialog).getByRole("button", { name: "Send" }));
   const confirm = testing.screen.getByRole("alertdialog", { name: "Confirm run" });
-  assert.match(confirm.textContent, /Investigation/);
+  assert.doesNotMatch(confirm.textContent, /Investigation|Implementation/);
   testing.fireEvent.click(testing.within(confirm).getByRole("button", { name: "Cancel" }));
   testing.fireEvent.click(testing.within(startDialog).getByRole("button", { name: "Cancel" }));
   assert.equal(composer.value, "Fix retries");
   view.unmount();
+});
+
+test("TODO starts from a prompt without requiring an Investigation or Implementation choice", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (String(url).endsWith("/live/history")) return response(url, history());
+    if (String(url).endsWith("/queue")) return response(url, { job_id: "job-1", run_id: "run-1", created: true });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: task(), queue: null, onClose() {}, onChanged() {} })));
+
+  const composer = await testing.screen.findByPlaceholderText("What should the agent do?");
+  assert.equal(testing.screen.queryByRole("radio", { name: /Investigation|Implementation/ }), null);
+  testing.fireEvent.change(composer, { target: { value: "Explore the retry bug and fix it if needed" } });
+  const start = testing.screen.getByRole("button", { name: "Start run" });
+  assert.equal(start.disabled, false);
+  testing.fireEvent.click(start);
+  const startDialog = await testing.screen.findByRole("dialog", { name: "Start a run" });
+  testing.fireEvent.click(testing.within(startDialog).getByRole("button", { name: "Send" }));
+  const confirmation = await testing.screen.findByRole("alertdialog", { name: "Confirm run" });
+  assert.match(confirmation.textContent, /Explore the retry bug and fix it if needed/);
+  assert.doesNotMatch(confirmation.textContent, /Investigation|Implementation/);
+  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: /Confirm and queue/i }));
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.options.method === "POST" && String(request.url).endsWith("/queue"))));
+  const queued = requests.find((request) => request.options.method === "POST" && String(request.url).endsWith("/queue"));
+  assert.deepEqual(Object.keys(JSON.parse(queued.options.body)).sort(), ["idempotency_key", "prompt", "task_id"]);
+});
+
+test("no-code work shows the agent's ordinary response without a Changes to review card", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const live = { ...history(), entries: [{ id: "entry-1", entry_id: "entry-1", session_id: "session-1", run_id: "run-1",
+    timestamp: new Date().toISOString(), role: "assistant", message: { role: "assistant", content: [{ type: "text", text: "The retry path is already safe." }] } }] };
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/live/history")) return response(url, live);
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-task-1", commit_sha: "a".repeat(40), state_token: "clean", diff: "",
+    });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
+    if (String(url).endsWith("/merge-preview")) return response(url, { eligible: false, reason: "SYNC_REQUIRED" });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {},
+  })));
+  assert.ok(await testing.screen.findByText("The retry path is already safe."));
+  assert.equal(testing.screen.queryByText("Changes to review"), null);
+});
+
+test("code changes show a review card with the summary, paths, and uncheckpointed diff", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const live = { ...history(), entries: [
+    { id: "entry-old", entry_id: "entry-old", session_id: "session-1", run_id: "run-old",
+      timestamp: new Date().toISOString(), role: "assistant", message: { role: "assistant", content: [{ type: "text", text: "An earlier response must not be shown." }] } },
+    { id: "entry-code", entry_id: "entry-code", session_id: "session-1", run_id: "run-1",
+      timestamp: new Date().toISOString(), role: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Updated the retry guard and added a regression case." }] } },
+  ] };
+  const patch = ["diff --git a/src/retry.ts b/src/retry.ts", "--- a/src/retry.ts", "+++ b/src/retry.ts",
+    "@@ -1 +1 @@", "-old guard", "+new guard", "diff --git a/test/retry.test.ts b/test/retry.test.ts",
+    "--- /dev/null", "+++ b/test/retry.test.ts", "@@ -0,0 +1 @@", "+test regression", ""].join("\n");
+  const completedRuns = [
+    { id: "run-old", stage: "WORK", sequence: 1, status: "COMPLETED", reason_code: null, error_message: null,
+      started_at: "2025-01-01T00:00:00.000Z", completed_at: "2025-01-01T00:01:00.000Z", handover: null },
+    { id: "run-1", stage: "WORK", sequence: 2, status: "COMPLETED", reason_code: null, error_message: null,
+      started_at: "2025-01-02T00:00:00.000Z", completed_at: "2025-01-02T00:01:00.000Z", handover: null },
+  ];
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/live/history")) return response(url, live);
+    if (String(url).endsWith("/runs")) return response(url, completedRuns);
+    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: ["src/retry.ts"], untracked_files: ["test/retry.test.ts"], branch: "agent/task-task-1",
+      commit_sha: "a".repeat(40), state_token: "dirty-state", diff: patch,
+    });
+    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: "WORKTREE_CHANGES" });
+    if (String(url).endsWith("/merge-preview")) return response(url, { eligible: false, reason: "CHECKPOINT_REQUIRED" });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const props = { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} };
+  const view = testing.render(createElement(ToastProvider, null, createElement(TicketPanel, props)));
+
+  assert.ok(await testing.screen.findByText("Changes to review"));
+  const card = testing.screen.getByRole("region", { name: "Changes to review" });
+  assert.ok(testing.within(card).getByText(/Updated the retry guard/));
+  assert.equal(testing.within(card).queryByText("An earlier response must not be shown."), null);
+  assert.ok(testing.within(card).getByText("src/retry.ts"));
+  assert.ok(testing.within(card).getByText("test/retry.test.ts"));
+  testing.fireEvent.click(testing.within(card).getByRole("button", { name: /Preview changes/i }));
+  const preview = await testing.screen.findByRole("dialog", { name: /Changes to review/i });
+  assert.match(preview.textContent, /new guard/);
+  testing.fireEvent.click(testing.within(preview).getByRole("button", { name: "test/retry.test.ts" }));
+  assert.match(preview.textContent, /test regression/);
+  assert.equal(testing.within(preview).queryByRole("button", { name: /Update checkpoint/i }), null,
+    "checkpoint confirmation belongs to W-09, not the diff preview");
+
+  view.unmount();
+  testing.render(createElement(ToastProvider, null, createElement(TicketPanel, props)));
+  assert.ok(await testing.screen.findByText("Changes to review"));
+  const refreshedCard = testing.screen.getByRole("region", { name: "Changes to review" });
+  assert.ok(testing.within(refreshedCard).getByText(/Updated the retry guard/),
+    "the response excerpt is recovered from persisted run history");
+});
+
+test("changed-work review data does not leak when the ticket switches", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.endsWith("/live/history")) return response(url, path.includes("task-1")
+      ? { ...history(), entries: [{ id: "entry-1", entry_id: "entry-1", session_id: "session-1", run_id: "run-1",
+        timestamp: new Date().toISOString(), role: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Task one's private summary." }] } }] }
+      : { ...history(), task_id: "task-2" });
+    if (path.endsWith("/runs")) return response(url, path.includes("task-1")
+      ? [{ id: "run-1", stage: "WORK", sequence: 1, status: "COMPLETED", reason_code: null, error_message: null,
+        started_at: null, completed_at: null, handover: null }]
+      : []);
+    if (path.endsWith("/checkpoint-preview")) return response(url, path.includes("task-1")
+      ? { tracked_changes: ["private.ts"], untracked_files: [], branch: "agent/task-1", commit_sha: "a".repeat(40),
+        state_token: "dirty", diff: "diff --git a/private.ts b/private.ts\n+private change" }
+      : { tracked_changes: [], untracked_files: [], branch: "agent/task-2", commit_sha: "b".repeat(40), state_token: "clean", diff: "" });
+    return response(url, []);
+  };
+
+  const firstTask = { ...task("REVIEW", "WORK_COMPLETE"), id: "task-1" };
+  const view = testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: firstTask, queue: null, onClose() {}, onChanged() {} })));
+  assert.ok(await testing.screen.findByText("Changes to review"));
+  view.rerender(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: { ...firstTask, id: "task-2" }, queue: null, onClose() {}, onChanged() {} })));
+  await testing.waitFor(() => assert.equal(testing.screen.queryByText("Changes to review"), null));
+  assert.equal(testing.screen.queryByText("Task one's private summary."), null);
+  assert.equal(testing.screen.queryByText("private.ts"), null);
 });
 
 test("Review can be closed as Done while retaining the task and its run history", async (t) => {
@@ -122,7 +265,155 @@ test("Review can be closed as Done while retaining the task and its run history"
   view.unmount();
 });
 
-test("current validation requires explicit confirmation before merging to the recorded base", async (t) => {
+test("Review exposes explicit Sync with main without running agent Validation", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    requests.push({ path, options });
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean", diff: "",
+    });
+    if (path.endsWith("/sync")) return response(url, { status: "SYNCED", synced_base_sha: "d".repeat(40), candidate_sha: "e".repeat(40) });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const reviewTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
+  testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: reviewTask, queue: null, onClose() {}, onChanged() {},
+  })));
+
+  const sync = await testing.screen.findByRole("button", { name: /Sync with main/i });
+  assert.equal(sync.disabled, false);
+  assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/sync")), false,
+    "sync must wait for an explicit user action");
+  testing.fireEvent.click(sync);
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/sync"))));
+  assert.match((await testing.screen.findByRole("status")).textContent, /Synced main at d{12}/);
+  assert.equal(requests.some((request) => request.path.endsWith("/validation")), false,
+    "sync must not start automated agent Validation");
+});
+
+test("persisted sync conflict recovery offers IDE inspection and a guarded abort", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  let recovery = {
+    attempt_id: "sync-attempt-1", state: "CONFLICT", base_sha: "d".repeat(40), prior_task_sha: "c".repeat(40),
+    current_candidate_sha: "c".repeat(40), can_abort: true, error_message: null,
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    requests.push({ path, options });
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean", diff: "",
+    });
+    if (path.endsWith("/sync-recovery")) return response(url, { recovery });
+    if (path.endsWith("/sync/view-conflicts")) return response(url, { status: "OPENED" });
+    if (path.endsWith("/sync/abort")) {
+      assert.equal(JSON.parse(options.body).confirmed, true);
+      recovery = null;
+      return response(url, { status: "ABORTED" });
+    }
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const reviewTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
+  testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: reviewTask, queue: null, onClose() {}, onChanged() {},
+  })));
+
+  const recoveryNotice = await testing.screen.findByRole("alert");
+  assert.match(recoveryNotice.textContent, /sync stopped on conflicts/i);
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "View Conflicts" }));
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.path.endsWith("/sync/view-conflicts"))));
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Abort sync" }));
+  const confirmation = await testing.screen.findByRole("dialog", { name: "Abort sync" });
+  assert.match(confirmation.textContent, /clear its conflict markers\/index state/i);
+  assert.match(confirmation.textContent, /does not discard edits made after the conflict snapshot/i);
+  assert.equal(requests.some((request) => request.path.endsWith("/sync/abort")), false);
+  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "Confirm abort" }));
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.path.endsWith("/sync/abort"))));
+  assert.equal(testing.screen.queryByText(/sync stopped on conflicts/i), null);
+  assert.ok(testing.screen.getByRole("button", { name: "Sync with main" }));
+});
+
+test("committed manual sync resolution can be finalized but not aborted", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    requests.push({ path, options });
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-1", commit_sha: "e".repeat(40), state_token: "clean", diff: "",
+    });
+    if (path.endsWith("/sync-recovery")) return response(url, { recovery: {
+      attempt_id: "sync-attempt-2", state: "RESOLUTION_COMMITTED", base_sha: "d".repeat(40), prior_task_sha: "c".repeat(40),
+      current_candidate_sha: "e".repeat(40), can_abort: false, error_message: null,
+    } });
+    if (path.endsWith("/sync/retry")) return response(url, {
+      status: "SYNCED", synced_base_sha: "d".repeat(40), candidate_sha: "e".repeat(40),
+    });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const reviewTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
+  testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: reviewTask, queue: null, onClose() {}, onChanged() {},
+  })));
+  assert.ok(await testing.screen.findByRole("button", { name: "Finish sync" }));
+  assert.equal(testing.screen.queryByRole("button", { name: "Abort sync" }), null);
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Finish sync" }));
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.path.endsWith("/sync/retry"))));
+  assert.equal(requests.filter((request) => request.path.endsWith("/sync" )).length, 0,
+    "finalizing a manual resolution must not replay the merge operation");
+});
+
+test("merge eligibility uses current Check sync without a Validation snapshot", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    requests.push({ path, options });
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/runs")) return response(url, []);
+    if (path.endsWith("/checkpoint-preview")) return response(url, {
+      tracked_changes: [], untracked_files: [], branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean",
+    });
+    if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
+    if (path.endsWith("/merge-preview")) return response(url, {
+      eligible: true, sync_status: "IN_SYNC", preview_id: "preview-no-validation", base_branch: "main",
+      checked_base_sha: "b".repeat(40), task_sha: "c".repeat(40), candidate_sha: "c".repeat(40),
+    });
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const reviewTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main", active_validation_snapshot_id: null };
+  testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: reviewTask, queue: null, onClose() {}, onChanged() {} })));
+  const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
+  assert.equal(mergeButton.disabled, false);
+  testing.fireEvent.click(mergeButton);
+  const confirmation = await testing.screen.findByRole("dialog", { name: /confirm merge back/i });
+  assert.equal(testing.within(confirmation).getByRole("button", { name: /Confirm merge/i }).disabled, false);
+  assert.equal(requests.some((request) => /\/validation|\/test/.test(request.path)), false);
+});
+
+test("Review and merge confirmation remind developers without adding an acknowledgement gate", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const originalFetch = globalThis.fetch;
@@ -138,7 +429,8 @@ test("current validation requires explicit confirmation before merging to the re
     });
     if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
     if (path.endsWith("/merge-preview")) return response(url, {
-      eligible: true, base_moved: false, base_branch: "main", validated_base_sha: "b".repeat(40), candidate_sha: "c".repeat(40),
+      eligible: true, sync_status: "IN_SYNC", preview_id: "preview-1", base_branch: "main",
+      checked_base_sha: "b".repeat(40), task_sha: "c".repeat(40), checked_at: "2026-01-01T00:00:00.000Z", candidate_sha: "c".repeat(40),
     });
     if (path.endsWith("/merge")) return response(url, { merge_attempt_id: "merge-1", status: "MERGED", resolution: "MERGED" });
     return response(url, []);
@@ -151,12 +443,23 @@ test("current validation requires explicit confirmation before merging to the re
     createElement(TicketPanel, { task: readyTask, queue: null, onClose() {}, onChanged() { changed += 1; } })));
 
   const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
+  const reviewReminder = await testing.screen.findByRole("note", { name: "Developer testing reminder" });
+  assert.match(reviewReminder.textContent, /test the app.*task worktree.*review the implemented code/i);
+  assert.match(reviewReminder.textContent, /Check sync.*Git state only/i);
   assert.equal(mergeButton.disabled, false);
   assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge")), false,
-    "a current passing snapshot never merges automatically");
+    "a fresh Check sync state still requires explicit merge approval");
   testing.fireEvent.click(mergeButton);
   const confirmation = await testing.screen.findByRole("dialog", { name: /confirm merge back/i });
   assert.match(confirmation.textContent, /main/);
+  const mergeReminder = testing.within(confirmation).getByRole("note", { name: "Before merge reminder" });
+  assert.match(mergeReminder.textContent, /test the app.*task worktree.*review the implemented code/i,
+    "merge confirmation reminds the developer to test the task worktree and review the code");
+  assert.match(mergeReminder.textContent, /Check sync.*Git state only/i);
+  assert.equal(testing.within(confirmation).queryByRole("checkbox"), null,
+    "testing and review remain developer-owned; no acknowledgement is required");
+  assert.equal(requests.some((request) => /\/validation|\/test/.test(request.path)), false,
+    "the reminder does not trigger Validation or app tests");
   assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge")), false,
     "opening confirmation has no Git side effect");
   testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: /cancel/i }));
@@ -166,8 +469,10 @@ test("current validation requires explicit confirmation before merging to the re
   testing.fireEvent.click(await testing.screen.findByRole("button", { name: /Confirm merge/i }));
   await testing.waitFor(() => assert.ok(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge"))));
   const posted = requests.find((request) => request.options.method === "POST" && request.path.endsWith("/merge"));
-  assert.deepEqual(JSON.parse(posted.options.body), { confirmed: true });
+  assert.deepEqual(JSON.parse(posted.options.body), { confirmed: true, preview_id: "preview-1" });
   await testing.waitFor(() => assert.ok(changed > 0, "successful merge refreshes the board state"));
+  assert.equal(requests.some((request) => /\/validation|\/test/.test(request.path)), false,
+    "confirming merge does not trigger Validation or application testing");
 });
 
 test("stale merge response remains visible and never refreshes as successfully merged", async (t) => {
@@ -185,8 +490,8 @@ test("stale merge response remains visible and never refreshes as successfully m
       tracked_changes: [], untracked_files: [], branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean",
     });
     if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
-    if (path.endsWith("/merge-preview")) return response(url, { eligible: true, base_branch: "main", candidate_sha: "c".repeat(40) });
-    if (path.endsWith("/merge")) return new Response(JSON.stringify({ error: "Validation snapshot is stale." }), {
+    if (path.endsWith("/merge-preview")) return response(url, { eligible: true, preview_id: "preview-stale", base_branch: "main", candidate_sha: "c".repeat(40) });
+    if (path.endsWith("/merge")) return new Response(JSON.stringify({ error: "Check sync is stale; Sync with main and try again." }), {
       status: 409, headers: { "content-type": "application/json" },
     });
     return response(url, []);
@@ -204,12 +509,11 @@ test("stale merge response remains visible and never refreshes as successfully m
   assert.equal(changed, 0, "failed integration must not be presented as a completed merge");
 });
 
-test("base-moved merge confirmation shows both base SHAs and queues fresh Validation only after approval", async (t) => {
+test("merge back blocks a base that moved since Check sync and directs Sync with main", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const originalFetch = globalThis.fetch;
   const requests = [];
-  let changed = 0;
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url);
     requests.push({ path, options });
@@ -220,33 +524,21 @@ test("base-moved merge confirmation shows both base SHAs and queues fresh Valida
     });
     if (path.endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
     if (path.endsWith("/merge-preview")) return response(url, {
-      eligible: true, action: "SYNC_BASE", base_moved: true, base_branch: "main",
-      validated_base_sha: "b".repeat(40), live_base_sha: "d".repeat(40), candidate_sha: "c".repeat(40),
+      eligible: false, sync_status: "STALE", reasons: ["The current base moved. Sync with main, then Check sync again."],
+      base_branch: "main", checked_base_sha: "d".repeat(40), recorded_base_sha: "b".repeat(40), candidate_sha: "c".repeat(40),
     });
-    if (path.endsWith("/merge")) return response(url, { merge_attempt_id: "merge-2", status: "VALIDATION_QUEUED" });
     return response(url, []);
   };
   t.after(() => { globalThis.fetch = originalFetch; });
-  const readyTask = { ...task("REVIEW", "READY_TO_MERGE"), base_commit_sha: "b".repeat(40),
-    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main",
-    active_validation_snapshot_id: "snapshot-1", validation_snapshot_current: true };
+  const reviewTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
+    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main", active_validation_snapshot_id: null };
   testing.render(createElement(ToastProvider, null,
-    createElement(TicketPanel, { task: readyTask, queue: null, onClose() {}, onChanged() { changed += 1; } })));
-
-  testing.fireEvent.click(await testing.screen.findByRole("button", { name: /Merge back to working branch/i }));
-  const confirmation = await testing.screen.findByRole("dialog", { name: /confirm merge back/i });
-  assert.match(confirmation.textContent, /main/);
-  assert.match(confirmation.textContent, new RegExp("b".repeat(12)));
-  assert.match(confirmation.textContent, new RegExp("d".repeat(12)));
-  assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge")), false,
-    "base sync requires the same explicit confirmation as integration");
-  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: /Confirm merge/i }));
-  await testing.waitFor(() => assert.ok(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge"))));
-  const posted = requests.find((request) => request.options.method === "POST" && request.path.endsWith("/merge"));
-  assert.deepEqual(JSON.parse(posted.options.body), { confirmed: true });
-  await testing.waitFor(() => assert.ok(changed > 0));
-  assert.doesNotMatch(testing.screen.getByRole("complementary").textContent, /MERGED/,
-    "approval starts sync and revalidation; it does not imply integration");
+    createElement(TicketPanel, { task: reviewTask, queue: null, onClose() {}, onChanged() {} })));
+  const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
+  assert.equal(mergeButton.disabled, true);
+  assert.match(testing.screen.getByText(/Sync with main, then Check sync again/i).textContent, /Sync with main/i);
+  assert.equal(testing.screen.queryByRole("dialog", { name: /confirm merge back/i }), null);
+  assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge")), false);
 });
 
 test("merge-conflict UI exposes safe recovery actions and reports a rejected Retry", async (t) => {
@@ -314,7 +606,7 @@ test("dirty worktree cannot be closed or silently discarded and still offers exp
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
 
-  const commit = await testing.screen.findByRole("button", { name: "Commit changes" });
+  const commit = await testing.screen.findByRole("button", { name: "Update checkpoint" });
   assert.equal(testing.screen.queryByRole("button", { name: "Mark as done" }), null);
   assert.equal(commit.disabled, false);
   testing.fireEvent.click(commit);
@@ -325,14 +617,16 @@ test("dirty worktree cannot be closed or silently discarded and still offers exp
   assert.equal(requests.some((request) => request.method === "POST" && request.url.endsWith("/complete")), false);
 });
 
-test("task-branch changes do not merge until a current passing Validation exists", async (t) => {
+test("merge remains blocked until Check sync sees the recorded clean task checkpoint", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url: String(url), method: options.method ?? "GET" });
     if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: "BRANCH_CHANGES" });
-    if (String(url).endsWith("/merge-preview")) return response(url, { eligible: false, reason: "VALIDATION_REQUIRED" });
+    if (String(url).endsWith("/merge-preview")) return response(url, {
+      eligible: false, sync_status: "BLOCKED", reasons: ["Task HEAD differs from the recorded checkpoint."],
+    });
     if (String(url).endsWith("/checkpoint-preview")) return response(url, {
       tracked_changes: [], untracked_files: [], branch: "agent/task-task-1", commit_sha: "a".repeat(40), state_token: "clean",
     });
@@ -344,8 +638,8 @@ test("task-branch changes do not merge until a current passing Validation exists
       task: task("REVIEW", "INVESTIGATION_COMPLETE"), queue: null, onClose() {}, onChanged() {},
     })));
 
-  assert.match(testing.screen.getByText(/validation required/i).textContent, /validation required/i,
-    "the UI should explain why merge is unavailable");
+  assert.match((await testing.screen.findByText(/Task HEAD differs from the recorded checkpoint/i)).textContent,
+    /Task HEAD differs from the recorded checkpoint/i, "the UI should explain why Git readiness is blocked");
   const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
   assert.equal(mergeButton.disabled, true, "branch changes alone are not merge authorization");
   assert.equal(testing.screen.queryByRole("button", { name: "Mark as done" }), null);
@@ -514,10 +808,10 @@ test("explicit reuse starts a new run linked to the unresolved source input", as
   testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Reuse / Send again" }));
   const startDialog = testing.screen.getByRole("dialog", { name: "Start a run" });
   assert.equal(testing.within(startDialog).getByLabelText("Initial prompt").value, unresolved.content);
-  assert.equal(testing.within(startDialog).getByRole("radio", { name: "Implementation" }).checked, true);
+  assert.equal(testing.within(startDialog).queryByRole("radio", { name: /Investigation|Implementation/ }), null);
   testing.fireEvent.click(testing.within(startDialog).getByRole("button", { name: "Send" }));
   const confirm = testing.screen.getByRole("alertdialog", { name: "Confirm run" });
-  assert.match(confirm.textContent, /without an investigation run/);
+  assert.doesNotMatch(confirm.textContent, /without an investigation run|Investigation|Implementation/);
   testing.fireEvent.click(testing.within(confirm).getByRole("button", { name: "Confirm and queue" }));
 
   await testing.waitFor(() => assert.ok(requests.some((request) => String(request.url).endsWith("/queue"))));
@@ -527,14 +821,15 @@ test("explicit reuse starts a new run linked to the unresolved source input", as
   assert.equal(JSON.parse(queueRequest.options.body).reused_from_input_id, unresolved.id);
 });
 
-test("Commit always requires confirmation, including tracked-only changes", async (t) => {
+test("Update checkpoint requires confirmation against the exact displayed diff", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const requests = [];
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url, options });
     if (String(url).endsWith("/checkpoint-preview")) return response(url, {
-      tracked_changes: ["src/retry.ts"], untracked_files: [], commit_sha: "a".repeat(40),
+      tracked_changes: ["src/retry.ts"], untracked_files: [], branch: "agent/task-task-1", commit_sha: "a".repeat(40),
+      state_token: "tracked-state", diff: "diff --git a/src/retry.ts b/src/retry.ts\n-old guard\n+new guard",
     });
     if (String(url).endsWith("/live/history")) return response(url, history());
     if (String(url).endsWith("/checkpoint")) return response(url, { commit_sha: "b".repeat(40) });
@@ -543,10 +838,12 @@ test("Commit always requires confirmation, including tracked-only changes", asyn
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
 
-  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Commit changes" }));
+  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Update checkpoint" }));
   const confirmation = await testing.screen.findByRole("dialog", { name: "Confirm checkpoint" });
   assert.match(confirmation.textContent, /src\/retry.ts/);
+  assert.match(confirmation.textContent, /new guard/);
   assert.equal(requests.some((request) => String(request.url).endsWith("/checkpoint")), false);
+  assert.ok(testing.within(confirmation).getByRole("button", { name: "Update checkpoint" }));
   testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "Cancel" }));
   assert.equal(requests.some((request) => String(request.url).endsWith("/checkpoint")), false);
 });
@@ -558,6 +855,7 @@ test("untracked-file confirmation is explicit; checkpointing alone does not enab
   const preview = {
     tracked_changes: ["src/retry.ts"], untracked_files: ["tests/retry.test.ts"],
     branch: "agent/task-task-1", commit_sha: "a".repeat(40), state_token: "preview-state",
+    diff: "diff --git a/src/retry.ts b/src/retry.ts\n-old guard\n+new guard\ndiff --git a/tests/retry.test.ts b/tests/retry.test.ts\n+new test",
   };
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url, options });
@@ -570,17 +868,19 @@ test("untracked-file confirmation is explicit; checkpointing alone does not enab
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
 
-  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Commit changes" }));
+  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Update checkpoint" }));
   const confirmation = await testing.screen.findByRole("dialog", { name: "Confirm checkpoint" });
   assert.match(confirmation.textContent, /tests\/retry.test.ts/);
-  assert.equal(testing.within(confirmation).getByRole("button", { name: "Include files and commit" }).disabled, false);
+  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "tests\/retry.test.ts" }));
+  await testing.waitFor(() => assert.match(confirmation.textContent, /new test/));
+  assert.equal(testing.within(confirmation).getByRole("button", { name: "Include files and update checkpoint" }).disabled, false);
   testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "Cancel" }));
   assert.equal(requests.some((request) => String(request.url).endsWith("/checkpoint")), false);
-  await testing.waitFor(() => assert.equal(testing.screen.getByRole("button", { name: "Commit changes" }).disabled, false));
+  await testing.waitFor(() => assert.equal(testing.screen.getByRole("button", { name: "Update checkpoint" }).disabled, false));
 
-  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Commit changes" }));
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Update checkpoint" }));
   const refreshedConfirmation = await testing.screen.findByRole("dialog", { name: "Confirm checkpoint" });
-  testing.fireEvent.click(testing.within(refreshedConfirmation).getByRole("button", { name: "Include files and commit" }));
+  testing.fireEvent.click(testing.within(refreshedConfirmation).getByRole("button", { name: "Include files and update checkpoint" }));
   await testing.waitFor(() => assert.ok(requests.some((request) => String(request.url).endsWith("/checkpoint"))));
   const post = requests.find((request) => String(request.url).endsWith("/checkpoint"));
   assert.deepEqual(JSON.parse(post.options.body), {
@@ -592,6 +892,56 @@ test("untracked-file confirmation is explicit; checkpointing alone does not enab
   });
   const mergeBack = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
   assert.equal(mergeBack.disabled, true, "checkpoint success without a current Validation never enables merge");
+});
+
+test("stale checkpoint confirmation refreshes the preview and requires a new confirmation", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const requests = [];
+  let previewReads = 0;
+  let checkpointPosts = 0;
+  const initialPreview = {
+    tracked_changes: ["src/comment.ts"], untracked_files: [], branch: "agent/task-1", commit_sha: "a".repeat(40),
+    state_token: "initial-state", diff: "diff --git a/src/comment.ts b/src/comment.ts\n-old comment\n+agent comment",
+  };
+  const latestPreview = {
+    ...initialPreview, state_token: "latest-state",
+    diff: "diff --git a/src/comment.ts b/src/comment.ts\n-old comment\n+user-edited comment",
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    requests.push({ path, options });
+    if (path.endsWith("/checkpoint-preview")) {
+      previewReads++;
+      return response(url, previewReads <= 2 ? initialPreview : latestPreview);
+    }
+    if (path.endsWith("/live/history")) return response(url, history());
+    if (path.endsWith("/checkpoint")) {
+      checkpointPosts++;
+      return checkpointPosts === 1
+        ? new Response(JSON.stringify({ error: "Task worktree or Git state changed; review the checkpoint contents again." }),
+          { status: 409, headers: { "content-type": "application/json" } })
+        : response(url, { commit_sha: "b".repeat(40) });
+    }
+    return response(url, []);
+  };
+
+  testing.render(createElement(ToastProvider, null,
+    createElement(TicketPanel, { task: task("REVIEW", "WORK_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
+  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Update checkpoint" }));
+  let confirmation = await testing.screen.findByRole("dialog", { name: "Confirm checkpoint" });
+  assert.match(confirmation.textContent, /agent comment/);
+  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "Update checkpoint" }));
+
+  await testing.waitFor(() => assert.equal(checkpointPosts, 1));
+  confirmation = await testing.screen.findByRole("dialog", { name: "Confirm checkpoint" });
+  await testing.waitFor(() => assert.match(confirmation.textContent, /user-edited comment/));
+  assert.doesNotMatch(confirmation.textContent, /agent comment/);
+  assert.equal(checkpointPosts, 1, "refreshing a stale preview must not retry the commit automatically");
+  testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: "Update checkpoint" }));
+  await testing.waitFor(() => assert.equal(checkpointPosts, 2));
+  const posts = requests.filter((request) => request.path.endsWith("/checkpoint"));
+  assert.equal(JSON.parse(posts[1].options.body).state_token, "latest-state");
 });
 
 test("concurrent ticket panels render only their own conversation history", async (t) => {
@@ -664,62 +1014,54 @@ test("a late checkpoint-diff response cannot leak across a ticket switch", async
   assert.doesNotMatch(dialog.textContent, /first-only\.ts/);
 });
 
-test("eligible Implementation Complete task exposes Validate and queues an explicit validation", async (t) => {
+test("Review exposes a read-only Check sync action instead of agent Validation", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
   const requests = [];
+  let checkResponse = { status: "IN_SYNC", in_sync: true, base_sha: "b".repeat(40),
+    recorded_base_sha: "b".repeat(40), task_sha: "c".repeat(40), branch: "agent/task-1", base_moved: false,
+    checked_at: "2026-01-01T00:00:00.000Z", reasons: [] };
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url: String(url), options });
     if (String(url).endsWith("/live/history")) return response(url, history());
     if (String(url).endsWith("/checkpoint-preview")) return response(url, { tracked_changes: [], untracked_files: [],
       branch: "agent/task-1", commit_sha: "c".repeat(40), state_token: "clean" });
     if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
-    if (String(url).endsWith("/validation")) return response(url, { run_id: "validation-1", status: "QUEUED" });
+    if (String(url).endsWith("/check-sync")) return response(url, checkResponse);
     return response(url, []);
   };
   const eligibleTask = { ...task("REVIEW", "IMPLEMENTATION_COMPLETE"), base_commit_sha: "b".repeat(40),
     latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: eligibleTask, queue: null, onClose() {}, onChanged() {} })));
-  const validate = await testing.screen.findByRole("button", { name: "Validate" });
-  assert.equal(validate.disabled, false);
-  testing.fireEvent.click(validate);
-  await testing.waitFor(() => assert.ok(requests.some((request) => request.url.endsWith("/validation"))));
-  const post = requests.find((request) => request.url.endsWith("/validation"));
-  assert.equal(post.options.method, "POST");
-  assert.deepEqual(JSON.parse(post.options.body), {});
-  await testing.screen.findByText(/validation.*queued/i);
+  assert.equal(testing.screen.queryByRole("button", { name: "Validate" }), null);
+  const check = await testing.screen.findByRole("button", { name: "Check sync" });
+  assert.equal(check.disabled, false);
+  assert.equal(requests.some((request) => request.url.endsWith("/check-sync")), false,
+    "the readiness check waits for an explicit user action");
+  testing.fireEvent.click(check);
+  await testing.waitFor(() => assert.ok(requests.some((request) => request.url.endsWith("/check-sync"))));
+  const get = requests.find((request) => request.url.endsWith("/check-sync"));
+  assert.equal(get.options.method ?? "GET", "GET");
+  assert.equal(requests.some((request) => request.url.endsWith("/validation")), false,
+    "Check sync must not start an agent Validation run");
+  const checked = await testing.screen.findByRole("status");
+  assert.match(checked.textContent, /Git.*in sync/i);
+  assert.match(checked.textContent, /Git-state check only, not application testing or code review/i);
+
+  checkResponse = { status: "STALE", in_sync: false, base_sha: "d".repeat(40), recorded_base_sha: "b".repeat(40),
+    task_sha: "c".repeat(40), branch: "agent/task-1", base_moved: true,
+    checked_at: "2026-01-01T00:05:00.000Z", reasons: ["The current base is not an ancestor."] };
+  testing.fireEvent.click(check);
+  const stale = await testing.screen.findByRole("alert");
+  assert.match(stale.textContent, /current base d{12} is not in the task history/i);
+  assert.match(stale.textContent, /base moved from recorded b{12} to d{12}/i);
+  assert.equal(requests.filter((request) => request.url.endsWith("/check-sync")).length, 2);
 });
 
-test("failed Validation retries require a clean worktree at the saved checkpoint", async (t) => {
-  const testing = await setupDom(t);
-  const { TicketPanel, ToastProvider } = await loadComponents(t);
-  const originalFetch = globalThis.fetch;
-  t.after(() => { globalThis.fetch = originalFetch; });
-  globalThis.fetch = async (url) => {
-    if (String(url).endsWith("/live/history")) return response(url, history());
-    if (String(url).endsWith("/checkpoint-preview")) return response(url, {
-      tracked_changes: String(url).includes("task-dirty") ? ["changed.ts"] : [],
-      untracked_files: [], branch: "agent/task-1",
-      commit_sha: String(url).includes("task-stale") ? "d".repeat(40) : "c".repeat(40), state_token: "clean",
-    });
-    if (String(url).endsWith("/complete-preview")) return response(url, { ready: false, reason: null });
-    return response(url, []);
-  };
-  const baseTask = { ...task("REVIEW", "VALIDATION_FAILED"), base_commit_sha: "b".repeat(40),
-    latest_task_commit_sha: "c".repeat(40), worktree_path: "C:/work/task-1", base_branch: "main" };
-  for (const [id, shouldEnable] of [["task-clean", true], ["task-dirty", false], ["task-stale", false]]) {
-    const view = testing.render(createElement(ToastProvider, null,
-      createElement(TicketPanel, { task: { ...baseTask, id }, queue: null, onClose() {}, onChanged() {} })));
-    const validate = await testing.screen.findByRole("button", { name: "Validate" });
-    await testing.waitFor(() => assert.equal(validate.disabled, !shouldEnable));
-    view.unmount();
-  }
-});
-
-test("Validate is unavailable for ineligible tasks, missing checkpoints, or conflicting queued work", async (t) => {
+test("Review never exposes the agent Validate action", async (t) => {
   const testing = await setupDom(t);
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const originalFetch = globalThis.fetch;
@@ -736,15 +1078,15 @@ test("Validate is unavailable for ineligible tasks, missing checkpoints, or conf
   const cases = [
     { task: { ...baseTask, review_tag: "INVESTIGATION_COMPLETE" }, queue: null },
     { task: { ...baseTask, latest_task_commit_sha: null }, queue: null },
-    { task: { ...baseTask, review_tag: "VALIDATION_ISSUES" }, queue: null },
+    { task: { ...baseTask, review_tag: "VALIDATION_FAILED" }, queue: null },
     { task: baseTask, queue: { jobs: [{ task_id: "task-3", run_id: "running", run_status: "RUNNING" }] } },
   ];
   for (const [index, item] of cases.entries()) {
     const view = testing.render(createElement(ToastProvider, null,
       createElement(TicketPanel, { task: { ...item.task, id: `task-${index}` }, queue: item.queue,
         onClose() {}, onChanged() {} })));
-    const action = testing.screen.queryByRole("button", { name: "Validate" });
-    assert.ok(!action || action.disabled, `ineligible case ${index} must not offer enabled validation`);
+    assert.equal(testing.screen.queryByRole("button", { name: "Validate" }), null,
+      `Review case ${index} must not offer agent Validation`);
     view.unmount();
   }
 });

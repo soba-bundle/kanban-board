@@ -69,6 +69,8 @@ test("checkpoint API requires the exact untracked-file approval and persists the
   const preview = await app.inject({ method: "GET", url: "/api/tasks/t/checkpoint-preview" });
   assert.equal(preview.statusCode, 200);
   assert.deepEqual(preview.json().untracked_files, ["new.txt"]);
+  assert.match(preview.json().diff, /new file/,
+    "review preview must include the uncheckpointed patch, including untracked file contents");
 
   const declined = await app.inject({ method: "POST", url: "/api/tasks/t/checkpoint", payload: confirmation(preview.json(), []) });
   assert.equal(declined.statusCode, 409);
@@ -206,7 +208,7 @@ test("checkpoint lock rejects concurrent start and delete operations for the sam
   await entered;
   const [start, deletion, duplicate] = await Promise.all([
     app.inject({ method: "POST", url: "/api/tasks/t/queue", payload: {
-      task_id: "t", stage: "IMPLEMENTATION", prompt: "continue", idempotency_key: "start-during-checkpoint",
+      task_id: "t", prompt: "continue", idempotency_key: "start-during-checkpoint",
     } }),
     app.inject({ method: "DELETE", url: "/api/tasks/t" }),
     app.inject({ method: "POST", url: "/api/tasks/t/checkpoint", payload: confirmation(preview.json()) }),

@@ -27,14 +27,14 @@ export function QueuePanel({ queue, loading, busyId, onMove, onRemove, onStop }:
         <div className="queue-jobs">
           {queue.jobs.map((job) => {
             const active = job.job_status === "CLAIMED";
-            const agent = job.stage === "INVESTIGATION" ? "Investigator" : "Worker";
+            const agent = "Worker";
             const position = queued.findIndex((item) => item.job_id === job.job_id) + 1;
             return (
               <article className={`queue-item ${active ? "queue-item-active" : ""}`} key={job.job_id}>
                 <span className={`queue-position ${active ? "position-active" : ""}`}>{active ? <span className="pulse-dot" /> : String(job.queue_position ?? position).padStart(2, "0")}</span>
                 <div className="queue-item-main">
                   <div className="queue-task-title"><strong>{job.title}</strong><span className={`queue-status ${active ? "status-active" : ""}`}>{active ? (job.run_status === "RUNNING" ? "Running" : "Starting") : "Queued"}</span></div>
-                  <div className="queue-agent"><Avatar name={agent} size="small" /><span>{agent}</span><span className="queue-separator">·</span><span>{job.stage === "INVESTIGATION" ? "Investigation" : "Implementation"}</span></div>
+                  <div className="queue-agent"><Avatar name={agent} size="small" /><span>{agent}</span><span className="queue-separator">·</span><span>Work</span></div>
                 </div>
                 {active ? (
                   <button className="button-stop" disabled={busyId !== null} onClick={() => onStop(job)}>

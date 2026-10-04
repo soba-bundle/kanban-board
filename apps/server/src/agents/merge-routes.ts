@@ -7,13 +7,18 @@ function errorResponse(reply: { code(status: number): { send(body: unknown): unk
 }
 
 export function registerMergeRoutes(app: FastifyInstance, merge: Pick<MergeManager,
-  "preview" | "start" | "abort" | "retry" | "viewConflicts">) {
+  "checkSync" | "preview" | "start" | "abort" | "retry" | "viewConflicts">) {
+  app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/check-sync", async (request, reply) => {
+    try { return await merge.checkSync(request.params.taskId); }
+    catch (error) { return errorResponse(reply, error); }
+  });
   app.get<{ Params: { taskId: string } }>("/api/tasks/:taskId/merge-preview", async (request, reply) => {
     try { return await merge.preview(request.params.taskId); }
     catch (error) { return errorResponse(reply, error); }
   });
   app.post<{ Params: { taskId: string }; Body: { confirmed?: boolean; preview_id?: string } }>("/api/tasks/:taskId/merge", async (request, reply) => {
     if (request.body?.confirmed !== true) return reply.code(400).send({ error: "Explicit merge approval is required." });
+    if (!request.body.preview_id) return reply.code(400).send({ error: "Refresh the merge preview and confirm the current Check sync state." });
     try {
       const input = request.body.preview_id === undefined
         ? { confirmed: true }

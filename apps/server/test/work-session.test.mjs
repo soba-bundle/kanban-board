@@ -38,7 +38,7 @@ function makeDb(rootPath, taskWorktree) {
   return db;
 }
 
-test("hosted AgentSession blocks write/edit for Investigation and Validation but permits them for Implementation", async (t) => {
+test("hosted work AgentSession permits edits and does not expose handover submission", async (t) => {
   const agentDir = mkdtempSync(join(tmpdir(), "kanban-stage-tools-agent-"));
   const sessionDir = mkdtempSync(join(tmpdir(), "kanban-stage-tools-session-"));
   const rootPath = mkdtempSync(join(tmpdir(), "kanban-stage-tools-root-"));
@@ -71,6 +71,8 @@ test("hosted AgentSession blocks write/edit for Investigation and Validation but
 
   let sequence = 0;
   async function requestTool(stage, name) {
+    writeFileSync(writeTarget, "original write\n");
+    writeFileSync(editTarget, "original edit\n");
     const runId = `run-${++sequence}`;
     db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
       VALUES (?, 'task-1', ?, ?, 'RUNNING')`).run(runId, stage, sequence);
@@ -91,31 +93,17 @@ test("hosted AgentSession blocks write/edit for Investigation and Validation but
     return { activeToolsDuringCall, activeToolsAfterRun: session.getActiveToolNames(), callNumber };
   }
 
-  for (const stage of ["INVESTIGATION", "VALIDATION_REVIEW"]) {
+  for (const stage of ["WORK"]) {
     for (const name of ["write", "edit"]) {
+      const { activeToolsDuringCall } = await requestTool(stage, name);
+      assert.ok(activeToolsDuringCall.includes("write"), `${stage} must retain write`);
+      assert.ok(activeToolsDuringCall.includes("edit"), `${stage} must retain edit`);
+      assert.ok(!activeToolsDuringCall.includes("submit_handover"), "WORK must not expose handover submission");
+      assert.ok(activeToolsDuringCall.includes("kanban_questionnaire"), "WORK retains the Human Request tool");
       const target = name === "write" ? writeTarget : editTarget;
-      const original = name === "write" ? "original write\n" : "original edit\n";
-      const { activeToolsDuringCall, activeToolsAfterRun } = await requestTool(stage, name);
-      assert.ok(activeToolsAfterRun.includes("write"), "the idle session must restore its configured tools after a run");
-      assert.ok(activeToolsAfterRun.includes("edit"), "the idle session must restore its configured tools after a run");
-      assert.ok(!activeToolsDuringCall.includes("write"), `${stage} session must hide write`);
-      assert.ok(!activeToolsDuringCall.includes("edit"), `${stage} session must hide edit`);
-      if (stage === "VALIDATION_REVIEW") {
-        assert.ok(!activeToolsDuringCall.includes("kanban_questionnaire"), "Validation must not park on a Human Request");
-      } else {
-        assert.ok(activeToolsDuringCall.includes("kanban_questionnaire"), "Investigation must retain its Human Request tool");
-      }
-      assert.equal(readFileSync(target, "utf8"), original, `${stage} ${name} call must not mutate the file`);
+      assert.equal(readFileSync(target, "utf8"), "changed by model\n", `${stage} ${name} should edit the task worktree`);
     }
   }
-
-  for (const name of ["write", "edit"]) {
-    const { activeToolsDuringCall } = await requestTool("IMPLEMENTATION", name);
-    assert.ok(activeToolsDuringCall.includes("write"), "Implementation must retain write");
-    assert.ok(activeToolsDuringCall.includes("edit"), "Implementation must retain edit");
-  }
-  assert.equal(readFileSync(writeTarget, "utf8"), "changed by model\n");
-  assert.equal(readFileSync(editTarget, "utf8"), "changed by model\n");
   assert.ok(existsSync(writeTarget));
   assert.ok(existsSync(editTarget));
 });

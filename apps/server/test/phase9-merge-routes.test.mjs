@@ -19,14 +19,13 @@ function register(t, mergeService) {
   return app;
 }
 
-test("merge preview reports the exact validation and target-base state without integrating", async (t) => {
+test("merge preview reports exact Check sync SHAs without integrating", async (t) => {
   const calls = [];
   const app = register(t, {
     async preview(taskId) {
       calls.push(taskId);
-      return { eligible: true, reason: null, action: "FAST_FORWARD", base_branch: "main",
-        validated_base_sha: "b".repeat(40), live_base_sha: "b".repeat(40), candidate_sha: "c".repeat(40),
-        validation_snapshot_id: "snapshot-1" };
+      return { eligible: true, sync_status: "IN_SYNC", base_branch: "main", checked_base_sha: "b".repeat(40),
+        task_sha: "c".repeat(40), candidate_sha: "c".repeat(40), preview_id: "preview-1" };
     },
   });
 
@@ -34,6 +33,23 @@ test("merge preview reports the exact validation and target-base state without i
   assert.equal(response.statusCode, 200);
   assert.equal(response.json().eligible, true);
   assert.equal(response.json().candidate_sha, "c".repeat(40));
+  assert.equal(response.json().sync_status, "IN_SYNC");
+  assert.equal(response.json().preview_id, "preview-1");
+  assert.deepEqual(calls, ["task-1"]);
+});
+
+test("Check sync is a read-only GET and reports Git readiness without Validation", async (t) => {
+  const calls = [];
+  const app = register(t, {
+    async checkSync(taskId) {
+      calls.push(taskId);
+      return { status: "IN_SYNC", in_sync: true, base_sha: "b".repeat(40), task_sha: "c".repeat(40),
+        base_moved: false, checked_at: "2026-01-01T00:00:00.000Z", reasons: [] };
+    },
+  });
+  const response = await app.inject({ method: "GET", url: "/api/tasks/task-1/check-sync" });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().in_sync, true);
   assert.deepEqual(calls, ["task-1"]);
 });
 
@@ -49,17 +65,22 @@ test("merge start requires explicit approval and returns the persisted attempt s
   const missingApproval = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge", payload: {} });
   assert.equal(missingApproval.statusCode, 400);
   assert.deepEqual(calls, []);
-  const approved = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge", payload: { confirmed: true } });
+  const missingPreview = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge", payload: { confirmed: true } });
+  assert.equal(missingPreview.statusCode, 400);
+  assert.deepEqual(calls, []);
+  const approved = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge",
+    payload: { confirmed: true, preview_id: "preview-1" } });
   assert.equal(approved.statusCode, 202);
   assert.deepEqual(approved.json(), { merge_attempt_id: "attempt-1", status: "MERGE_QUEUED" });
-  assert.deepEqual(calls, [{ taskId: "task-1", input: { confirmed: true } }]);
+  assert.deepEqual(calls, [{ taskId: "task-1", input: { confirmed: true, preview_id: "preview-1" } }]);
 });
 
 test("merge start maps stale/ineligible and operation-lock conflicts without accepting approval", async (t) => {
   const app = register(t, {
-    async start() { throw Object.assign(new Error("Validation snapshot is stale."), { statusCode: 409 }); },
+    async start() { throw Object.assign(new Error("Check sync is stale; Sync with main and try again."), { statusCode: 409 }); },
   });
-  const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge", payload: { confirmed: true } });
+  const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/merge",
+    payload: { confirmed: true, preview_id: "preview-1" } });
   assert.equal(response.statusCode, 409);
   assert.match(response.json().error, /stale/i);
 });

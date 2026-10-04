@@ -161,6 +161,34 @@ export async function getDiff(cwd: string, from?: string, to?: string): Promise<
   return result.stdout;
 }
 
+const MAX_CHECKPOINT_DIFF_BYTES = 10 * 1024 * 1024;
+
+export async function getUncheckpointedDiff(cwd: string, status: GitFileStatus[]): Promise<string> {
+  const chunks: string[] = [];
+  let totalBytes = 0;
+  const add = (diff: string): void => {
+    totalBytes += Buffer.byteLength(diff);
+    if (totalBytes > MAX_CHECKPOINT_DIFF_BYTES) {
+      throw new Error("Uncheckpointed diff exceeds the 10 MB preview limit.");
+    }
+    if (diff) chunks.push(diff);
+  };
+
+  if (status.some((file) => !file.untracked)) add(await getDiff(cwd, "HEAD"));
+  for (const file of status) {
+    if (!file.untracked) continue;
+    const result = await runGit(["diff", "--no-index", "--no-ext-diff", "--no-color", "--", "/dev/null", file.path], { cwd });
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(result.stderr.trim() || `Unable to preview untracked file ${file.path}.`);
+    }
+    if (result.exitCode === 1 && !result.stdout && result.stderr.trim()) {
+      throw new Error(result.stderr.trim());
+    }
+    add(result.stdout);
+  }
+  return chunks.join("");
+}
+
 export async function getChangedFiles(cwd: string, from?: string, to?: string): Promise<string[]> {
   if (from) {
     const args = ["diff", "--name-only", "-z", from];

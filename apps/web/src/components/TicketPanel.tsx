@@ -6,13 +6,16 @@ import { StartTaskDialog } from "./StartTaskDialog.js";
 import { useToast } from "./ToastContext.js";
 import { completeTask, loadTaskCompletionStatus } from "../board-api.js";
 import {
+  type TaskSyncCheck,
+  type TaskSyncRecovery,
+  abortTaskSync,
+  checkTaskSync,
   answerHumanRequest,
   loadHumanRequests,
   loadLiveHistory,
   loadRuns,
   openRunEvents,
   steerRun,
-  startValidation,
   stopHumanRequest,
   loadCheckpointPreview,
   createCheckpoint,
@@ -20,6 +23,10 @@ import {
   loadMergePreview,
   startMerge,
   mergeAction,
+  syncTaskWithBase,
+  loadTaskSyncRecovery,
+  viewTaskSyncConflicts,
+  retryTaskSync,
 } from "../ticket-api.js";
 
 type Tab = "runs" | "live";
@@ -33,6 +40,7 @@ interface TicketPanelProps {
 
 /** How often the panel re-reads the board while it has queued or active work. */
 const ACTIVE_POLL_MS = 3000;
+const DEVELOPER_TEST_REMINDER = "Before merging, test the app in the task worktree and review the implemented code and diff. Check sync verifies Git state only; it does not test the app.";
 
 function formatProvisional(snapshot: LiveHistorySnapshot): string {
   const provisional = snapshot.provisional_events.map(describeEvent).filter((text): text is string => !!text).join("");
@@ -111,13 +119,13 @@ function describeEvent(event: LiveEvent): string | null {
 
 export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProps) {
   const [runs, setRuns] = useState<TaskRunSummary[]>([]);
+  const [runsTaskId, setRunsTaskId] = useState<string | null>(null);
   const [humanRequests, setHumanRequests] = useState<HumanRequest[]>([]);
   const [humanRequestError, setHumanRequestError] = useState<string | null>(null);
   const [humanRequestBusy, setHumanRequestBusy] = useState(false);
   const [tab, setTab] = useState<Tab>("live");
   const [draft, setDraft] = useState("");
   const [draftInputId, setDraftInputId] = useState<string | null>(null);
-  const [startStage, setStartStage] = useState<"INVESTIGATION" | "IMPLEMENTATION" | null>(null);
   const [reuseInputId, setReuseInputId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [startingRun, setStartingRun] = useState(false);
@@ -128,7 +136,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [historyRecoveryFailed, setHistoryRecoveryFailed] = useState(false);
   const [historyRetry, setHistoryRetry] = useState(0);
   const [checkpointPreview, setCheckpointPreview] = useState<CheckpointPreview | null>(null);
+  const [selectedCheckpointFile, setSelectedCheckpointFile] = useState(0);
   const [checkpointStatus, setCheckpointStatus] = useState<CheckpointPreview | null>(null);
+  const [checkpointStatusTaskId, setCheckpointStatusTaskId] = useState<string | null>(null);
+  const [reviewDiffOpen, setReviewDiffOpen] = useState(false);
+  const [selectedReviewFile, setSelectedReviewFile] = useState(0);
   const [checkpointStatusError, setCheckpointStatusError] = useState<string | null>(null);
   const [completionStatus, setCompletionStatus] = useState<{
     ready: boolean; reason: "WORKTREE_CHANGES" | "BRANCH_CHANGES" | "GIT_STATE_UNAVAILABLE" | null;
@@ -141,8 +153,17 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [mergePreview, setMergePreview] = useState<Awaited<ReturnType<typeof loadMergePreview>> | null>(null);
   const [mergeConfirmation, setMergeConfirmation] = useState(false);
   const [mergeStatus, setMergeStatus] = useState<string | null>(null);
+  const [syncResult, setSyncResult] = useState<{
+    taskId: string; status: "SYNCED"; synced_base_sha: string; candidate_sha: string;
+  } | null>(null);
+  const [syncCheck, setSyncCheck] = useState<TaskSyncCheck | null>(null);
+  const [syncCheckTaskId, setSyncCheckTaskId] = useState<string | null>(null);
+  const [syncCheckError, setSyncCheckError] = useState<string | null>(null);
+  const [syncRecovery, setSyncRecovery] = useState<TaskSyncRecovery | null>(null);
+  const [syncRecoveryTaskId, setSyncRecoveryTaskId] = useState<string | null>(null);
+  const [syncRecoveryError, setSyncRecoveryError] = useState<string | null>(null);
+  const [syncAbortConfirmation, setSyncAbortConfirmation] = useState(false);
   const diffRequestIdRef = useRef(0);
-  const [validationNotice, setValidationNotice] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
   const liveCursorRef = useRef(0);
@@ -153,35 +174,49 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
   const runningRunId = activeJob?.run_status === "RUNNING" ? activeJob.run_id : null;
   const canStartRun = task.workflow_state === "TODO" || (task.workflow_state === "REVIEW" &&
-    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? ""));
+    ["WORK_COMPLETE", "INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_ISSUES", "VALIDATION_FAILED",
+      "READY_TO_MERGE", "RUN_FAILED", "INTERRUPTED"].includes(task.review_tag ?? ""));
+  const currentCheckpointStatus = checkpointStatusTaskId === task.id ? checkpointStatus : null;
+  const currentRuns = runsTaskId === task.id ? runs : [];
   const canReviewAction = task.workflow_state === "REVIEW" &&
-    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED", "READY_TO_MERGE", "MERGE_CONFLICT"].includes(task.review_tag ?? "");
+    ["WORK_COMPLETE", "INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "RUN_FAILED", "INTERRUPTED", "VALIDATION_FAILED", "VALIDATION_ISSUES", "READY_TO_MERGE", "MERGE_CONFLICT"].includes(task.review_tag ?? "");
   const canCheckpoint = task.workflow_state === "REVIEW" &&
-    ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "");
-  const needsCheckpointPreview = canCheckpoint || (task.workflow_state === "REVIEW" && task.review_tag === "VALIDATION_FAILED");
+    ["WORK_COMPLETE", "INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED",
+      "VALIDATION_ISSUES", "READY_TO_MERGE"].includes(task.review_tag ?? "");
+  const needsCheckpointPreview = canCheckpoint;
   const latestCheckpointSha = checkpointedSha ?? task.latest_task_commit_sha;
-  const checkpointHasChanges = !!checkpointStatus &&
-    (checkpointStatus.tracked_changes.length > 0 || checkpointStatus.untracked_files.length > 0);
-  const canValidateTag = ["IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "");
-  const validationCheckpointClean = !!checkpointStatus && !checkpointHasChanges &&
-    checkpointStatus.commit_sha === latestCheckpointSha;
-  const canValidate = task.workflow_state === "REVIEW" && canValidateTag && !!task.base_commit_sha &&
-    !!latestCheckpointSha && !!task.worktree_path && !!task.base_branch && !activeJob && validationCheckpointClean;
-  const showValidateAction = canValidateTag && (checkpointStatus !== null || checkpointStatusError !== null);
-  const latestValidationRun = runs.slice().reverse().find((item) => item.stage === "VALIDATION_REVIEW");
-  const visibleReviewTag = task.review_tag === "READY_TO_MERGE" &&
-    (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true ||
-      latestValidationRun?.validation_result?.active === false)
-    ? "IMPLEMENTATION_COMPLETE" : task.review_tag;
+  const checkpointHasChanges = !!currentCheckpointStatus &&
+    (currentCheckpointStatus.tracked_changes.length > 0 || currentCheckpointStatus.untracked_files.length > 0);
+  const visibleReviewTag = ["READY_TO_MERGE", "VALIDATION_FAILED", "VALIDATION_ISSUES"].includes(task.review_tag ?? "")
+    ? "WORK_COMPLETE" : task.review_tag;
   const showMergeControls = task.workflow_state === "REVIEW";
+  const currentSyncResult = syncResult?.taskId === task.id ? syncResult : null;
+  const currentSyncCheck = syncCheckTaskId === task.id ? syncCheck : null;
+  const currentSyncRecovery = syncRecoveryTaskId === task.id ? syncRecovery : null;
+  const latestWorkRun = currentRuns.slice().reverse().find((item) => item.status === "COMPLETED" && item.stage !== "VALIDATION_REVIEW");
+  const ordinaryResponse = latestWorkRun && liveHistory?.task_id === task.id
+    ? liveHistory.entries.filter((entry) => entry.run_id === latestWorkRun.id && entry.role === "assistant")
+      .map(textContent).filter(Boolean).slice(-1)[0] ?? ""
+    : "";
+  const reviewFiles = currentCheckpointStatus
+    ? [...currentCheckpointStatus.tracked_changes, ...currentCheckpointStatus.untracked_files]
+    : [];
+  const reviewPatches = currentCheckpointStatus ? diffSections(currentCheckpointStatus.diff ?? "") : [];
+  const selectedReviewPatch = reviewPatches[selectedReviewFile] ?? "";
+  const checkpointPreviewFiles = checkpointPreview
+    ? [...checkpointPreview.tracked_changes, ...checkpointPreview.untracked_files]
+    : [];
+  const checkpointPreviewPatches = checkpointPreview ? diffSections(checkpointPreview.diff ?? "") : [];
+  const selectedCheckpointPatch = checkpointPreviewPatches[selectedCheckpointFile] ?? "";
   const diffPatches = checkpointDiff ? diffSections(checkpointDiff.diff) : [];
   const selectedDiffPatch = checkpointDiff?.files.length ? diffPatches[selectedDiffFile] ?? "" : checkpointDiff?.diff ?? "";
 
   const refresh = useCallback(async () => {
     try {
       const nextRuns = await loadRuns(task.id);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || liveTaskIdRef.current !== task.id) return;
       setRuns(nextRuns);
+      setRunsTaskId(task.id);
       setError(null);
     } catch (caught) {
       if (mountedRef.current) setError(caught instanceof Error ? caught.message : String(caught));
@@ -224,7 +259,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setLiveLog(formatProvisional(snapshot));
   }
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    setRuns([]);
+    setRunsTaskId(null);
+    void refresh();
+  }, [refresh]);
 
   useEffect(() => {
     if (!activeJob && !runs.some((item) => item.status === "QUEUED" || item.status === "RUNNING")) return;
@@ -258,6 +297,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   useEffect(() => {
     setCheckpointedSha(null);
     setCheckpointStatus(null);
+    setCheckpointStatusTaskId(null);
     setCheckpointStatusError(null);
     if (!needsCheckpointPreview) return;
     let current = true;
@@ -265,11 +305,13 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
       void loadCheckpointPreview(task.id).then((preview) => {
         if (current) {
           setCheckpointStatus(preview);
+          setCheckpointStatusTaskId(task.id);
           setCheckpointStatusError(null);
         }
       }).catch((caught) => {
         if (current) {
           setCheckpointStatus(null);
+          setCheckpointStatusTaskId(task.id);
           setCheckpointStatusError(caught instanceof Error ? caught.message : String(caught));
         }
       });
@@ -278,6 +320,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     const timer = setInterval(load, 5000);
     return () => { current = false; clearInterval(timer); };
   }, [needsCheckpointPreview, task.id, task.latest_task_commit_sha]);
+
+  useEffect(() => {
+    setReviewDiffOpen(false);
+    setSelectedReviewFile(0);
+  }, [task.id]);
 
   useEffect(() => {
     let current = true;
@@ -291,6 +338,30 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
       .catch((caught) => { if (current) setMergePreview({ eligible: false, reason: caught instanceof Error ? caught.message : String(caught) }); });
     return () => { current = false; };
   }, [task.id, task.workflow_state, task.base_branch, task.base_commit_sha, task.latest_task_commit_sha, task.review_tag]);
+
+  useEffect(() => {
+    setSyncCheck(null);
+    setSyncCheckTaskId(null);
+  }, [task.id, task.base_commit_sha, task.latest_task_commit_sha]);
+
+  useEffect(() => {
+    let current = true;
+    setSyncRecovery(null);
+    setSyncRecoveryTaskId(null);
+    setSyncRecoveryError(null);
+    setSyncAbortConfirmation(false);
+    if (task.workflow_state !== "REVIEW" || !task.worktree_path) return;
+    void loadTaskSyncRecovery(task.id).then((result) => {
+      if (!current) return;
+      setSyncRecovery(result.recovery ?? null);
+      setSyncRecoveryTaskId(task.id);
+    }).catch((caught) => {
+      if (!current) return;
+      setSyncRecoveryError(caught instanceof Error ? caught.message : String(caught));
+      setSyncRecoveryTaskId(task.id);
+    });
+    return () => { current = false; };
+  }, [task.id, task.workflow_state, task.worktree_path]);
 
   useEffect(() => {
     let current = true;
@@ -419,6 +490,15 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     }
   }
 
+  async function refreshSyncRecovery() {
+    const taskId = task.id;
+    const result = await loadTaskSyncRecovery(taskId);
+    if (!mountedRef.current || liveTaskIdRef.current !== taskId) return;
+    setSyncRecovery(result.recovery ?? null);
+    setSyncRecoveryTaskId(taskId);
+    setSyncRecoveryError(null);
+  }
+
   async function openCheckpointDiff() {
     const requestId = ++diffRequestIdRef.current;
     const taskId = task.id;
@@ -436,19 +516,44 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     }
   }
 
+  async function prepareMergeConfirmation() {
+    const taskId = task.id;
+    setBusy(true);
+    setMergeStatus(null);
+    try {
+      const preview = await loadMergePreview(taskId);
+      if (liveTaskIdRef.current !== taskId) return;
+      setMergePreview(preview);
+      if (preview.eligible && preview.preview_id) setMergeConfirmation(true);
+      else setMergeStatus(preview.reasons?.join(" ") ?? preview.reason ?? "Check sync before merging.");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setMergeStatus(message);
+      pushToast({ title: "Merge preview failed", description: message, variant: "danger" });
+    } finally { setBusy(false); }
+  }
+
   async function runMergeAction(action: "start" | "abort" | "retry" | "view-conflicts") {
     setBusy(true);
     setMergeStatus(null);
     try {
-      const result = action === "start" ? await startMerge(task.id) : await mergeAction(task.id, action);
+      let result;
+      if (action === "start") {
+        const previewId = mergePreview?.preview_id;
+        if (!previewId) throw new Error("Refresh Check sync before confirming merge.");
+        result = await startMerge(task.id, previewId);
+      } else {
+        result = await mergeAction(task.id, action);
+      }
       setMergeConfirmation(false);
       setMergeStatus(result.status === "MERGED" ? "Merged successfully." :
-        result.status === "VALIDATION_QUEUED" ? "Base synced. Fresh Validation is queued; merging still requires a new approval if interrupted." :
+        result.status === "CHECK_SYNC_REQUIRED" ? "Conflict resolution was committed. Check sync and confirm merge again." :
           result.status === "ABORTED" ? "Merge aborted; task changes were preserved." :
             result.status === "OPENED" ? "Opened the task worktree in the IDE." : `Merge status: ${result.status}`);
       if (action === "start" || action === "abort") onChanged();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
+      if (action === "start") setMergeConfirmation(false);
       setMergeStatus(message);
       pushToast({ title: "Merge action failed", description: message, variant: "danger" });
     } finally { setBusy(false); }
@@ -514,8 +619,6 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setDraft(input.content);
     setDraftInputId(null);
     setReuseInputId(input.id);
-    const sourceStage = runs.find((item) => item.id === input.run_id)?.stage;
-    setStartStage(sourceStage === "INVESTIGATION" || sourceStage === "IMPLEMENTATION" ? sourceStage : null);
     setStartingRun(true);
   }
 
@@ -535,7 +638,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
       }, activeJob.run_status === "RUNNING" ? "Guidance accepted" : "Guidance added to queued run");
       return;
     }
-    if (!canStartRun || !startStage) return;
+    if (!canStartRun) return;
     setStartingRun(true);
   }
 
@@ -565,24 +668,109 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
 
         <div className="ticket-panel-body" ref={logRef}>
           {error && <div className="error-banner" role="alert"><span>{error}</span></div>}
-          {validationNotice && <p className="run-empty" role="status">{validationNotice}</p>}
 
           {tab === "live" && (
             <>
               <section className="ticket-section live-task-context">
                 <p className="ticket-description">{task.description || "No description."}</p>
               </section>
+              {showMergeControls && <aside className="developer-test-reminder" role="note" aria-label="Developer testing reminder">
+                {DEVELOPER_TEST_REMINDER}
+              </aside>}
+              {canCheckpoint && checkpointStatusTaskId === task.id && checkpointHasChanges && (
+                <section className="ticket-section changes-review-card" aria-labelledby="changes-review-title">
+                  <h3 id="changes-review-title">Changes to review</h3>
+                  {ordinaryResponse
+                    ? <p className="changes-review-summary">{ordinaryResponse.length > 420 ? `${ordinaryResponse.slice(0, 420).trimEnd()}…` : ordinaryResponse}</p>
+                    : <p className="changes-review-summary">Review the changed files before updating the checkpoint.</p>}
+                  <p><strong>Changed files</strong></p>
+                  <ul>{reviewFiles.map((file) => <li key={file}>{file}</li>)}</ul>
+                  <button className="button-primary" onClick={() => { setSelectedReviewFile(0); setReviewDiffOpen(true); }}>Preview changes</button>
+                </section>
+              )}
               {canReviewAction && (
                 <section className="ticket-section review-actions">
                   <p className="ticket-section-title">Next step</p>
                   {checkpointStatusError && <p className="error-banner" role="alert">{checkpointStatusError}</p>}
+                  {syncRecoveryError && syncRecoveryTaskId === task.id && <p className="run-error" role="alert">Cannot inspect sync recovery: {syncRecoveryError}</p>}
+                  {currentSyncResult?.status === "SYNCED" && <p className="run-empty" role="status">
+                    Synced main at {currentSyncResult.synced_base_sha.slice(0, 12)} into task commit {currentSyncResult.candidate_sha.slice(0, 12)}.
+                  </p>}
+                  {currentSyncCheck && <p className={currentSyncCheck.status === "IN_SYNC" ? "run-empty" : "run-error"}
+                    role={currentSyncCheck.status === "IN_SYNC" ? "status" : "alert"}>
+                    {currentSyncCheck.status === "IN_SYNC" ?
+                      `Git state was in sync with base ${currentSyncCheck.base_sha?.slice(0, 12)} at task commit ${currentSyncCheck.task_sha?.slice(0, 12)} when checked at ${new Date(currentSyncCheck.checked_at).toLocaleTimeString()}. Recheck after Git changes.` :
+                      currentSyncCheck.status === "STALE" ?
+                        `The current base ${currentSyncCheck.base_sha?.slice(0, 12)} is not in the task history. Use Sync with main, then check again.` :
+                        `Git sync check is blocked: ${currentSyncCheck.reasons.join(" ")}`}
+                    {currentSyncCheck.base_moved && ` The base moved from recorded ${currentSyncCheck.recorded_base_sha?.slice(0, 12)} to ${currentSyncCheck.base_sha?.slice(0, 12)}.`}
+                    {" This is a Git-state check only, not application testing or code review."}
+                  </p>}
+                  {currentSyncRecovery && <p className={currentSyncRecovery.state === "CONFLICT" ? "run-error" : "run-empty"}
+                    role={currentSyncRecovery.state === "CONFLICT" ? "alert" : "status"}>
+                    {currentSyncRecovery.state === "CONFLICT" ? `Sync stopped on conflicts. Git state is preserved; resolve and commit the conflict before continuing.${currentSyncRecovery.can_abort ? "" : " Abort is unavailable because the conflict snapshot is missing or changed."}` :
+                      currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "The manual conflict resolution is committed and ready to finish sync." :
+                        currentSyncRecovery.state === "SAFE_TO_RETRY" ? "No merge is in progress and the task branch is unchanged; explicit Retry will start a fresh sync." :
+                          `Sync was interrupted and Git state needs inspection. ${currentSyncRecovery.error_message ?? "Preserve the worktree and inspect it before continuing."}`}
+                  </p>}
                   <div className="dialog-actions">
+                    {showMergeControls && <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
+                      const taskId = task.id;
+                      setSyncCheck(null);
+                      setSyncCheckTaskId(null);
+                      const result = await checkTaskSync(taskId);
+                      if (liveTaskIdRef.current !== taskId) return;
+                      setSyncCheck(result);
+                      setSyncCheckTaskId(taskId);
+                    })}>Check sync</button>}
+                    {currentSyncRecovery ? <>
+                      <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
+                        await viewTaskSyncConflicts(task.id);
+                      })}>{currentSyncRecovery.state === "CONFLICT" ? "View Conflicts" : "Open task worktree"}</button>
+                      {(currentSyncRecovery.state === "RESOLUTION_COMMITTED" || currentSyncRecovery.state === "SAFE_TO_RETRY") &&
+                        <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+                          const taskId = task.id;
+                          setSyncCheck(null);
+                          setSyncCheckTaskId(null);
+                          const result = await retryTaskSync(taskId);
+                          if (liveTaskIdRef.current !== taskId) return;
+                          if (result.status === "SYNCED") {
+                            setSyncRecovery(null);
+                            setSyncRecoveryTaskId(taskId);
+                            setSyncResult({ taskId, status: "SYNCED",
+                              synced_base_sha: result.synced_base_sha,
+                              candidate_sha: result.candidate_sha });
+                          } else {
+                            await refreshSyncRecovery();
+                          }
+                        }, "Sync recovered")}>{currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "Finish sync" : "Retry Sync"}</button>}
+                      {currentSyncRecovery.can_abort && (currentSyncRecovery.state === "CONFLICT" || currentSyncRecovery.state === "INTERRUPTED") &&
+                        <button className="button-quiet" disabled={busy} onClick={() => setSyncAbortConfirmation(true)}>
+                          {currentSyncRecovery.state === "CONFLICT" ? "Abort sync" : "Clear sync recovery"}
+                        </button>}
+                      <button className="button-quiet" disabled={busy} onClick={() => void run(refreshSyncRecovery)}>Refresh recovery</button>
+                    </> : showMergeControls && task.base_branch && task.worktree_path && <button className="button-quiet"
+                      disabled={busy}
+                      onClick={() => void run(async () => {
+                        const taskId = task.id;
+                        setSyncCheck(null);
+                        setSyncCheckTaskId(null);
+                        const result = await syncTaskWithBase(taskId);
+                        if (liveTaskIdRef.current !== taskId) return;
+                        if (result.status === "CONFLICT") {
+                          setSyncResult(null);
+                          await refreshSyncRecovery();
+                        } else {
+                          setSyncResult({ taskId, ...result });
+                        }
+                      })}>Sync with main</button>}
                     {canCheckpoint && (checkpointStatus === null ? (
                       <button className="button-primary" disabled>Checking worktree…</button>
                     ) : checkpointHasChanges ? (
                       <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+                        setSelectedCheckpointFile(0);
                         setCheckpointPreview(await loadCheckpointPreview(task.id));
-                      })}>Commit changes</button>
+                      })}>Update checkpoint</button>
                     ) : latestCheckpointSha ? (
                       <span className="run-empty">Checkpoint {latestCheckpointSha.slice(0, 12)} is ready for review.</span>
                     ) : (
@@ -590,18 +778,15 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                     ))}
                     <button className="button-quiet" disabled={busy} onClick={() => setStartingRun(true)}>Start run</button>
                     {showMergeControls && task.review_tag !== "MERGE_CONFLICT" && <>
-                      <button className="button-primary" disabled={busy || mergePreview?.eligible === false || !task.active_validation_snapshot_id}
+                      <button className="button-primary" disabled={busy || mergePreview?.eligible !== true || !mergePreview.preview_id}
                         title={mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? undefined}
-                        onClick={() => { setMergeStatus(null); setMergeConfirmation(true); }}>Merge back to working branch</button>
-                      {((mergePreview?.eligible === false) || !task.active_validation_snapshot_id) && <span className="run-error">
-                        {(mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? "Validation required").replaceAll("_", " ")}
+                        onClick={() => void prepareMergeConfirmation()}>Merge back to working branch</button>
+                      {mergePreview?.eligible !== true && <span className="run-error">
+                        {(mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? "Check sync before merging.").replaceAll("_", " ")}
                       </span>}
                     </>}
                     {mergeStatus && <p className="run-empty" role="status">{mergeStatus}</p>}
-                    {showValidateAction && <button className="button-primary" disabled={busy || !canValidate} onClick={() => void run(async () => {
-                      const result = await startValidation(task.id);
-                      setValidationNotice(result.status === "QUEUED" ? "Validation queued." : `Validation ${result.status.toLowerCase()}.`);
-                    }, "Validation queued")}>Validate</button>}
+
                     {completionStatus?.ready ? (
                       <button className="button-primary" disabled={busy || !!activeJob} onClick={() => void run(async () => {
                         await completeTask(task.id);
@@ -625,6 +810,20 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 </section>
               )}
             </>
+          )}
+
+          {reviewDiffOpen && currentCheckpointStatus && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="dialog checkpoint-diff-dialog" role="dialog" aria-modal="true" aria-labelledby="changes-review-dialog-title" onClick={(event) => event.stopPropagation()}>
+                <h2 id="changes-review-dialog-title">Changes to review</h2>
+                <div className="checkpoint-diff-files" aria-label="Changed files">
+                  {reviewFiles.map((file, index) => <button key={`${index}:${file}`} className="button-quiet"
+                    aria-pressed={selectedReviewFile === index} onClick={() => setSelectedReviewFile(index)}>{file}</button>)}
+                </div>
+                <pre className="checkpoint-diff-content">{selectedReviewPatch || "No diff available for this file."}</pre>
+                <div className="dialog-actions"><button className="button-quiet" onClick={() => setReviewDiffOpen(false)}>Close</button></div>
+              </section>
+            </div>
           )}
 
           {checkpointDiff && (
@@ -661,12 +860,46 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             <div className="dialog-backdrop" role="presentation">
               <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="merge-confirm-title" onClick={(event) => event.stopPropagation()}>
                 <h2 id="merge-confirm-title">Confirm merge back</h2>
-                <p>Merge the validated checkpoint into <strong>{task.base_branch}</strong>?</p>
-                {mergePreview?.base_moved && <p>The base moved since Validation: {mergePreview.validated_base_sha?.slice(0, 12)} → {(mergePreview.current_base_sha ?? mergePreview.live_base_sha)?.slice(0, 12)}. Approval will sync the new base and queue fresh Validation; it will not merge automatically.</p>}
+                <p>Merge the checkpoint into <strong>{task.base_branch}</strong>?</p>
+                {mergePreview?.checked_base_sha && mergePreview.task_sha && <p>Check sync found base {mergePreview.checked_base_sha.slice(0, 12)} and task {mergePreview.task_sha.slice(0, 12)}{mergePreview.checked_at ? ` at ${new Date(mergePreview.checked_at).toLocaleTimeString()}` : ""}. Git state is checked again before integration.</p>}
                 {mergePreview?.candidate_sha && <p>Checkpoint {mergePreview.candidate_sha.slice(0, 12)}</p>}
+                <aside className="developer-test-reminder" role="note" aria-label="Before merge reminder">
+                  {DEVELOPER_TEST_REMINDER}
+                </aside>
                 <div className="dialog-actions">
-                  <button className="button-primary" disabled={busy || mergePreview?.eligible !== true} onClick={() => void runMergeAction("start")}>Confirm merge</button>
+                  <button className="button-primary" disabled={busy || mergePreview?.eligible !== true || !mergePreview.preview_id} onClick={() => void runMergeAction("start")}>Confirm merge</button>
                   <button className="button-quiet" disabled={busy} onClick={() => setMergeConfirmation(false)}>Cancel</button>
+                </div>
+              </section>
+            </div>
+          )}
+
+          {syncAbortConfirmation && currentSyncRecovery?.can_abort &&
+            (currentSyncRecovery.state === "CONFLICT" || currentSyncRecovery.state === "INTERRUPTED") && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="sync-abort-title" onClick={(event) => event.stopPropagation()}>
+                <h2 id="sync-abort-title">{currentSyncRecovery.state === "CONFLICT" ? "Abort sync" : "Clear sync recovery"}</h2>
+                {currentSyncRecovery.state === "CONFLICT" ? <>
+                  <p>Abort this sync and clear its conflict markers/index state, restoring the task worktree to the pre-sync commit. The primary checkout is untouched. Abort is allowed only while the conflict worktree still matches its saved snapshot.</p>
+                  <p>This does not discard edits made after the conflict snapshot; if the worktree changes, the server refuses the abort.</p>
+                </> : <p>No Git operation is in progress and the task branch is at its pre-sync commit. Clear this interrupted recovery without running Git; start a fresh sync separately if desired.</p>}
+                <div className="dialog-actions">
+                  <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+                    try {
+                      await abortTaskSync(task.id, true);
+                    } catch (caught) {
+                      await refreshSyncRecovery().catch(() => {});
+                      throw caught;
+                    }
+                    if (liveTaskIdRef.current !== task.id) return;
+                    setSyncRecovery(null);
+                    setSyncRecoveryTaskId(task.id);
+                    setSyncCheck(null);
+                    setSyncCheckTaskId(null);
+                    setSyncAbortConfirmation(false);
+                    setSyncResult(null);
+                  }, "Sync aborted")}>{currentSyncRecovery.state === "CONFLICT" ? "Confirm abort" : "Clear recovery"}</button>
+                  <button className="button-quiet" disabled={busy} onClick={() => setSyncAbortConfirmation(false)}>Cancel</button>
                 </div>
               </section>
             </div>
@@ -676,7 +909,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             <div className="dialog-backdrop" role="presentation">
               <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="checkpoint-confirm-title" onClick={(event) => event.stopPropagation()}>
                 <h2 id="checkpoint-confirm-title">Confirm checkpoint</h2>
-                <p>Commit the reviewed changes on branch <strong>{checkpointPreview.branch}</strong> at {checkpointPreview.commit_sha.slice(0, 12)}?</p>
+                <p>Record this exact Git snapshot on branch <strong>{checkpointPreview.branch}</strong> at {checkpointPreview.commit_sha.slice(0, 12)}. This records the checkpoint only; it is not a code-review or testing sign-off.</p>
                 <p><strong>Tracked changes</strong></p>
                 {checkpointPreview.tracked_changes.length
                   ? <ul>{checkpointPreview.tracked_changes.map((file) => <li key={file}>{file}</li>)}</ul>
@@ -687,23 +920,44 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                   : <p>No new files.</p>}
                 {checkpointPreview.tracked_changes.length === 0 && checkpointPreview.untracked_files.length === 0 &&
                   <p role="alert">There are no changes to checkpoint.</p>}
+                {checkpointPreviewFiles.length > 0 && <>
+                  <p><strong>Previewed diff</strong></p>
+                  <div className="checkpoint-diff-files" aria-label="Checkpoint preview files">
+                    {checkpointPreviewFiles.map((file, index) => <button key={`${index}:${file}`} className="button-quiet"
+                      aria-pressed={selectedCheckpointFile === index} onClick={() => setSelectedCheckpointFile(index)}>{file}</button>)}
+                  </div>
+                  <pre className="checkpoint-diff-content">{selectedCheckpointPatch || "No diff available for this file."}</pre>
+                </>}
                 <div className="dialog-actions">
                   <button className="button-primary" disabled={busy || (checkpointPreview.tracked_changes.length === 0 && checkpointPreview.untracked_files.length === 0)} onClick={() => void run(async () => {
-                    const result = await createCheckpoint(task.id, {
-                      tracked_changes: checkpointPreview.tracked_changes,
-                      include_untracked_files: checkpointPreview.untracked_files,
-                      branch: checkpointPreview.branch,
-                      commit_sha: checkpointPreview.commit_sha,
-                      state_token: checkpointPreview.state_token,
-                    });
+                    let result;
+                    try {
+                      result = await createCheckpoint(task.id, {
+                        tracked_changes: checkpointPreview.tracked_changes,
+                        include_untracked_files: checkpointPreview.untracked_files,
+                        branch: checkpointPreview.branch,
+                        commit_sha: checkpointPreview.commit_sha,
+                        state_token: checkpointPreview.state_token,
+                      });
+                    } catch (caught) {
+                      const message = caught instanceof Error ? caught.message : String(caught);
+                      if (!/changed|stale/i.test(message)) throw caught;
+                      setCheckpointPreview(null);
+                      const latestPreview = await loadCheckpointPreview(task.id);
+                      setSelectedCheckpointFile(0);
+                      setCheckpointPreview(latestPreview);
+                      throw new Error("The worktree changed. The preview has been refreshed; review it and confirm again.");
+                    }
                     setCheckpointedSha(result.commit_sha);
                     setCheckpointStatusError(null);
                     setCheckpointStatus({ ...checkpointPreview, tracked_changes: [], untracked_files: [], commit_sha: result.commit_sha });
+                    setCheckpointStatusTaskId(task.id);
                     setCheckpointPreview(null);
-                  }, "Checkpoint created")}>{checkpointPreview.untracked_files.length ? "Include files and commit" : "Confirm and commit"}</button>
+                  }, "Checkpoint created")}>{checkpointPreview.untracked_files.length ? "Include files and update checkpoint" : "Update checkpoint"}</button>
                   <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
+                    setSelectedCheckpointFile(0);
                     setCheckpointPreview(await loadCheckpointPreview(task.id));
-                  })}>Review latest contents</button>
+                  })}>Refresh preview</button>
                   <button className="button-quiet" disabled={busy} onClick={() => setCheckpointPreview(null)}>Cancel</button>
                 </div>
               </section>
@@ -762,15 +1016,8 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
               ? "New guidance is saved before being steered. Delivery status updates when its transcript entry is confirmed."
               : activeJob
                 ? "Guidance sent now is saved to this queued run in send order."
-                : canStartRun ? "Enter a prompt and choose a stage to start a run." : "This ticket is read-only."}
+                : canStartRun ? "Enter a prompt to start a run." : "This ticket is read-only."}
           </p>
-          {!activeJob && canStartRun && <fieldset className="composer-stage-picker">
-            <legend>Stage</legend>
-            {(["INVESTIGATION", "IMPLEMENTATION"] as const).map((stage) => <label key={stage}>
-              <input type="radio" name={`composer-stage-${task.id}`} checked={startStage === stage} onChange={() => setStartStage(stage)} />
-              {stage === "INVESTIGATION" ? "Investigation" : "Implementation"}
-            </label>)}
-          </fieldset>}
           <textarea
             value={draft}
             rows={3}
@@ -785,7 +1032,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             }}
           />
           <div className="dialog-actions">
-            <button className="button-primary" disabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && (!canStartRun || !startStage))} onClick={submitDraft}>
+            <button className="button-primary" disabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && !canStartRun)} onClick={submitDraft}>
               {activeJob ? "Send guidance" : "Start run"}
             </button>
           </div>
@@ -793,20 +1040,17 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         {startingRun && <StartTaskDialog
           task={task}
           initialPrompt={draft}
-          initialStage={startStage}
           reusedFromInputId={reuseInputId}
-          onCancel={(prompt, stage) => {
+          onCancel={(prompt) => {
             setStartingRun(false);
             setDraft(prompt);
-            setStartStage(stage);
             if (reuseInputId && prompt.trim() !== history?.inputs.find((input) => input.id === reuseInputId)?.content) setReuseInputId(null);
           }}
-          onStarted={(stage) => {
+          onStarted={() => {
             setStartingRun(false);
             setDraft("");
             setReuseInputId(null);
-            setStartStage(stage);
-            pushToast({ title: "Run queued", description: `${stage === "INVESTIGATION" ? "Investigation" : "Implementation"} queued.`, variant: "success" });
+            pushToast({ title: "Run queued", description: "Work queued.", variant: "success" });
             onChanged();
             void refresh();
             void refreshLiveHistory().catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));

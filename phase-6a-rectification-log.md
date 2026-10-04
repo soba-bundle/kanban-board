@@ -2,7 +2,7 @@
 
 **Purpose:** Reviewable record of the decisions, implementation changes, database operations, and verification performed to close the Phase 6A exit gate after retiring ticket comments.
 
-**Authoritative requirements:** [Implementation plan v2](local-agent-kanban-implementation-plan-v2.md) and [PRD v2](local-agent-kanban-prd-v2.md).
+**Historical requirements at the time:** [Implementation plan v2](local-agent-kanban-implementation-plan-v2.md) and [PRD v2](local-agent-kanban-prd-v2.md). For current workflow semantics, see [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md).
 
 ## Operating rules
 

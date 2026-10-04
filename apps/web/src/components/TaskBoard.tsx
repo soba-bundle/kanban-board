@@ -27,9 +27,10 @@ interface TaskBoardProps {
 
 function agentFor(task: Task, queue: QueueSnapshot | null): string | null {
   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
-  if (activeJob) return activeJob.stage === "INVESTIGATION" ? "Investigator" : "Worker";
-  if (task.review_tag === "INVESTIGATION_COMPLETE") return "Investigator";
-  if (task.review_tag === "IMPLEMENTATION_COMPLETE" || task.review_tag === "VALIDATION_ISSUES" || task.review_tag === "VALIDATION_FAILED") return "Worker";
+  if (activeJob) return "Worker";
+  if (task.review_tag === "INVESTIGATION_COMPLETE") return "Worker";
+  if (task.review_tag === "WORK_COMPLETE" || task.review_tag === "IMPLEMENTATION_COMPLETE" ||
+    task.review_tag === "VALIDATION_ISSUES" || task.review_tag === "VALIDATION_FAILED" || task.review_tag === "READY_TO_MERGE") return "Worker";
   return null;
 }
 
@@ -59,9 +60,8 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                 {tasks.map((task) => {
                   const agent = agentFor(task, queue);
                   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
-                  const reviewTag = task.review_tag === "READY_TO_MERGE" &&
-                    (!task.active_validation_snapshot_id || task.validation_snapshot_current !== true)
-                    ? "IMPLEMENTATION_COMPLETE" : task.review_tag;
+                  const reviewTag = ["READY_TO_MERGE", "VALIDATION_ISSUES", "VALIDATION_FAILED"].includes(task.review_tag ?? "")
+                    ? "WORK_COMPLETE" : task.review_tag;
                   return (
                     <article
                       className="task-card task-card-clickable"

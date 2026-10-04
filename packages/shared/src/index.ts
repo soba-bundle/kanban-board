@@ -35,7 +35,9 @@ export const WorkflowStateSchema = z.enum([
 ]);
 export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
 
+/** WORK is the only stage created for new runs; other values remain for stored history. */
 export const WorkingPhaseSchema = z.enum([
+  "WORK",
   "INVESTIGATION",
   "IMPLEMENTATION",
   "VALIDATION_REVIEW",
@@ -124,7 +126,9 @@ export const RunReasonCodeSchema = z.enum([
 ]);
 export type RunReasonCode = z.infer<typeof RunReasonCodeSchema>;
 
+/** Generic work tags drive current behavior; older tags remain readable as historical data. */
 export const ReviewTagSchema = z.enum([
+  "WORK_COMPLETE",
   "INVESTIGATION_COMPLETE",
   "IMPLEMENTATION_COMPLETE",
   "VALIDATION_ISSUES",
@@ -166,8 +170,6 @@ export const TaskSchema = z.object({
   base_commit_sha: z.string().nullable().optional(),
   base_branch: z.string().nullable().optional(),
   worktree_path: z.string().nullable().optional(),
-  active_validation_snapshot_id: z.string().nullable().optional(),
-  validation_snapshot_current: z.boolean().optional(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
 });
@@ -197,6 +199,7 @@ export type BoardSnapshot = z.infer<typeof BoardSnapshotSchema>;
 
 export const TaskRunSummarySchema = z.object({
   id: z.string().min(1),
+  /** Historical runs may use legacy stages; new runs are always WORK. */
   stage: WorkingPhaseSchema,
   sequence: z.number().int().positive(),
   status: RunStatusSchema,
@@ -213,6 +216,7 @@ export const TaskRunSummarySchema = z.object({
 });
 export type TaskRunSummary = z.infer<typeof TaskRunSummarySchema>;
 
+/** Queue items for newly created jobs use WORK; stage remains for API compatibility. */
 export const QueueItemSchema = z.object({
   job_id: z.string().min(1),
   run_id: z.string().min(1),
@@ -230,14 +234,12 @@ export const QueueSnapshotSchema = z.object({
 });
 export type QueueItem = z.infer<typeof QueueItemSchema>;
 export type QueueSnapshot = z.infer<typeof QueueSnapshotSchema>;
-export const EnqueueTaskSchema = z.object({ stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]) });
 export const StartRunSchema = z.object({
   task_id: z.string().trim().min(1),
-  stage: z.enum(["INVESTIGATION", "IMPLEMENTATION"]),
   prompt: z.string().trim().min(1),
   idempotency_key: z.string().trim().min(1),
   reused_from_input_id: z.string().trim().min(1).optional(),
-});
+}).strict();
 export const RunMessageSchema = z.object({
   input_id: z.string().trim().min(1),
   text: z.string().trim().min(1),
@@ -310,6 +312,7 @@ export const CheckpointPreviewSchema = z.object({
   branch: z.string().min(1),
   commit_sha: z.string().min(1),
   state_token: z.string().min(1),
+  diff: z.string(),
 });
 export type CheckpointPreview = z.infer<typeof CheckpointPreviewSchema>;
 export const CheckpointDiffSchema = z.object({

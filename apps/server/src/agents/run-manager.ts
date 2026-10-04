@@ -1,28 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { RunInput, ReviewTag } from "@kanban-board/shared";
+import type { RunInput } from "@kanban-board/shared";
 import { AgentManager } from "./agent-manager.js";
 import type { RunPrompt } from "./prompt-builder.js";
-import { readHandover } from "./handover-tool.js";
 import type { HumanRequestService } from "./human-requests.js";
 
-const HANDOVER_RETRY_PROMPT = [
-  "You ended the run without calling submit_handover.",
-  "Call submit_handover now with the structured result of this run. Do not do any further work.",
-].join(" ");
-const HANDOVER_UPDATE_PROMPT = [
-  "Additional user guidance was processed after your current handover.",
-  "Update and resubmit the authoritative handover to account for all accepted guidance.",
-].join(" ");
 const HUMAN_REQUEST_RESTART_PROMPT = [
   "A human has answered the pending questionnaire in this session.",
   "Continue from the current transcript, incorporate that answer, and do not repeat earlier work or ask the same question again.",
 ].join(" ");
-
-const COMPLETION_TAG: Record<string, ReviewTag> = {
-  INVESTIGATION: "INVESTIGATION_COMPLETE",
-  IMPLEMENTATION: "IMPLEMENTATION_COMPLETE",
-};
 
 interface RunRow {
   task_id: string;
@@ -164,7 +150,6 @@ export class RunManager {
   async steer(runId: string, inputId: string, text: string, reusedFromInputId?: string): Promise<InputResult> {
     const run = this.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found.`);
-    if (run.stage === "VALIDATION_REVIEW") throw new Error("Validation Review does not accept live guidance.");
     if (!["QUEUED", "RUNNING"].includes(run.status)) throw new Error(`Run ${runId} is not accepting messages.`);
     if (this.closingRuns.has(runId)) throw new Error(`Run ${runId} is closing; refresh before sending.`);
     const created = this.db.transaction(() => {
@@ -359,86 +344,30 @@ export class RunManager {
     for (const input of inputs) this.scheduleSteering(runId, input.id, input.content);
   }
 
-  private async finishRun(runId: string, taskId: string): Promise<void> {
-    const stage = this.getRun(runId)!.stage;
-    const tag = COMPLETION_TAG[stage];
-    if (!tag) {
-      this.markCompleted(runId);
+  private finishRun(runId: string, taskId: string): void {
+    const unresolved = this.db.prepare(`SELECT COUNT(*) AS count FROM run_inputs WHERE run_id = ?
+      AND delivery_status IN ('PENDING', 'ACCEPTED', 'UNDELIVERED', 'DELIVERY_UNKNOWN')`).get(runId) as { count: number };
+    if (unresolved.count > 0) {
+      this.markInputDeliveryFailed(runId, taskId);
       return;
     }
-
-    if (!readHandover(this.db, runId)) {
-      await this.agents.prompt(taskId, runId, HANDOVER_RETRY_PROMPT);
-      this.closingRuns.add(runId);
-      await this.steeringQueues.get(runId);
-      if (this.stopRequested.has(runId)) {
-        this.markStopped(runId, taskId);
-        return;
-      }
-      this.closingRuns.add(runId);
-      if (!readHandover(this.db, runId)) {
-        this.markHandoverFailed(runId, taskId);
-        return;
-      }
-    }
-
-    let handoverRevisionUsed = false;
-    for (;;) {
-      const unresolved = this.db.prepare(`SELECT COUNT(*) AS count FROM run_inputs WHERE run_id = ?
-        AND delivery_status IN ('PENDING', 'ACCEPTED', 'UNDELIVERED', 'DELIVERY_UNKNOWN')`).get(runId) as { count: number };
-      if (unresolved.count > 0) {
-        this.markInputDeliveryFailed(runId, taskId);
-        return;
-      }
-      const watermark = (this.db.prepare("SELECT handover_input_sequence FROM task_runs WHERE id = ?")
-        .get(runId) as { handover_input_sequence: number }).handover_input_sequence;
-      const latestDelivered = (this.db.prepare(`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_inputs
-        WHERE run_id = ? AND delivery_status = 'DELIVERED'`).get(runId) as { sequence: number }).sequence;
-      if (watermark >= latestDelivered) break;
-      if (handoverRevisionUsed) {
-        this.markHandoverFailed(runId, taskId, "Handover did not include all delivered guidance after its update request.");
-        return;
-      }
-      handoverRevisionUsed = true;
-      await this.agents.prompt(taskId, runId, HANDOVER_UPDATE_PROMPT);
-      this.closingRuns.add(runId);
-      await this.steeringQueues.get(runId);
-      if (this.stopRequested.has(runId)) {
-        this.markStopped(runId, taskId);
-        return;
-      }
-      this.closingRuns.add(runId);
-      if (!readHandover(this.db, runId)) {
-        this.markHandoverFailed(runId, taskId);
-        return;
-      }
-    }
-
-    const now = new Date().toISOString();
-    this.db.transaction(() => {
-      this.db.prepare("UPDATE task_runs SET status = 'COMPLETED', completed_at = ? WHERE id = ?").run(now, runId);
-      this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = ?, updated_at = ? WHERE id = ?")
-        .run(tag, now, taskId);
-    })();
+    this.markCompleted(runId);
   }
 
   private markCompleted(runId: string): void {
-    this.db.prepare("UPDATE task_runs SET status = 'COMPLETED', completed_at = ? WHERE id = ?")
-      .run(new Date().toISOString(), runId);
+    const now = new Date().toISOString();
+    const run = this.db.prepare("SELECT task_id FROM task_runs WHERE id = ?").get(runId) as { task_id: string };
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE task_runs SET status = 'COMPLETED', completed_at = ? WHERE id = ?").run(now, runId);
+      this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'WORK_COMPLETE', updated_at = ? WHERE id = ?")
+        .run(now, run.task_id);
+    })();
   }
 
   private markInputsUnresolved(runId: string): void {
     this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
       WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END
       WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
-  }
-
-  private markHandoverFailed(runId: string, taskId: string, message = "Run ended without a valid handover after a second request."): void {
-    const now = new Date().toISOString();
-    this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'HANDOVER_FAILED', completed_at = ?,
-      error_message = ? WHERE id = ?`).run(now, message, runId);
-    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'RUN_FAILED', updated_at = ? WHERE id = ?")
-      .run(now, taskId);
   }
 
   private markInputDeliveryFailed(runId: string, taskId: string): void {
@@ -458,17 +387,10 @@ export class RunManager {
     this.db.prepare(`UPDATE run_inputs SET delivery_status = CASE
       WHEN delivery_status = 'ACCEPTED' THEN 'DELIVERY_UNKNOWN' ELSE 'UNDELIVERED' END
       WHERE run_id = ? AND delivery_status IN ('PENDING', 'ACCEPTED')`).run(runId);
-    if (run?.stage === "VALIDATION_REVIEW") {
-      this.db.prepare(`UPDATE task_runs SET status = 'FAILED', reason_code = 'USER_STOPPED', interrupted_at = ?,
-        completed_at = ?, error_message = 'Validation stopped by user.' WHERE id = ?`).run(now, now, runId);
-      this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'VALIDATION_FAILED', updated_at = ? WHERE id = ?`)
-        .run(now, taskId);
-    } else {
-      this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'USER_STOPPED', interrupted_at = ?,
-        error_message = 'Run stopped by user.' WHERE id = ?`).run(now, runId);
-      this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
-        .run(now, taskId);
-    }
+    this.db.prepare(`UPDATE task_runs SET status = 'INTERRUPTED', reason_code = 'USER_STOPPED', interrupted_at = ?,
+      error_message = 'Run stopped by user.' WHERE id = ?`).run(now, runId);
+    this.db.prepare(`UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED', updated_at = ? WHERE id = ?`)
+      .run(now, taskId);
   }
 
   private watchRunEvents(runId: string, taskId: string, initialInputIds: string[], initialPromptText: string): { unsubscribe: () => void } {

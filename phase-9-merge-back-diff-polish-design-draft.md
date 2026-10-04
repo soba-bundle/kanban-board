@@ -1,8 +1,11 @@
 # Phase 9 — Merge Back and Diff Polish (Acceptance-Test Draft)
 
-**Status:** Phase 9 is implemented and passed the full verification gate. Merge eligibility/approval, safe unchanged-base integration, moved-base sync with priority Validation, conflict recovery, queue stop/removal revocation, restart reconciliation, `CLOSED` resolution, and pinned checkpoint diff navigation/views are implemented. User scope decisions remain: checkpoint-diff polish belongs to Phase 9; broader Live/session rendering remains Phase 12; base branches checked out in non-primary linked worktrees are safely blocked.
+**Status:** Historical Phase 9 design/implementation record. Current merge-back/readiness behavior is superseded by W-12–W-14.
+**Current source of truth:** [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md).
 
-**Sources:** `local-agent-kanban-prd-v2.md` (especially §§6–7, 11–13) and `local-agent-kanban-implementation-plan-v2.md` (§6, Phase 9). This draft does not supersede either source.
+> Current readiness uses Git-only Check sync; no priority Validation or automatic Validation is run. Sync with main is explicit and separate from Merge back. Merge-back requires a current preview/explicit approval and final safety checks; non-primary linked-worktree refusal remains. Developers own application testing and code review.
+
+**Historical sources:** `local-agent-kanban-prd-v2.md` and `local-agent-kanban-implementation-plan-v2.md` as they stood during Phase 9. Their earlier Validation-gated merge behavior is superseded; current behavior is in the linked workflow plan above.
 
 ## 1. Goal and safety boundaries
 

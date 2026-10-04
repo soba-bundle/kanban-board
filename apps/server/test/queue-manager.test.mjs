@@ -46,9 +46,9 @@ function makeDb(taskCount = 3) {
 }
 
 let inputSequence = 0;
-function enqueue(queue, taskId, stage, prompt = `Explicit prompt ${inputSequence + 1}`) {
+function enqueue(queue, taskId, prompt = `Explicit prompt ${inputSequence + 1}`) {
   inputSequence++;
-  return queue.enqueueTask(taskId, stage, prompt, `request-${inputSequence}`);
+  return queue.enqueueTask(taskId, prompt, `request-${inputSequence}`);
 }
 
 function makeFakeRuns(db) {
@@ -106,9 +106,9 @@ test("global queue preserves order, supports reorder/remove, and respects concur
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
 
-  const first = enqueue(queue, "task-1", "INVESTIGATION");
-  const second = enqueue(queue, "task-2", "IMPLEMENTATION");
-  const third = enqueue(queue, "task-3", "INVESTIGATION");
+  const first = enqueue(queue, "task-1");
+  const second = enqueue(queue, "task-2");
+  const third = enqueue(queue, "task-3");
   assert.deepEqual(fakeRuns.started, [first.run_id]);
   assert.equal(queue.getSnapshot().active_count, 1);
 
@@ -138,8 +138,8 @@ test("completed Review tasks can continue with another run and cancellation rest
     await waitFor(() => queue.getSnapshot().active_count === 0);
     db.close();
   });
-  enqueue(queue, "task-2", "INVESTIGATION");
-  const queued = enqueue(queue, "task-1", "INVESTIGATION");
+  enqueue(queue, "task-2");
+  const queued = enqueue(queue, "task-1");
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "IN_PROGRESS");
   queue.remove(queued.job_id);
   assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
@@ -160,7 +160,7 @@ test("a new run can explicitly reuse unresolved guidance as a linked initial inp
   const queue = new QueueManager(db, fakeRuns, 1);
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
-  const queued = queue.enqueueTask("task-1", "IMPLEMENTATION", "retry this", "retry-key", "uncertain-input");
+  const queued = queue.enqueueTask("task-1", "retry this", "retry-key", "uncertain-input");
   const linked = db.prepare(`SELECT reused_from_input_id, content FROM run_inputs WHERE run_id = ? AND delivery_type = 'INITIAL_PROMPT'`)
     .get(queued.run_id);
   assert.deepEqual(linked, { reused_from_input_id: "uncertain-input", content: "retry this" });
@@ -169,7 +169,7 @@ test("a new run can explicitly reuse unresolved guidance as a linked initial inp
 
   db.prepare("UPDATE run_inputs SET delivery_status = 'DELIVERED' WHERE id = 'uncertain-input'").run();
   db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'INTERRUPTED' WHERE id = 'task-1'").run();
-  assert.throws(() => queue.enqueueTask("task-1", "IMPLEMENTATION", "retry this", "new-key", "uncertain-input"), /Only undelivered or delivery-unknown/);
+  assert.throws(() => queue.enqueueTask("task-1", "retry this", "new-key", "uncertain-input"), /Only undelivered or delivery-unknown/);
 });
 
 test("interrupted Review tasks can be safely recovered with a new explicit prompt", async (t) => {
@@ -180,7 +180,7 @@ test("interrupted Review tasks can be safely recovered with a new explicit promp
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
 
-  const queued = enqueue(queue, "task-1", "IMPLEMENTATION", "Recover with this new instruction");
+  const queued = enqueue(queue, "task-1", "Recover with this new instruction");
   assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "IN_PROGRESS");
   assert.equal(db.prepare("SELECT content FROM run_inputs WHERE run_id = ?").get(queued.run_id).content, "Recover with this new instruction");
   fakeRuns.releases.get(queued.run_id)();
@@ -201,13 +201,14 @@ test("queue routes enqueue tasks and expose the global queue snapshot", async (t
   } });
   assert.equal(invalid.statusCode, 400);
   const missingPrompt = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
-    task_id: "task-1", stage: "INVESTIGATION", idempotency_key: "missing-prompt",
+    task_id: "task-1", idempotency_key: "missing-prompt",
   } });
   assert.equal(missingPrompt.statusCode, 400);
-  const payload = { task_id: "task-1", stage: "INVESTIGATION", prompt: "Look into the race", idempotency_key: "start-1" };
+  const payload = { task_id: "task-1", prompt: "Look into the race", idempotency_key: "start-1" };
   const enqueued = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
   assert.equal(enqueued.statusCode, 201);
   assert.ok(enqueued.json().run_id);
+  assert.equal(db.prepare("SELECT stage FROM task_runs WHERE id = ?").get(enqueued.json().run_id).stage, "WORK");
   assert.equal(db.prepare("SELECT content FROM run_inputs WHERE run_id = ?").get(enqueued.json().run_id).content, payload.prompt);
   const retry = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
   assert.equal(retry.statusCode, 200);
@@ -226,6 +227,7 @@ test("queue routes enqueue tasks and expose the global queue snapshot", async (t
   assert.equal(snapshot.json().max_concurrent_agents, 1);
   assert.equal(snapshot.json().active_count, 1);
   assert.equal(snapshot.json().jobs[0].task_id, "task-1");
+  assert.equal(snapshot.json().jobs[0].stage, "WORK");
 
   db.prepare("DELETE FROM agent_jobs WHERE id = ?").run(enqueued.json().job_id);
   const delayedRetry = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload });
@@ -261,7 +263,7 @@ test("Stop Run aborts an active session and records USER_STOPPED / Interrupted",
   registerQueueRoutes(app, queue);
   t.after(async () => { await app.close(); agents.dispose("task-1"); db.close(); });
 
-  const queued = enqueue(queue, "task-1", "INVESTIGATION");
+  const queued = enqueue(queue, "task-1");
   await waitFor(() => session?.promptStarted === true);
   const stopped = await app.inject({ method: "POST", url: `/api/runs/${queued.run_id}/stop` });
   assert.equal(stopped.statusCode, 200);
@@ -296,7 +298,7 @@ test("a human-waiting run remains parked while a later job uses the released wor
   assert.equal(db.prepare("SELECT status FROM human_requests WHERE id = 'request-1'").get().status, "PENDING");
   assert.equal(queue.getSnapshot().active_count, 0);
 
-  const later = enqueue(queue, "task-2", "INVESTIGATION");
+  const later = enqueue(queue, "task-2");
   await waitFor(() => fakeRuns.started.includes(later.run_id));
   assert.deepEqual(fakeRuns.started, [later.run_id]);
   assert.equal(queue.getSnapshot().active_count, 1);
@@ -430,7 +432,7 @@ test("a hosted AgentSession prompt waits without consuming capacity and resumes 
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
     await resourceLoader.reload();
     const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader,
-      sessionManager, customTools, tools: ["submit_handover", "kanban_questionnaire"] });
+      sessionManager, customTools, tools: ["kanban_questionnaire"] });
     sessions.set(taskId, session);
     let callNumber = 0;
     session.agent.streamFunction = async (model) => {
@@ -444,13 +446,6 @@ test("a hosted AgentSession prompt waits without consuming capacity and resumes 
           arguments: { questions: [{ id: "scope", label: "Scope", prompt: "Which scope?", options: [
             { value: "small", label: "Small" }, { value: "large", label: "Large" },
           ], allowOther: true }] } }], "toolUse");
-      }
-      const callHandover = (taskId === "task-1" && callNumber === 2) || (taskId === "task-2" && callNumber === 1);
-      if (callHandover) {
-        return assistantStream(model, [{ type: "toolCall", id: `handover-${taskId}`, name: "submit_handover", arguments: {
-          stage: "INVESTIGATION", summary: `Finished ${taskId}`, confidence: "HIGH",
-          outcome: "Completed the requested investigation", recommended_next_step: "CLOSE",
-        } }], "toolUse");
       }
       return assistantStream(model, [{ type: "text", text: `Done ${taskId}` }], "stop");
     };
@@ -474,7 +469,7 @@ test("a hosted AgentSession prompt waits without consuming capacity and resumes 
   assert.equal(streamCalls.filter((call) => call.taskId === "task-1").length, 1,
     "the Pi prompt must be held inside its pending tool execution");
 
-  const active = enqueue(queue, "task-2", "INVESTIGATION", "Other task continues");
+  const active = enqueue(queue, "task-2", "Other task continues");
   await waitFor(() => streamCalls.some((call) => call.taskId === "task-2"));
   assert.ok(queue.getSnapshot().jobs.some((job) => job.run_id === active.run_id && job.job_status === "CLAIMED"),
     "another task must own the released worker slot while the Pi tool promise remains pending");
@@ -490,8 +485,8 @@ test("a hosted AgentSession prompt waits without consuming capacity and resumes 
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = 'run-human'").get().status === "COMPLETED");
   await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = ?").get(active.run_id).status === "COMPLETED");
   assert.deepEqual(startCalls, ["run-human", active.run_id]);
-  assert.equal(streamCalls.filter((call) => call.taskId === "task-1").length, 3,
-    "the same Pi prompt should continue through the answer, handover, and final response");
+  assert.equal(streamCalls.filter((call) => call.taskId === "task-1").length, 2,
+    "the same Pi prompt should continue through the answer and ordinary final response");
   const sessionManager = sessions.get("task-1").sessionManager;
   assert.equal(sessionManager.getSessionId(), db.prepare("SELECT session_id FROM task_runs WHERE id = 'run-human'").get().session_id);
   const toolResults = sessionManager.getBranch().filter((entry) => entry.type === "message" &&
@@ -616,7 +611,7 @@ test("a hosted Pi tool execution exercises the HumanRequest and queue scheduler 
   queue = new QueueManager(db, fakeRuns, 1);
   queue.initialize();
   await waitFor(() => starts.includes("run-human"));
-  const active = enqueue(queue, "task-2", "INVESTIGATION", "Other task");
+  const active = enqueue(queue, "task-2", "Other task");
   await waitFor(() => starts.includes(active.run_id));
   const request = humanRequests.listForTask("task-1").find((item) => item.id === requestId);
   assert.equal(request.status, "PENDING");
@@ -688,9 +683,9 @@ test("a live human wait frees capacity and an answered run resumes in queue with
     db.close();
   });
 
-  const waiting = enqueue(queue, "task-1", "INVESTIGATION");
+  const waiting = enqueue(queue, "task-1");
   waitingRunId = waiting.run_id;
-  const active = enqueue(queue, "task-2", "INVESTIGATION");
+  const active = enqueue(queue, "task-2");
   db.prepare("UPDATE task_runs SET session_id = 'same-session' WHERE id = ?").run(waiting.run_id);
   await waitFor(() => calls.includes(waiting.run_id));
   assert.deepEqual(calls, [waiting.run_id]);
@@ -793,7 +788,7 @@ test("each Human Request in the same run releases and reacquires queue capacity"
     db.close();
   });
 
-  const waiting = enqueue(queue, "task-1", "INVESTIGATION");
+  const waiting = enqueue(queue, "task-1");
   db.prepare("UPDATE task_runs SET session_id = 'same-session' WHERE id = ?").run(waiting.run_id);
   const question = (toolCallId, id) => humanRequests.ask({
     taskId: "task-1", runId: waiting.run_id, sessionId: "same-session", toolCallId,
@@ -802,7 +797,7 @@ test("each Human Request in the same run releases and reacquires queue capacity"
   const firstWait = question("call-1", "first");
   await waitFor(() => db.prepare("SELECT status FROM agent_jobs WHERE task_run_id = ?").get(waiting.run_id).status === "WAITING_FOR_HUMAN");
 
-  const other = enqueue(queue, "task-2", "INVESTIGATION");
+  const other = enqueue(queue, "task-2");
   await waitFor(() => started.includes(other.run_id));
   await humanRequests.answer(firstRequestId, [{ id: "first", value: "one" }]);
   releases.get(other.run_id)();
@@ -810,7 +805,7 @@ test("each Human Request in the same run releases and reacquires queue capacity"
   assert.equal(started.filter((runId) => runId === waiting.run_id).length, 1,
     "a second Human Request parks the original execution without starting another prompt");
 
-  const next = enqueue(queue, "task-3", "INVESTIGATION");
+  const next = enqueue(queue, "task-3");
   await waitFor(() => started.includes(next.run_id));
   await humanRequests.answer(secondRequestId, [{ id: "second", value: "two" }]);
   releases.get(next.run_id)();
@@ -915,7 +910,7 @@ test("Stop Run during worktree setup prevents the agent prompt from starting", a
   registerQueueRoutes(app, queue);
   t.after(async () => { releaseWorktree?.(); await app.close(); db.close(); });
 
-  const queued = enqueue(queue, "task-1", "INVESTIGATION");
+  const queued = enqueue(queue, "task-1");
   await worktreeStarted;
   const stopped = await app.inject({ method: "POST", url: `/api/runs/${queued.run_id}/stop` });
   assert.equal(stopped.statusCode, 200);
@@ -933,9 +928,9 @@ test("queue dispatches up to maxConcurrentAgents and recovers interrupted claims
   queue.initialize();
   t.after(() => { for (const release of fakeRuns.releases.values()) release(); db.close(); });
 
-  const first = enqueue(queue, "task-1", "INVESTIGATION");
-  const second = enqueue(queue, "task-2", "IMPLEMENTATION");
-  const third = enqueue(queue, "task-3", "INVESTIGATION");
+  const first = enqueue(queue, "task-1");
+  const second = enqueue(queue, "task-2");
+  const third = enqueue(queue, "task-3");
   assert.deepEqual(fakeRuns.started, [first.run_id, second.run_id]);
   assert.equal(queue.getSnapshot().active_count, 2);
   fakeRuns.releases.get(first.run_id)();

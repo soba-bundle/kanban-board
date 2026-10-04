@@ -1,7 +1,10 @@
 # Local Agent Kanban — Product Requirements v2
 
-**Status:** Authoritative v2 requirements
+**Status:** Historical v2 requirements; current workflow superseded by W-01–W-16 below.
 **Companion:** [Implementation plan v2](local-agent-kanban-implementation-plan-v2.md)
+**Current behavior:** [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md) is authoritative where requirements below conflict.
+
+> This document records the earlier design, not the current runtime contract. New work uses a single prompt-driven `WORK` run; Review uses explicit checkpoint review, Sync with main, Git-only Check sync, developer-owned app testing/code review, and separately confirmed Merge back. There is no automated Validation gate or required Investigation/Implementation choice. Legacy stage/tag values and stored handovers/Validation reports remain readable for history.
 
 This document replaces `local-agent-kanban-prd.md` for future development. The
 original remains a historical reference. This is a consolidated revision, not

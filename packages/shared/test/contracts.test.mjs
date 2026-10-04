@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   BoardSnapshotSchema,
+  CheckpointPreviewSchema,
   CreateTaskSchema,
   HumanRequestAnswerBatchSchema,
   HumanRequestAnswerInputSchema,
@@ -21,6 +22,7 @@ import {
   TaskRunSummarySchema,
   handoverSchemaForStage,
   ProjectSchema,
+  ReviewTagSchema,
   RunStatusSchema,
   TaskSchema,
   UpdateTaskSchema,
@@ -29,6 +31,7 @@ import {
   ValidationFindingSchema,
   ValidationReportSchema,
   ValidationResultSchema,
+  WorkingPhaseSchema,
 } from "../dist/index.js";
 
 const timestamp = "2025-01-01T00:00:00.000Z";
@@ -38,6 +41,14 @@ test("workflow enums accept declared values and reject unknown values", () => {
   assert.equal(WorkflowStateSchema.safeParse("ARCHIVED").success, false);
   assert.equal(RunStatusSchema.safeParse("WAITING_FOR_HUMAN").success, true);
   assert.equal(RunStatusSchema.safeParse("PAUSED").success, false);
+});
+
+test("checkpoint preview contract includes the unified current diff", () => {
+  const preview = {
+    tracked_changes: ["src/retry.ts"], untracked_files: ["test/retry.test.ts"], branch: "agent/task-t1",
+    commit_sha: "a".repeat(40), state_token: "state", diff: "diff --git a/src/retry.ts b/src/retry.ts",
+  };
+  assert.deepEqual(CheckpointPreviewSchema.parse(preview), preview);
 });
 
 test("Validation contracts require evidence, locations, and unambiguous finding attribution", () => {
@@ -122,10 +133,25 @@ test("task schema validates workflow state and required fields", () => {
     updated_at: timestamp,
   };
   assert.equal(TaskSchema.safeParse(task).success, true);
+  const currentTask = TaskSchema.parse({ ...task, active_validation_snapshot_id: "legacy", validation_snapshot_current: true });
+  assert.equal("active_validation_snapshot_id" in currentTask, false);
+  assert.equal("validation_snapshot_current" in currentTask, false);
   assert.equal(TaskSchema.safeParse({ ...task, workflow_state: "ARCHIVED" }).success, false);
   assert.equal(BoardSnapshotSchema.safeParse({ columns: {
     TODO: [task], IN_PROGRESS: [], REQUIRES_HUMAN: [], REVIEW: [], DONE: [],
   } }).success, true);
+});
+
+test("unified work values are additive to legacy run stages and review tags", () => {
+  assert.equal(WorkingPhaseSchema.safeParse("WORK").success, true);
+  for (const stage of ["INVESTIGATION", "IMPLEMENTATION", "VALIDATION_REVIEW"]) {
+    assert.equal(WorkingPhaseSchema.safeParse(stage).success, true, `legacy stage ${stage} remains readable`);
+  }
+  assert.equal(ReviewTagSchema.safeParse("WORK_COMPLETE").success, true);
+  for (const tag of ["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_ISSUES",
+    "VALIDATION_FAILED", "READY_TO_MERGE"]) {
+    assert.equal(ReviewTagSchema.safeParse(tag).success, true, `legacy review tag ${tag} remains readable`);
+  }
 });
 
 test("run summary rejects unknown reason codes", () => {
@@ -153,7 +179,6 @@ test("run reason codes reject unknown values", () => {
 test("Phase 6A run contracts require explicit prompts and stable input identities", () => {
   const start = {
     task_id: "t1",
-    stage: "INVESTIGATION",
     prompt: "  Inspect the retry behavior  ",
     idempotency_key: "start-1",
   };
@@ -161,7 +186,7 @@ test("Phase 6A run contracts require explicit prompts and stable input identitie
   assert.equal(StartRunSchema.safeParse({ ...start, reused_from_input_id: "prior-input" }).success, true);
   assert.equal(StartRunSchema.safeParse({ ...start, reused_from_input_id: "  " }).success, false);
   assert.equal(StartRunSchema.safeParse({ ...start, prompt: "  " }).success, false);
-  assert.equal(StartRunSchema.safeParse({ ...start, stage: "VALIDATION_REVIEW" }).success, false);
+  assert.equal(StartRunSchema.safeParse({ ...start, stage: "IMPLEMENTATION" }).success, false);
   assert.equal(StartRunSchema.safeParse({ ...start, idempotency_key: "" }).success, false);
 
   assert.equal(RunMessageSchema.safeParse({ input_id: "input-1", text: " Check edge cases " }).success, true);

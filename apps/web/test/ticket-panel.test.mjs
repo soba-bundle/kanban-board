@@ -31,7 +31,7 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.match(markup, /Live/);
   assert.match(markup, /Runs \(0\)/);
   assert.doesNotMatch(markup, /Timeline|Comments/);
-  assert.match(markup, /composer-stage-picker/);
+  assert.doesNotMatch(markup, /composer-stage-picker|Investigation|Implementation/);
   assert.match(markup, /Start run/);
 
   const interruptedTaskMarkup = renderToStaticMarkup(createElement(ToastProvider, null,
@@ -39,8 +39,8 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
       task: { ...task, workflow_state: "REVIEW", review_tag: "INTERRUPTED" },
       queue: null, onClose() {}, onChanged() {},
     })));
-  assert.match(interruptedTaskMarkup, /Enter a prompt and choose a stage to start a run/);
-  assert.match(interruptedTaskMarkup, /composer-stage-picker/);
+  assert.match(interruptedTaskMarkup, /Enter a prompt to start a run/);
+  assert.doesNotMatch(interruptedTaskMarkup, /composer-stage-picker|Investigation|Implementation/);
   assert.match(interruptedTaskMarkup, /Start run/);
 
   const interruptedCard = renderToStaticMarkup(createElement(HandoverCard, { run: {
@@ -55,7 +55,14 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
     id: "run-2", stage: "INVESTIGATION", sequence: 2, status: "COMPLETED", reason_code: null,
     error_message: null, handover: { summary: "Final handover" },
   } }));
+  assert.match(completedCard, /Investigation #2/);
   assert.match(completedCard, /Final handover/);
+  const workCard = renderToStaticMarkup(createElement(HandoverCard, { run: {
+    id: "run-3", stage: "WORK", sequence: 3, status: "COMPLETED", reason_code: null,
+    error_message: null, handover: null,
+  } }));
+  assert.match(workCard, /Work #3/);
+  assert.doesNotMatch(workCard, /No handover recorded|final handover was recorded/i);
 
   const timestamp = new Date().toISOString();
   const messageCard = renderToStaticMarkup(createElement(LiveMessageCard, {
@@ -80,7 +87,7 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.match(messageCard, /local · coder · in 14 · out 7 tokens/);
 });
 
-test("the task board only displays Ready to Merge for a current active snapshot", async (t) => {
+test("the task board renders legacy Validation readiness tags as ordinary work completion", async (t) => {
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
@@ -100,13 +107,15 @@ test("the task board only displays Ready to Merge for a current active snapshot"
     queue: null, projects: [], projectId: "all", onStartTask() {}, onOpenTask() {}, onCreateTask() {}, onDeleteTask() {}, onCancelTask() {},
   }));
   const staleMarkup = renderBoard(baseTask);
-  assert.match(staleMarkup, /IMPLEMENTATION COMPLETE/);
+  assert.match(staleMarkup, /WORK COMPLETE/);
   assert.doesNotMatch(staleMarkup, /READY TO MERGE/);
-  assert.match(renderBoard({ ...baseTask, validation_snapshot_current: true }), /READY TO MERGE/);
-  assert.doesNotMatch(renderBoard({ ...baseTask, active_validation_snapshot_id: null, validation_snapshot_current: true }), /READY TO MERGE/);
+  const workMarkup = renderBoard({ ...baseTask, review_tag: "WORK_COMPLETE", active_validation_snapshot_id: null });
+  assert.match(workMarkup, /WORK COMPLETE/);
+  assert.match(workMarkup, /Worker/);
+  assert.doesNotMatch(renderBoard({ ...baseTask, validation_snapshot_current: true }), /READY TO MERGE/);
 });
 
-test("stale or inactive validation snapshots are not rendered as Ready to Merge", async (t) => {
+test("legacy Validation tags are not rendered as active merge readiness", async (t) => {
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
@@ -126,5 +135,5 @@ test("stale or inactive validation snapshots are not rendered as Ready to Merge"
   const markup = renderToStaticMarkup(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: staleTask, queue: null, onClose() {}, onChanged() {} })));
   assert.doesNotMatch(markup, /Ready to Merge/i,
-    "an inactive/stale snapshot must not be presented as current merge readiness");
+    "historical Validation metadata must not be presented as current merge readiness");
 });

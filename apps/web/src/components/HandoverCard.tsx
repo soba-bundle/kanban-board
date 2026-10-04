@@ -28,7 +28,7 @@ export function HandoverCard({ run }: { run: TaskRunSummary }) {
   const handover = run.handover as Record<string, unknown> | null;
   const validation = run.validation_result;
   const findings = validation?.findings ?? [];
-  const stageLabel = run.stage === "INVESTIGATION" ? "Investigation" : run.stage === "IMPLEMENTATION" ? "Implementation" : "Validation";
+  const stageLabel = run.stage === "WORK" ? "Work" : run.stage === "INVESTIGATION" ? "Investigation" : run.stage === "IMPLEMENTATION" ? "Implementation" : "Validation";
 
   async function copyFindings(attribution: ValidationAttribution) {
     const selected = findings.filter((finding) => finding.attribution === attribution);
@@ -79,7 +79,7 @@ export function HandoverCard({ run }: { run: TaskRunSummary }) {
             ? "Validation is reviewing the pinned checkpoint."
             : "No validation report was recorded for this run."}</p>}
         </section>
-      ) : !handover ? <p className="run-empty">{run.status === "INTERRUPTED"
+      ) : !handover ? run.stage === "WORK" ? null : <p className="run-empty">{run.status === "INTERRUPTED"
         ? "Run interrupted before the final handover. Enter a new prompt in Live to continue."
         : run.status === "FAILED"
           ? "Run failed before a final handover was recorded."

@@ -41,11 +41,9 @@ function makeFixture(sessionDir) {
     VALUES ('project-1', 'Project', '/tmp/project', ?, ?)`).run(now, now);
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Task', '', 'IN_PROGRESS', ?, ?)`).run(now, now);
-  for (const id of ["run-1", "run-2", "run-3"]) {
-    // Pre-seeded handover: this fixture exercises session reuse, not handover enforcement.
-    db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, handover_json)
-      VALUES (?, 'task-1', 'INVESTIGATION', ?, 'QUEUED', '{"stage":"INVESTIGATION"}')`)
-      .run(id, id === "run-1" ? 1 : 2);
+  for (const [index, id] of ["run-1", "run-2", "run-3"].entries()) {
+    db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
+      VALUES (?, 'task-1', 'WORK', ?, 'QUEUED')`).run(id, index + 1);
   }
   const createdSessions = [];
   const customToolsSeen = [];
@@ -137,7 +135,7 @@ test("successive runs reuse the persisted task session", async (t) => {
 
   assert.equal(createdSessions.length, 1);
   assert.deepEqual(createdSessions[0].prompts, ["investigate", "implement"]);
-  assert.deepEqual(customToolsSeen.map((tools) => tools.map((tool) => tool.name)), [["submit_handover", "kanban_questionnaire"]]);
+  assert.deepEqual(customToolsSeen.map((tools) => tools.map((tool) => tool.name)), [["kanban_questionnaire"]]);
   const sessionId = createdSessions[0].sessionId;
   assert.ok(createdSessions[0].sessionFile);
   assert.ok(existsSync(createdSessions[0].sessionFile));
@@ -152,9 +150,9 @@ test("successive runs reuse the persisted task session", async (t) => {
   assert.equal(createdSessions.length, 2);
   assert.equal(createdSessions[1].sessionId, sessionId);
   assert.deepEqual(createdSessions[1].prompts, ["continue"]);
-  // Both repo-owned SDK tools are re-registered on restored sessions.
+  // The hosted Human Request tool is re-registered on restored sessions; handover submission is retired.
   assert.deepEqual(customToolsSeen.map((tools) => tools.map((tool) => tool.name)),
-    [["submit_handover", "kanban_questionnaire"], ["submit_handover", "kanban_questionnaire"]]);
+    [["kanban_questionnaire"], ["kanban_questionnaire"]]);
   restoredAgents.dispose("task-1");
 });
 
@@ -454,10 +452,11 @@ test("run WebSocket receives normalized live events from its task session", asyn
 
   await app.ready();
   const response = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
-    task_id: "task-1", stage: "INVESTIGATION", prompt: "Investigate the issue", idempotency_key: "start-run-1",
+    task_id: "task-1", prompt: "Investigate the issue", idempotency_key: "start-run-1",
   } });
   assert.equal(response.statusCode, 201);
   const runId = response.json().run_id;
+  assert.equal(db.prepare("SELECT stage FROM task_runs WHERE id = ?").get(runId).stage, "WORK");
   socket = await app.injectWS(`/api/tasks/task-1/runs/${runId}/events`);
   const received = new Promise((resolve, reject) => {
     socket.once("message", (data) => resolve(JSON.parse(data.toString())));
@@ -468,9 +467,9 @@ test("run WebSocket receives normalized live events from its task session", asyn
   assert.equal(event.taskId, "task-1");
   assert.equal(event.runId, runId);
   assert.equal(event.type, "message_update");
-  assert.match(event.data.delta, /^Investigate this task/);
+  assert.match(event.data.delta, /^Work on this task/);
   socket.terminate();
-  // This run never submits a handover, so let the retry/failure path settle before teardown.
+  // Let normal run completion settle without a handover retry.
   await waitFor(() => !["QUEUED", "RUNNING"].includes(
     db.prepare("SELECT status FROM task_runs WHERE id = ?").get(runId).status));
 });

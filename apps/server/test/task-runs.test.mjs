@@ -3,9 +3,8 @@ import test from "node:test";
 import Fastify from "fastify";
 import { openDatabase } from "../dist/db.js";
 import { registerTaskRunRoutes } from "../dist/task-runs.js";
-import { recordValidationResult } from "../dist/agents/validation-results.js";
 
-test("task runs endpoint exposes validation findings and recomputes active readiness", async (t) => {
+test("task runs endpoint exposes historical Validation findings without recomputing readiness", async (t) => {
   const db = openDatabase(":memory:");
   const now = new Date().toISOString();
   const baseSha = "a".repeat(40);
@@ -18,36 +17,28 @@ test("task runs endpoint exposes validation findings and recomputes active readi
     .run(baseSha, candidateSha, now, now);
   db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status)
     VALUES ('validation-1', 't', 'VALIDATION_REVIEW', 1, 'COMPLETED')`).run();
-  await recordValidationResult(db, {
-    task_id: "t", run_id: "validation-1", candidate_sha: candidateSha, base_sha: baseSha,
-    base_tip_at_start: baseSha, base_tip_at_finish: baseSha, guidance_watermark: "2",
-    task_head_at_start: candidateSha, task_head_at_finish: candidateSha,
-    task_worktree_clean_at_start: true, task_worktree_clean_at_finish: true,
-    validation_worktree_clean: true,
-    report: { findings: [{ id: "indirect-1", attribution: "INDIRECT", summary: "Old timeout",
-      rationale: "It predates this change.", evidence: "Observed under load.", locations: [{ file: "src/client.ts", line: 8 }] }] },
-  });
+  db.prepare(`INSERT INTO validation_results (id, task_id, run_id, result, findings_json, created_at)
+    VALUES ('result-1', 't', 'validation-1', 'ISSUES_FOUND', ?, ?)`).run(JSON.stringify([
+      { id: "indirect-1", attribution: "INDIRECT", summary: "Old timeout",
+        rationale: "It predates this change.", evidence: "Observed under load.", locations: [{ file: "src/client.ts", line: 8 }] },
+    ]), now);
 
-  let liveBaseTip = baseSha;
+  let gitReads = 0;
   const worktrees = {
-    async getBaseBranchTip() { return liveBaseTip; },
-    async getTaskWorktreeState() { return { head_sha: candidateSha, dirty: false }; },
+    async getBaseBranchTip() { gitReads++; return baseSha; },
+    async getTaskWorktreeState() { gitReads++; return { head_sha: candidateSha, dirty: false }; },
   };
   const app = Fastify();
-  registerTaskRunRoutes(app, db, worktrees);
+  registerTaskRunRoutes(app, db);
   t.after(async () => { await app.close(); db.close(); });
 
-  let response = await app.inject({ method: "GET", url: "/api/tasks/t/runs" });
-  let validation = response.json()[0].validation_result;
+  const response = await app.inject({ method: "GET", url: "/api/tasks/t/runs" });
+  const validation = response.json()[0].validation_result;
   assert.equal(validation.result, "ISSUES_FOUND");
-  assert.equal(validation.active, true);
-  assert.equal(validation.findings[0].summary, "Old timeout");
-
-  liveBaseTip = "c".repeat(40);
-  response = await app.inject({ method: "GET", url: "/api/tasks/t/runs" });
-  validation = response.json()[0].validation_result;
   assert.equal(validation.active, false);
-  assert.equal(db.prepare("SELECT review_tag FROM tasks WHERE id = 't'").get().review_tag, "IMPLEMENTATION_COMPLETE");
+  assert.equal(validation.findings[0].summary, "Old timeout");
+  assert.equal(gitReads, 0, "history reads do not inspect live Git state");
+  assert.equal(db.prepare("SELECT review_tag FROM tasks WHERE id = 't'").get().review_tag, "IN_PROGRESS");
 });
 
 test("task runs endpoint exposes parsed handovers in run order", async (t) => {

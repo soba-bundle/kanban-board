@@ -8,21 +8,19 @@ import type { TaskOperationCoordinator } from "../task-operation-coordinator.js"
 
 interface MergeOptions { confirmed: boolean; preview_id?: string }
 interface MergeTask {
-  id: string; root_path: string; base_branch: string | null; base_commit_sha: string | null;
+  id: string; workflow_state: string; root_path: string; base_branch: string | null; base_commit_sha: string | null;
   latest_task_commit_sha: string | null; worktree_path: string | null; agent_branch: string | null;
-  active_validation_snapshot_id: string | null; ide_command: string | null;
+  ide_command: string | null;
 }
 interface MergeAttempt {
   id: string; task_id: string; approval_status: string; status: string; validated_base_sha: string;
-  validated_task_sha: string; validation_snapshot_id: string | null; priority_validation_run_id: string | null;
-  sync_base_sha: string | null; sync_candidate_sha: string | null; base_branch: string | null;
+  validated_task_sha: string; sync_base_sha: string | null; sync_candidate_sha: string | null; base_branch: string | null;
 }
 
 export interface MergeManagerOptions {
   db: Database.Database;
   worktrees: WorktreeManager;
   operations: TaskOperationCoordinator;
-  validation: { start(taskId: string, options?: { priority?: boolean }): Promise<{ run_id: string; status: string }> };
   beforeRefUpdate?: (input: { branch: string; expectedOldSha: string; candidateSha: string }) => Promise<void> | void;
 }
 
@@ -30,56 +28,90 @@ function fail(message: string): Error { return Object.assign(new Error(message),
 function gitError(result: { stderr: string }, fallback: string): Error { return fail(result.stderr.trim() || fallback); }
 
 export class MergeManager {
-  private readonly previews = new Map<string, string>();
+  private readonly previews = new Map<string, { taskId: string; baseSha: string; taskSha: string; branch: string; baseBranch: string }>();
   constructor(private readonly options: MergeManagerOptions) {}
 
   private get db() { return this.options.db; }
 
   private task(taskId: string): MergeTask {
-    const task = this.db.prepare(`SELECT t.id, t.base_branch, t.base_commit_sha, t.latest_task_commit_sha,
-      t.worktree_path, t.agent_branch, t.active_validation_snapshot_id, p.root_path, p.ide_command
+    const task = this.db.prepare(`SELECT t.id, t.workflow_state, t.base_branch, t.base_commit_sha, t.latest_task_commit_sha,
+      t.worktree_path, t.agent_branch, p.root_path, p.ide_command
       FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?`).get(taskId) as MergeTask | undefined;
     if (!task) throw Object.assign(new Error("Task not found."), { statusCode: 404 });
     return task;
   }
 
+  async checkSync(taskId: string, acquireLock = true) {
+    const blocked = (reasons: string[], currentBase: string | null = null, taskSha: string | null = null, branch: string | null = null,
+      recordedBase: string | null = null, baseMoved = false) => ({
+      task_id: taskId, status: "BLOCKED" as const, in_sync: false, base_sha: currentBase,
+      recorded_base_sha: recordedBase, task_sha: taskSha, branch, base_moved: baseMoved,
+      checked_at: new Date().toISOString(), reasons,
+    });
+    const release = acquireLock ? this.options.operations.tryAcquire(taskId) : undefined;
+    if (acquireLock && !release) return blocked(["Another task operation is active; retry Check sync when it finishes."]);
+    try {
+      const task = this.task(taskId);
+      const reasons: string[] = [];
+      let currentBase: string | null = null;
+      let state: Awaited<ReturnType<WorktreeManager["getTaskSyncState"]>> | null = null;
+      if (task.workflow_state !== "REVIEW") reasons.push("Check sync is available only for tasks in Review.");
+      if (!task.base_branch || !task.base_commit_sha || !task.worktree_path || !task.agent_branch) {
+        reasons.push("Task base branch and task worktree metadata are required.");
+      } else {
+        try { currentBase = await this.options.worktrees.getBaseBranchTip(taskId); }
+        catch (error) { reasons.push(error instanceof Error ? error.message : String(error)); }
+        try { state = await this.options.worktrees.getTaskSyncState(taskId); }
+        catch (error) { reasons.push(error instanceof Error ? error.message : String(error)); }
+      }
+      if (state) {
+        if (state.branch !== task.agent_branch) reasons.push(`Task branch changed; expected ${task.agent_branch}.`);
+        if (state.dirty) reasons.push("Task worktree has uncommitted changes.");
+        if (state.operation) reasons.push(`A Git ${state.operation.toLowerCase()} operation is in progress.`);
+        if (state.hasUnmergedPaths && !state.operation) reasons.push("Task worktree has unresolved Git conflicts.");
+        if (!task.latest_task_commit_sha) reasons.push("Create a task checkpoint before checking sync readiness.");
+        else if (state.headSha !== task.latest_task_commit_sha) reasons.push("Task HEAD differs from the recorded checkpoint.");
+      }
+      const activeSync = this.db.prepare(`SELECT 1 FROM git_sync_attempts WHERE task_id = ?
+        AND status IN ('PREPARED', 'MERGING', 'RUNNING', 'CONFLICT', 'ABORTING', 'INTERRUPTED') LIMIT 1`).get(taskId);
+      if (activeSync) reasons.push("Resolve or clear the active sync recovery before checking readiness.");
+      const baseMoved = !!currentBase && currentBase !== task.base_commit_sha;
+      let behindCurrentBase = false;
+      const structurallySafe = !!state && !state.dirty && !state.operation && !state.hasUnmergedPaths &&
+        state.branch === task.agent_branch && !!task.latest_task_commit_sha && state.headSha === task.latest_task_commit_sha &&
+        !activeSync && task.workflow_state === "REVIEW";
+      if (structurallySafe && currentBase) {
+        try {
+          behindCurrentBase = !await this.options.worktrees.isBaseAncestorOfTask(taskId, currentBase, state!.headSha);
+          if (behindCurrentBase) reasons.push("The current base is not an ancestor of the task commit; use Sync with main, then check again.");
+        } catch (error) {
+          reasons.push(`Unable to verify current-base ancestry: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      const status = reasons.length ? (structurallySafe && behindCurrentBase ? "STALE" as const : "BLOCKED" as const) : "IN_SYNC" as const;
+      return { task_id: taskId, status, in_sync: status === "IN_SYNC", base_sha: currentBase,
+        recorded_base_sha: task.base_commit_sha, task_sha: state?.headSha ?? null, branch: state?.branch ?? null,
+        base_moved: baseMoved, checked_at: new Date().toISOString(), reasons };
+    } finally { release?.(); }
+  }
+
   async preview(taskId: string) {
     const task = this.task(taskId);
-    const reasons: string[] = [];
-    let liveBase = "";
-    try {
-      if (!task.base_branch || !task.base_commit_sha || !task.latest_task_commit_sha || !task.worktree_path || !task.agent_branch) {
-        reasons.push("Create a task checkpoint and worktree before merging.");
-      } else {
-        liveBase = (await runGit(["rev-parse", "--verify", `refs/heads/${task.base_branch}`], { cwd: realpathSync(task.root_path) })).stdout.trim();
-        if (await getCurrentBranch(task.worktree_path) !== task.agent_branch) reasons.push("Task branch changed.");
-        if (await getHeadSha(task.worktree_path) !== task.latest_task_commit_sha) reasons.push("Task checkpoint changed.");
-        if ((await getStatus(task.worktree_path)).length) reasons.push("Task worktree has uncommitted changes.");
-        if ((await getGitOperationState(task.worktree_path)).operation) reasons.push("A Git operation is in progress.");
-        const snapshot = task.active_validation_snapshot_id ? this.db.prepare(`SELECT s.id, s.validated_task_sha,
-          s.validated_base_sha, s.result, r.findings_json FROM validation_snapshots s
-          JOIN validation_results r ON r.run_id = s.validation_run_id WHERE s.id = ?`).get(task.active_validation_snapshot_id) as {
-            id: string; validated_task_sha: string; validated_base_sha: string; result: string; findings_json: string | null;
-          } | undefined : undefined;
-        if (!snapshot || snapshot.result !== "PASSED" || snapshot.validated_task_sha !== task.latest_task_commit_sha ||
-          snapshot.validated_base_sha !== task.base_commit_sha) reasons.push("A current passing Validation is required.");
-        if (snapshot?.findings_json && JSON.parse(snapshot.findings_json).some((finding: { attribution?: string }) =>
-          finding.attribution === "DIRECT" || finding.attribution === "UNCERTAIN")) reasons.push("Validation findings block merge.");
-        const guidance = this.db.prepare(`SELECT COUNT(*) AS count FROM run_inputs i JOIN task_runs r ON r.id = i.run_id
-          WHERE r.task_id = ? AND i.delivery_type = 'STEERING' AND i.delivery_status = 'DELIVERED'
-          AND i.sequence > COALESCE((SELECT CAST(messages_watermark AS INTEGER) FROM validation_snapshots WHERE id = ?), 0)`)
-          .get(taskId, snapshot?.id ?? "") as { count: number };
-        if (guidance.count > 0) reasons.push("New guidance requires fresh Validation.");
-        const active = this.db.prepare(`SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
-          WHERE r.task_id = ? AND j.status IN ('QUEUED', 'CLAIMED') LIMIT 1`).get(taskId);
-        if (active) reasons.push("Another task run is active or queued.");
-      }
-    } catch (error) { reasons.push(error instanceof Error ? error.message : String(error)); }
+    const sync = await this.checkSync(taskId);
+    const reasons = [...sync.reasons];
+    const active = this.db.prepare(`SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+      WHERE r.task_id = ? AND j.status IN ('QUEUED', 'CLAIMED') LIMIT 1`).get(taskId);
+    if (active) reasons.push("Another task run is active or queued.");
     const previewId = randomUUID();
-    this.previews.set(previewId, `${taskId}:${task.latest_task_commit_sha ?? ""}:${task.base_commit_sha ?? ""}`);
-    return { task_id: taskId, eligible: reasons.length === 0, reasons, candidate_sha: task.latest_task_commit_sha,
-      validated_base_sha: task.base_commit_sha, current_base_sha: liveBase, base_moved: !!liveBase && liveBase !== task.base_commit_sha,
-      preview_id: previewId };
+    for (const [id, preview] of this.previews) if (preview.taskId === taskId) this.previews.delete(id);
+    const eligible = sync.status === "IN_SYNC" && !active;
+    if (sync.status === "IN_SYNC" && sync.base_sha && sync.task_sha && sync.branch && task.base_branch) {
+      this.previews.set(previewId, { taskId, baseSha: sync.base_sha, taskSha: sync.task_sha,
+        branch: sync.branch, baseBranch: task.base_branch });
+    }
+    return { task_id: taskId, eligible, reasons, base_branch: task.base_branch, candidate_sha: sync.task_sha,
+      checked_base_sha: sync.base_sha, recorded_base_sha: sync.recorded_base_sha, current_base_sha: sync.base_sha,
+      base_moved: sync.base_moved, sync_status: sync.status, checked_at: sync.checked_at, preview_id: previewId };
   }
 
   async start(taskId: string, options: MergeOptions) {
@@ -95,55 +127,35 @@ export class MergeManager {
           return { status: "MERGED", merge_attempt_id: prior.id };
         }
       }
-      const task = this.task(taskId);
-      const preview = await this.preview(taskId);
-      if (!preview.eligible) throw fail(preview.reasons.join(" "));
-      if (options.preview_id && this.previews.get(options.preview_id) !== `${taskId}:${task.latest_task_commit_sha}:${task.base_commit_sha}`) {
-        throw fail("Merge preview changed; review the current candidate and try again.");
+      if (!options.preview_id) throw fail("Merge preview is missing or expired; refresh Check sync and confirm again.");
+      const approvedPreview = this.previews.get(options.preview_id);
+      if (!approvedPreview || approvedPreview.taskId !== taskId) {
+        throw fail("Merge preview is missing or expired; refresh Check sync and confirm again.");
       }
-      const snapshot = this.db.prepare("SELECT id FROM validation_snapshots WHERE id = ?").get(task.active_validation_snapshot_id) as { id: string };
+      const task = this.task(taskId);
+      const sync = await this.checkSync(taskId, false);
+      if (sync.status !== "IN_SYNC") {
+        const advice = sync.status === "STALE" ? "Sync with main, then Check sync again." : "Resolve the blocked Git state, then Check sync again.";
+        throw fail(`${sync.reasons.join(" ")} ${advice}`);
+      }
+      if (sync.base_sha !== approvedPreview.baseSha || sync.task_sha !== approvedPreview.taskSha ||
+        sync.branch !== approvedPreview.branch || task.base_branch !== approvedPreview.baseBranch) {
+        this.previews.delete(options.preview_id);
+        throw fail("Git state changed since the merge preview; refresh Check sync and confirm again. If the base moved, Sync with main first.");
+      }
+      const active = this.db.prepare(`SELECT 1 FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id
+        WHERE r.task_id = ? AND j.status IN ('QUEUED', 'CLAIMED') LIMIT 1`).get(taskId);
+      if (active) throw fail("Another task run is active or queued.");
+      this.previews.delete(options.preview_id);
       const now = new Date().toISOString();
       const attemptId = randomUUID();
-      this.db.prepare(`INSERT INTO merge_attempts (id, task_id, validation_snapshot_id, approval_status,
-        validated_base_sha, validated_task_sha, status, started_at, base_branch)
-        VALUES (?, ?, ?, 'APPROVED', ?, ?, 'APPROVED', ?, ?)`)
-        .run(attemptId, taskId, snapshot.id, task.base_commit_sha, task.latest_task_commit_sha, now, task.base_branch);
-      if (preview.current_base_sha !== task.base_commit_sha) {
-        return await this.syncMovedBase(task, attemptId, preview.current_base_sha);
-      }
-      await this.integrate(task, attemptId, task.base_commit_sha!, task.latest_task_commit_sha!);
+      this.db.prepare(`INSERT INTO merge_attempts (id, task_id, approval_status,
+        validated_base_sha, validated_task_sha, status, started_at, base_branch, sync_base_sha, sync_candidate_sha)
+        VALUES (?, ?, 'APPROVED', ?, ?, 'APPROVED', ?, ?, ?, ?)`)
+        .run(attemptId, taskId, sync.base_sha, sync.task_sha, now, task.base_branch, sync.base_sha, sync.task_sha);
+      await this.integrate(task, attemptId, sync.base_sha!, sync.task_sha!);
       return { status: this.cleanupPending(taskId) ? "MERGED_CLEANUP_PENDING" : "MERGED", merge_attempt_id: attemptId };
     } finally { release(); }
-  }
-
-  private async syncMovedBase(task: MergeTask, attemptId: string, baseSha: string) {
-    const worktree = task.worktree_path!;
-    const merge = await runGit(["merge", "--no-edit", baseSha], { cwd: worktree });
-    if (merge.exitCode !== 0) {
-      const operation = await getGitOperationState(worktree);
-      if (operation.operation === "MERGE" || (await runGit(["ls-files", "-u"], { cwd: worktree })).stdout.trim()) {
-        this.db.prepare("UPDATE merge_attempts SET approval_status = 'REVOKED', status = 'MERGE_CONFLICT', error_reason = ? WHERE id = ?")
-          .run(merge.stderr.trim() || "Base sync has conflicts.", attemptId);
-        this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'MERGE_CONFLICT', updated_at = ? WHERE id = ?")
-          .run(new Date().toISOString(), task.id);
-        return { status: "MERGE_CONFLICT", merge_attempt_id: attemptId };
-      }
-      this.revoke(attemptId, "BASE_SYNC_FAILED");
-      throw gitError(merge, "Unable to sync the current base into the task branch.");
-    }
-    const candidate = await getHeadSha(worktree);
-    this.db.prepare(`UPDATE tasks SET base_commit_sha = ?, latest_task_commit_sha = ?, active_validation_snapshot_id = NULL,
-      review_tag = 'IMPLEMENTATION_COMPLETE', updated_at = ? WHERE id = ?`).run(baseSha, candidate, new Date().toISOString(), task.id);
-    this.db.prepare("UPDATE merge_attempts SET status = 'VALIDATION_QUEUED', sync_base_sha = ?, sync_candidate_sha = ? WHERE id = ?")
-      .run(baseSha, candidate, attemptId);
-    try {
-      const validation = await this.options.validation.start(task.id, { priority: true });
-      this.db.prepare("UPDATE merge_attempts SET priority_validation_run_id = ? WHERE id = ?").run(validation.run_id, attemptId);
-      return { status: "VALIDATION_QUEUED", merge_attempt_id: attemptId, run_id: validation.run_id };
-    } catch (error) {
-      this.revoke(attemptId, "VALIDATION_START_FAILED");
-      throw error;
-    }
   }
 
   private cleanupPending(taskId: string): boolean {
@@ -161,7 +173,7 @@ export class MergeManager {
     if (await getCurrentBranch(task.worktree_path!) !== task.agent_branch ||
       await getHeadSha(task.worktree_path!) !== candidate || (await getStatus(task.worktree_path!)).length ||
       (await getGitOperationState(task.worktree_path!)).operation) {
-      this.revoke(attemptId, "TASK_CHANGED"); throw fail("Task branch, candidate, worktree, or Git state changed; review and validate again.");
+      this.revoke(attemptId, "TASK_CHANGED"); throw fail("Task branch, candidate, worktree, or Git state changed; review, check sync, and confirm again.");
     }
     const ancestor = await runGit(["merge-base", "--is-ancestor", expectedBase, candidate], { cwd: root });
     if (ancestor.exitCode !== 0) { this.revoke(attemptId, "NOT_FAST_FORWARD"); throw fail("Task candidate is not a fast-forward of the base."); }
@@ -196,7 +208,7 @@ export class MergeManager {
     const now = new Date().toISOString();
     this.db.transaction(() => {
       this.db.prepare("UPDATE merge_attempts SET status = 'COMPLETED', completed_at = ?, error_reason = NULL WHERE id = ?").run(now, attemptId);
-      this.db.prepare("UPDATE tasks SET workflow_state = 'DONE', resolution = 'MERGED', active_validation_snapshot_id = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
+      this.db.prepare("UPDATE tasks SET workflow_state = 'DONE', resolution = 'MERGED', updated_at = ? WHERE id = ?").run(now, task.id);
     })();
     try { await this.options.worktrees.removeTaskWorktree(task.id); }
     catch { /* successful integration remains authoritative; cleanup is retried separately */ }
@@ -206,50 +218,6 @@ export class MergeManager {
     this.db.prepare("UPDATE merge_attempts SET approval_status = 'REVOKED', status = ?, error_reason = ? WHERE id = ?")
       .run(reason, reason, attemptId);
   }
-
-  async onValidationStopped(attemptId: string, runId: string) {
-    const attempt = this.db.prepare("SELECT * FROM merge_attempts WHERE id = ?").get(attemptId) as MergeAttempt | undefined;
-    if (!attempt || attempt.priority_validation_run_id !== runId || attempt.approval_status !== "APPROVED") return { status: "APPROVAL_REVOKED" };
-    this.revoke(attemptId, "VALIDATION_STOPPED");
-    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'VALIDATION_FAILED', active_validation_snapshot_id = NULL, updated_at = ? WHERE id = ?")
-      .run(new Date().toISOString(), attempt.task_id);
-    return { status: "VALIDATION_STOPPED" };
-  }
-
-  async onJobRemoved(jobId: string) {
-    const run = this.db.prepare("SELECT r.id, r.task_id, r.stage FROM agent_jobs j JOIN task_runs r ON r.id = j.task_run_id WHERE j.id = ?")
-      .get(jobId) as { id: string; task_id: string; stage: string } | undefined;
-    if (!run || run.stage !== "VALIDATION_REVIEW") return;
-    const attempt = this.db.prepare("SELECT id FROM merge_attempts WHERE priority_validation_run_id = ? AND approval_status = 'APPROVED'")
-      .get(run.id) as { id: string } | undefined;
-    if (attempt) await this.onValidationStopped(attempt.id, run.id);
-  }
-
-  async onValidationCompleted(attemptId: string, runId: string) {
-    const attempt = this.db.prepare("SELECT * FROM merge_attempts WHERE id = ?").get(attemptId) as MergeAttempt | undefined;
-    if (!attempt || attempt.priority_validation_run_id !== runId || attempt.approval_status !== "APPROVED") return { status: "APPROVAL_REVOKED" };
-    const task = this.task(attempt.task_id);
-    const currentBase = (await runGit(["rev-parse", "--verify", `refs/heads/${attempt.base_branch}`], { cwd: realpathSync(task.root_path) })).stdout.trim();
-    if (currentBase !== attempt.sync_base_sha) { this.revoke(attemptId, "BASE_MOVED_AGAIN"); return { status: "REAPPROVAL_REQUIRED" }; }
-    const snapshot = this.db.prepare(`SELECT s.id, s.validated_task_sha, s.validated_base_sha, s.result, r.findings_json
-      FROM validation_snapshots s JOIN validation_results r ON r.run_id = s.validation_run_id WHERE s.id = ?`)
-      .get(task.active_validation_snapshot_id) as { id: string; validated_task_sha: string; validated_base_sha: string; result: string; findings_json: string | null } | undefined;
-    const invalidFindings = snapshot?.findings_json && JSON.parse(snapshot.findings_json).some((finding: { attribution?: string }) =>
-      finding.attribution === "DIRECT" || finding.attribution === "UNCERTAIN");
-    const watermark = snapshot && this.db.prepare("SELECT CAST(messages_watermark AS INTEGER) AS value FROM validation_snapshots WHERE id = ?")
-      .get(snapshot.id) as { value: number } | undefined;
-    const newGuidance = this.db.prepare(`SELECT 1 FROM run_inputs i JOIN task_runs r ON r.id = i.run_id
-      WHERE r.task_id = ? AND i.delivery_type = 'STEERING' AND i.delivery_status = 'DELIVERED'
-      AND i.sequence > COALESCE(?, 0) LIMIT 1`).get(task.id, watermark?.value ?? 0);
-    if (!snapshot || snapshot.result !== "PASSED" || invalidFindings || newGuidance ||
-      snapshot.validated_task_sha !== attempt.sync_candidate_sha || snapshot.validated_base_sha !== attempt.sync_base_sha) {
-      this.revoke(attemptId, "VALIDATION_NOT_READY");
-      return { status: "APPROVAL_REVOKED" };
-    }
-    await this.integrate(task, attemptId, attempt.sync_base_sha!, attempt.sync_candidate_sha!);
-    return { status: this.cleanupPending(task.id) ? "MERGED_CLEANUP_PENDING" : "MERGED" };
-  }
-
   async retry(taskId: string) {
     const release = this.options.operations.tryAcquire(taskId);
     if (!release) throw fail("Another operation is active for this task.");
@@ -262,13 +230,12 @@ export class MergeManager {
     const state = await this.options.worktrees.getTaskWorktreeState(taskId);
     if (state.dirty) throw fail("Commit the resolved conflict as a checkpoint before Retry.");
     const branch = await getCurrentBranch(task.worktree_path!);
-    if (branch !== task.agent_branch) throw fail("Task branch changed; cannot retry validation.");
-    this.db.prepare("UPDATE tasks SET latest_task_commit_sha = ?, active_validation_snapshot_id = NULL, workflow_state = 'REVIEW', review_tag = 'IMPLEMENTATION_COMPLETE', updated_at = ? WHERE id = ?")
+    if (branch !== task.agent_branch) throw fail("Task branch changed; cannot retry merge recovery.");
+    this.db.prepare("UPDATE tasks SET latest_task_commit_sha = ?, workflow_state = 'REVIEW', review_tag = 'WORK_COMPLETE', updated_at = ? WHERE id = ?")
       .run(state.head_sha, new Date().toISOString(), taskId);
     const attempt = this.db.prepare("SELECT id FROM merge_attempts WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string };
     this.revoke(attempt.id, "MANUAL_RESOLUTION");
-    const validation = await this.options.validation.start(taskId, { priority: true });
-    return { status: "VALIDATION_QUEUED", run_id: validation.run_id };
+    return { status: "CHECK_SYNC_REQUIRED" };
     } finally { release(); }
   }
 
@@ -286,7 +253,7 @@ export class MergeManager {
     const result = await runGit(["merge", "--abort"], { cwd: task.worktree_path! });
     if (result.exitCode !== 0) throw gitError(result, "Unable to abort the base sync; preserve the worktree and resolve Git state manually.");
     this.db.prepare("UPDATE merge_attempts SET status = 'ABORTED', approval_status = 'REVOKED' WHERE id = ?").run(latestAttempt.id);
-    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'IMPLEMENTATION_COMPLETE', updated_at = ? WHERE id = ?")
+    this.db.prepare("UPDATE tasks SET workflow_state = 'REVIEW', review_tag = 'WORK_COMPLETE', updated_at = ? WHERE id = ?")
       .run(new Date().toISOString(), taskId);
     return { status: "ABORTED" };
     } finally { release(); }
@@ -303,7 +270,7 @@ export class MergeManager {
         const now = new Date().toISOString();
         this.db.transaction(() => {
           this.db.prepare("UPDATE merge_attempts SET status = 'COMPLETED', completed_at = ? WHERE id = ?").run(now, attempt.id);
-          this.db.prepare("UPDATE tasks SET workflow_state = 'DONE', resolution = 'MERGED', active_validation_snapshot_id = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
+          this.db.prepare("UPDATE tasks SET workflow_state = 'DONE', resolution = 'MERGED', updated_at = ? WHERE id = ?").run(now, task.id);
         })();
       } else {
         this.revoke(attempt.id, "RESTARTED");

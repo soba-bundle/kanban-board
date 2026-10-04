@@ -30,12 +30,6 @@ export function loadRuns(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/runs`);
 }
 
-export function startValidation(taskId) {
-  return request(`/api/tasks/${encodeURIComponent(taskId)}/validation`, {
-    method: "POST", ...json({}),
-  });
-}
-
 export function loadLiveHistory(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/live/history`);
 }
@@ -67,6 +61,32 @@ export function loadCheckpointPreview(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint-preview`);
 }
 
+export function checkTaskSync(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/check-sync`);
+}
+
+export function syncTaskWithBase(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/sync`, { method: "POST", ...json({}) });
+}
+
+export function loadTaskSyncRecovery(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/sync-recovery`);
+}
+
+export function viewTaskSyncConflicts(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/sync/view-conflicts`, { method: "POST", ...json({}) });
+}
+
+export function retryTaskSync(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/sync/retry`, { method: "POST", ...json({}) });
+}
+
+export function abortTaskSync(taskId, confirmed) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/sync/abort`, {
+    method: "POST", ...json({ confirmed }),
+  });
+}
+
 export function loadCheckpointDiff(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/checkpoint-diff`);
 }
@@ -75,8 +95,8 @@ export function loadMergePreview(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/merge-preview`);
 }
 
-export function startMerge(taskId) {
-  return request(`/api/tasks/${encodeURIComponent(taskId)}/merge`, { method: "POST", ...json({ confirmed: true }) });
+export function startMerge(taskId, previewId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/merge`, { method: "POST", ...json({ confirmed: true, preview_id: previewId }) });
 }
 
 export function mergeAction(taskId, action) {

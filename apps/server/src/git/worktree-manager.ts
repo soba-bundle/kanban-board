@@ -1,7 +1,6 @@
 import type Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { runGit } from "./git-command.js";
 import { openInIde } from "../ide/ide-launcher.js";
 import {
@@ -10,6 +9,7 @@ import {
   getDiff,
   getGitOperationState,
   getCheckpointStateToken,
+  getUncheckpointedDiff,
   createCheckpointCommit,
   getHeadSha,
   getStatus,
@@ -43,9 +43,10 @@ export interface CheckpointPreview {
   branch: string;
   commitSha: string;
   stateToken: string;
+  diff: string;
 }
 
-function sameCheckpointPreview(left: CheckpointPreview, right: CheckpointPreview): boolean {
+function sameCheckpointPreview(left: CheckpointPreview, right: Omit<CheckpointPreview, "diff">): boolean {
   return JSON.stringify(left.trackedChanges) === JSON.stringify(right.trackedChanges) &&
     JSON.stringify(left.untrackedFiles) === JSON.stringify(right.untrackedFiles) &&
     left.branch === right.branch && left.commitSha === right.commitSha && left.stateToken === right.stateToken;
@@ -166,17 +167,95 @@ export class WorktreeManager {
     return result.stdout.trim();
   }
 
-  async getValidationWorktreeStatus(taskId: string, worktreePath: string): Promise<GitFileStatus[]> {
-    const row = this.getTaskProject(taskId);
-    const expectedRoot = this.getWorktreeRoot(row);
-    const path = resolve(worktreePath);
-    const expectedPrefix = `validation-${taskSegment(taskId)}-`;
-    if (dirname(path) !== expectedRoot || !basename(path).startsWith(expectedPrefix)) {
-      throw new Error("Validation path does not belong to this task.");
+  async getTaskSyncState(taskId: string): Promise<{
+    branch: string | null; headSha: string; dirty: boolean; operation: string | null;
+    hasUnmergedPaths: boolean; stateToken: string;
+  }> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const readState = async () => {
+      const [branch, headSha, status, operation, unmerged, stateToken] = await Promise.all([
+        getCurrentBranch(path), getHeadSha(path), getStatus(path), getGitOperationState(path),
+        runGit(["ls-files", "-u"], { cwd: path }), getCheckpointStateToken(path),
+      ]);
+      return {
+        branch, headSha, dirty: status.length > 0, operation: operation.operation,
+        hasUnmergedPaths: !!unmerged.stdout.trim(), stateToken,
+      };
+    };
+    const first = await readState();
+    const confirmed = await readState();
+    if (JSON.stringify(first) !== JSON.stringify(confirmed)) {
+      throw new Error("Task worktree changed while reading sync state; preserve it and refresh before continuing.");
     }
-    const canonicalPath = realpathSync(path);
-    if (dirname(canonicalPath) !== expectedRoot) throw new Error("Validation path is outside the configured worktree root.");
-    return getStatus(canonicalPath);
+    return confirmed;
+  }
+
+  async isBaseAncestorOfTask(taskId: string, baseSha: string, taskSha: string): Promise<boolean> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const result = await runGit(["merge-base", "--is-ancestor", baseSha, taskSha], { cwd: path });
+    if (result.exitCode === 0) return true;
+    if (result.exitCode === 1) return false;
+    throw new Error(result.stderr.trim() || "Unable to verify whether the current base is in the task history.");
+  }
+
+  async taskSyncContains(taskId: string, baseSha: string, priorTaskSha: string, candidateSha: string): Promise<boolean> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const [containsBase, containsPrior] = await Promise.all([
+      runGit(["merge-base", "--is-ancestor", baseSha, candidateSha], { cwd: path }),
+      runGit(["merge-base", "--is-ancestor", priorTaskSha, candidateSha], { cwd: path }),
+    ]);
+    return containsBase.exitCode === 0 && containsPrior.exitCode === 0;
+  }
+
+  async abortTaskSync(taskId: string, input: { expectedBranch: string; expectedHead: string; stateToken: string }): Promise<void> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const state = await this.getTaskSyncState(taskId);
+    if (state.branch !== input.expectedBranch || state.headSha !== input.expectedHead || state.operation !== "MERGE" || !state.hasUnmergedPaths) {
+      throw new Error("The task no longer has the captured sync conflict; preserve its current Git state and inspect it.");
+    }
+    if (state.stateToken !== input.stateToken) {
+      throw new Error("The conflict worktree changed since the conflict snapshot; commit or preserve those edits before aborting.");
+    }
+    const abort = await runGit(["merge", "--abort"], { cwd: path });
+    if (abort.exitCode !== 0) throw gitFailure(abort, "Unable to abort the sync; preserve the task worktree and resolve Git state manually.");
+    const after = await this.getTaskSyncState(taskId);
+    if (after.branch !== input.expectedBranch || after.headSha !== input.expectedHead || after.dirty || after.operation || after.hasUnmergedPaths) {
+      throw new Error("Sync abort returned with unexpected Git state; preserve the task worktree and inspect it before continuing.");
+    }
+  }
+
+  async mergeBaseIntoTask(taskId: string, input: {
+    baseSha: string; expectedBranch: string; expectedHead: string;
+  }): Promise<{ status: "SYNCED"; candidateSha: string } | { status: "CONFLICT"; candidateSha: string }> {
+    const { path } = this.getTaskWorktreePath(taskId);
+    const [branch, head, status, operation] = await Promise.all([
+      getCurrentBranch(path), getHeadSha(path), getStatus(path), getGitOperationState(path),
+    ]);
+    if (branch !== input.expectedBranch) throw new Error(`Task branch changed; expected ${input.expectedBranch}.`);
+    if (head !== input.expectedHead) throw new Error("Task branch tip changed; refresh task state before syncing.");
+    if (operation.operation) throw new Error(`A Git ${operation.operation.toLowerCase()} operation is already in progress.`);
+    if (status.length > 0) throw new Error("Task worktree is dirty; checkpoint or preserve its changes before syncing.");
+
+    const merge = await runGit(["merge", "--no-edit", input.baseSha], { cwd: path });
+    if (merge.exitCode !== 0) {
+      const [currentOperation, unmerged] = await Promise.all([
+        getGitOperationState(path), runGit(["ls-files", "-u"], { cwd: path }),
+      ]);
+      if (currentOperation.operation === "MERGE" || unmerged.stdout.trim()) {
+        return { status: "CONFLICT", candidateSha: await getHeadSha(path) };
+      }
+      throw gitFailure(merge, "Unable to merge the captured base into the task branch; preserve the worktree state.");
+    }
+
+    const [finalBranch, candidateSha, finalStatus, finalOperation] = await Promise.all([
+      getCurrentBranch(path), getHeadSha(path), getStatus(path), getGitOperationState(path),
+    ]);
+    if (finalBranch !== input.expectedBranch || finalStatus.length > 0 || finalOperation.operation) {
+      throw new Error("Task worktree changed during sync; preserve its current Git state and inspect it before retrying.");
+    }
+    const containsBase = await runGit(["merge-base", "--is-ancestor", input.baseSha, candidateSha], { cwd: path });
+    if (containsBase.exitCode !== 0) throw new Error("Synchronized task commit does not contain the captured base.");
+    return { status: "SYNCED", candidateSha };
   }
 
   async getTaskCompletionStatus(taskId: string): Promise<{
@@ -206,7 +285,7 @@ export class WorktreeManager {
       : { ready: false, reason: "BRANCH_CHANGES" };
   }
 
-  async createCheckpoint(taskId: string, expected?: CheckpointPreview): Promise<string> {
+  async createCheckpoint(taskId: string, expected?: Omit<CheckpointPreview, "diff">): Promise<string> {
     const current = await this.previewCheckpoint(taskId);
     if (expected && !sameCheckpointPreview(current, expected)) {
       throw new Error("Task worktree changed; review the checkpoint contents again.");
@@ -228,13 +307,22 @@ export class WorktreeManager {
     if (operation.operation) throw new Error(`Cannot checkpoint while a Git ${operation.operation.toLowerCase()} operation is in progress.`);
     const status = await getStatus(path);
     const commitSha = await getHeadSha(path);
-    const stateToken = await getCheckpointStateToken(path);
+    const initialToken = await getCheckpointStateToken(path);
+    const diff = await getUncheckpointedDiff(path, status);
+    const [verifiedStatus, verifiedBranch, verifiedCommitSha, stateToken] = await Promise.all([
+      getStatus(path), getCurrentBranch(path), getHeadSha(path), getCheckpointStateToken(path),
+    ]);
+    if (stateToken !== initialToken || JSON.stringify(status) !== JSON.stringify(verifiedStatus) ||
+        branch !== verifiedBranch || commitSha !== verifiedCommitSha) {
+      throw new Error("Task worktree changed while preparing the preview; refresh and review it again.");
+    }
     return {
       trackedChanges: status.filter((file) => !file.untracked).map((file) => file.path),
       untrackedFiles: status.filter((file) => file.untracked).map((file) => file.path),
       branch,
       commitSha,
       stateToken,
+      diff,
     };
   }
 
@@ -285,31 +373,4 @@ export class WorktreeManager {
       .run(new Date().toISOString(), taskId);
   }
 
-  async createValidationWorktree(taskId: string, commitSha: string): Promise<string> {
-    const row = this.getTaskProject(taskId);
-    const repositoryRoot = realpathSync(row.root_path);
-    const worktreeRoot = this.getWorktreeRoot(row);
-    const path = resolve(worktreeRoot, `validation-${taskSegment(taskId)}-${randomUUID()}`);
-    const result = await runGit(["worktree", "add", "--detach", path, commitSha], { cwd: repositoryRoot });
-    if (result.exitCode !== 0) throw gitFailure(result, "Unable to create validation worktree.");
-    return path;
-  }
-
-  async removeValidationWorktree(taskId: string, worktreePath: string): Promise<void> {
-    const row = this.getTaskProject(taskId);
-    const repositoryRoot = realpathSync(row.root_path);
-    const worktreeRoot = this.getWorktreeRoot(row);
-    const path = resolve(worktreePath);
-    const expectedPrefix = `validation-${taskSegment(taskId)}-`;
-    if (dirname(path) !== worktreeRoot || !basename(path).startsWith(expectedPrefix)) {
-      throw new Error("Refusing to remove a path that is not this task's validation worktree.");
-    }
-    if (!existsSync(path)) return;
-    const canonicalPath = realpathSync(path);
-    if (dirname(canonicalPath) !== worktreeRoot) {
-      throw new Error("Refusing to remove a validation path outside the configured worktree root.");
-    }
-    const result = await runGit(["worktree", "remove", "--force", canonicalPath], { cwd: repositoryRoot });
-    if (result.exitCode !== 0) throw gitFailure(result, "Unable to remove validation worktree.");
-  }
 }

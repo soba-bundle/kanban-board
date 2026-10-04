@@ -2,7 +2,6 @@ import type { FastifyInstance } from "fastify";
 import type Database from "better-sqlite3";
 import type { WorktreeManager } from "./git/worktree-manager.js";
 import { TaskOperationCoordinator } from "./task-operation-coordinator.js";
-import { refreshValidationReadiness } from "./agents/validation-readiness.js";
 import { randomUUID } from "node:crypto";
 import {
   CheckpointConfirmationSchema,
@@ -14,27 +13,21 @@ import {
 } from "@kanban-board/shared";
 
 const taskFields = `t.id, t.project_id, t.title, t.description, t.workflow_state, t.review_tag,
-  t.latest_task_commit_sha, t.base_commit_sha, t.base_branch, t.worktree_path,
-  t.active_validation_snapshot_id, t.created_at, t.updated_at`;
+  t.latest_task_commit_sha, t.base_commit_sha, t.base_branch, t.worktree_path, t.created_at, t.updated_at`;
 
 export function hasAgentWorkStarted(db: Database.Database, taskId: string): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM task_runs WHERE task_id = ? AND
     (started_at IS NOT NULL OR status NOT IN ('QUEUED', 'CANCELLED')) LIMIT 1`).get(taskId));
 }
 
-async function listTasks(db: Database.Database, worktrees?: WorktreeManager, projectId?: string): Promise<Task[]> {
+async function listTasks(db: Database.Database, projectId?: string): Promise<Task[]> {
   const scope = `FROM tasks t JOIN projects p ON p.id = t.project_id
     WHERE t.is_active = 1 AND p.is_active = 1${projectId ? " AND t.project_id = ?" : ""}
     ORDER BY t.created_at, t.id`;
   const tasks = (projectId
     ? db.prepare(`SELECT ${taskFields} ${scope}`).all(projectId)
     : db.prepare(`SELECT ${taskFields} ${scope}`).all()) as Task[];
-  return Promise.all(tasks.map(async (task) => {
-    const validationCurrent = await refreshValidationReadiness(db, task.id, worktrees);
-    const refreshed = db.prepare("SELECT review_tag, active_validation_snapshot_id FROM tasks WHERE id = ?")
-      .get(task.id) as { review_tag: Task["review_tag"]; active_validation_snapshot_id: string | null };
-    return { ...task, ...refreshed, validation_snapshot_current: validationCurrent };
-  }));
+  return tasks;
 }
 
 export function registerTaskRoutes(
@@ -44,7 +37,7 @@ export function registerTaskRoutes(
   operations = new TaskOperationCoordinator(),
 ) {
   app.get<{ Querystring: { project_id?: string } }>("/api/tasks", async (request) => {
-    return listTasks(db, worktrees, request.query.project_id);
+    return listTasks(db, request.query.project_id);
   });
 
   app.post("/api/tasks", async (request, reply) => {
@@ -194,7 +187,8 @@ export function registerTaskRoutes(
     const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
       .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
     if (!task) return reply.code(404).send({ error: "Task not found." });
-    if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE", "VALIDATION_FAILED"].includes(task.review_tag ?? "")) {
+    if (task.workflow_state !== "REVIEW" || !["WORK_COMPLETE", "INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE",
+      "VALIDATION_FAILED", "VALIDATION_ISSUES", "READY_TO_MERGE"].includes(task.review_tag ?? "")) {
       return reply.code(409).send({ error: "This task is not eligible for a worktree preview." });
     }
     if (!worktrees) return reply.code(503).send({ error: "Worktree preview is unavailable." });
@@ -206,6 +200,7 @@ export function registerTaskRoutes(
         branch: preview.branch,
         commit_sha: preview.commitSha,
         state_token: preview.stateToken,
+        diff: preview.diff,
       };
     } catch (error) {
       return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) });
@@ -221,7 +216,7 @@ export function registerTaskRoutes(
       const task = db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = ? AND is_active = 1")
         .get(request.params.taskId) as { workflow_state: string; review_tag: string | null } | undefined;
       if (!task) return reply.code(404).send({ error: "Task not found." });
-      if (task.workflow_state !== "REVIEW" || !["INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
+      if (task.workflow_state !== "REVIEW" || !["WORK_COMPLETE", "INVESTIGATION_COMPLETE", "IMPLEMENTATION_COMPLETE"].includes(task.review_tag ?? "")) {
         return reply.code(409).send({ error: "Only completed work in Review can be checkpointed." });
       }
       if (!worktrees) return reply.code(503).send({ error: "Checkpointing is unavailable." });
@@ -253,7 +248,7 @@ export function registerTaskRoutes(
       try {
         const now = new Date().toISOString();
         db.transaction(() => {
-          db.prepare("UPDATE tasks SET latest_task_commit_sha = ?, active_validation_snapshot_id = NULL, updated_at = ? WHERE id = ?")
+          db.prepare("UPDATE tasks SET latest_task_commit_sha = ?, updated_at = ? WHERE id = ?")
             .run(sha, now, request.params.taskId);
           db.prepare(`UPDATE task_runs SET task_commit_sha = ? WHERE id = (
             SELECT id FROM task_runs WHERE task_id = ? AND status = 'COMPLETED'
@@ -302,7 +297,7 @@ export function registerTaskRoutes(
       REVIEW: [],
       DONE: [],
     };
-    for (const task of await listTasks(db, worktrees)) {
+    for (const task of await listTasks(db)) {
       const state = WorkflowStateSchema.parse(task.workflow_state);
       columns[state].push(task);
     }

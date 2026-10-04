@@ -76,6 +76,53 @@ test("Review actions use checkpoint preview/confirmation contracts", async (t) =
   });
 });
 
+test("Sync with main uses its own explicit task API operation", async (t) => {
+  const api = await import("../src/ticket-api.js");
+  assert.equal(typeof api.syncTaskWithBase, "function", "Sync with main needs a dedicated API operation");
+  const requests = captureFetch(t);
+  await api.syncTaskWithBase("task/1");
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "POST /api/tasks/task%2F1/sync",
+  ]);
+});
+
+test("merge approval carries the exact Check sync preview ID", async (t) => {
+  const api = await import("../src/ticket-api.js");
+  const requests = captureFetch(t);
+  await api.loadMergePreview("task/1");
+  await api.startMerge("task/1", "preview-1");
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "GET /api/tasks/task%2F1/merge-preview",
+    "POST /api/tasks/task%2F1/merge",
+  ]);
+  assert.deepEqual(JSON.parse(requests[1].options.body), { confirmed: true, preview_id: "preview-1" });
+});
+
+test("Check sync is a read-only GET operation", async (t) => {
+  const api = await import("../src/ticket-api.js");
+  const requests = captureFetch(t);
+  await api.checkTaskSync("task/1");
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "GET /api/tasks/task%2F1/check-sync",
+  ]);
+});
+
+test("sync conflict recovery API inspects, opens, retries, and explicitly aborts the task sync", async (t) => {
+  const api = await import("../src/ticket-api.js");
+  const requests = captureFetch(t);
+  await api.loadTaskSyncRecovery("task/1");
+  await api.viewTaskSyncConflicts("task/1");
+  await api.retryTaskSync("task/1");
+  await api.abortTaskSync("task/1", true);
+  assert.deepEqual(requests.map((entry) => `${entry.options.method ?? "GET"} ${entry.url}`), [
+    "GET /api/tasks/task%2F1/sync-recovery",
+    "POST /api/tasks/task%2F1/sync/view-conflicts",
+    "POST /api/tasks/task%2F1/sync/retry",
+    "POST /api/tasks/task%2F1/sync/abort",
+  ]);
+  assert.deepEqual(JSON.parse(requests[3].options.body), { confirmed: true });
+});
+
 test("backend rejections surface their reason to the panel", async (t) => {
   captureFetch(t, async () => new Response(JSON.stringify({
     error: "Run is no longer accepting inputs.",

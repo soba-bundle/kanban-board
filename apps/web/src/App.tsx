@@ -127,7 +127,7 @@ export function App() {
         <StartTaskDialog
           task={selectedTask}
           onCancel={() => setSelectedTask(null)}
-          onStarted={(stage) => { setSelectedTask(null); pushToast({ title: "Task queued", description: `${selectedTask.title} queued for ${stage === "INVESTIGATION" ? "investigation" : "implementation"}.`, variant: "success" }); void refreshData(); }}
+          onStarted={() => { setSelectedTask(null); pushToast({ title: "Task queued", description: `${selectedTask.title} queued for work.`, variant: "success" }); void refreshData(); }}
         />
       )}
       {addingProject && (

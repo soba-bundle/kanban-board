@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -70,20 +70,6 @@ test("task worktree creation records base metadata and leaves primary checkout u
   assert.match(await manager.getDiff("task-1"), /return 1/);
   await assert.rejects(manager.openInIDE("task-1"), /Configure an IDE executable/);
 
-  const validationPath = await manager.createValidationWorktree("task-1", baseSha);
-  const retryValidationPath = await manager.createValidationWorktree("task-1", baseSha);
-  assert.notEqual(retryValidationPath, validationPath, "each validation attempt gets a fresh worktree");
-  for (const path of [validationPath, retryValidationPath]) {
-    assert.equal(await getCurrentBranch(path), null);
-    assert.equal(await getHeadSha(path), baseSha);
-  }
-  writeFileSync(join(validationPath, "build-output.txt"), "validation artifact");
-  await assert.rejects(manager.removeValidationWorktree("task-1", worktree.worktreePath), /Refusing to remove/);
-  await manager.removeValidationWorktree("task-1", validationPath);
-  assert.equal(existsSync(validationPath), false);
-  assert.equal(existsSync(retryValidationPath), true, "removing one attempt must not remove another");
-  await manager.removeValidationWorktree("task-1", retryValidationPath);
-  assert.equal(existsSync(retryValidationPath), false);
   assert.equal(await getHeadSha(worktree.worktreePath), baseSha);
   assert.match(await manager.getDiff("task-1"), /return 1/);
   await assert.rejects(manager.removeTaskWorktree("task-1"), /uncommitted changes/);
@@ -96,7 +82,6 @@ test("task worktree creation records base metadata and leaves primary checkout u
   await manager.createCheckpoint("task-1");
   const checkpointSha = await getHeadSha(worktree.worktreePath);
   assert.deepEqual(await manager.getTaskCompletionStatus("task-1"), { ready: false, reason: "BRANCH_CHANGES" });
-  const pinnedValidationPath = await manager.createValidationWorktree("task-1", checkpointSha);
   const pinnedDiff = await manager.getPinnedDiff("task-1", baseSha, checkpointSha);
   assert.deepEqual(pinnedDiff.changedFiles, ["main.cpp"]);
   assert.match(pinnedDiff.diff, /return 2/);
@@ -104,12 +89,8 @@ test("task worktree creation records base metadata and leaves primary checkout u
   git(worktree.worktreePath, "add", "main.cpp");
   git(worktree.worktreePath, "commit", "-m", "later task change");
   assert.notEqual(await getHeadSha(worktree.worktreePath), checkpointSha);
-  assert.equal(await getHeadSha(pinnedValidationPath), checkpointSha);
   assert.deepEqual(await manager.getPinnedDiff("task-1", baseSha, checkpointSha), pinnedDiff,
     "diff must stay pinned to the recorded base/candidate even if the task branch moves");
-  assert.equal(readFileSync(join(pinnedValidationPath, "main.cpp"), "utf8").replace(/\r\n/g, "\n"),
-    "int main() { return 2; }\n");
-  await manager.removeValidationWorktree("task-1", pinnedValidationPath);
   await manager.removeTaskWorktree("task-1");
   assert.equal(existsSync(worktree.worktreePath), false);
   assert.equal(db.prepare("SELECT worktree_path FROM tasks WHERE id = 'task-1'").get().worktree_path, null);
@@ -152,6 +133,65 @@ test("checkpoint commit stages tracked and untracked task changes only in the ta
   assert.deepEqual(git(worktree.worktreePath, "show", "--pretty=format:", "--name-only").split("\n").sort(), ["file.txt", "new.txt"]);
   assert.equal(existsSync(join(worktree.worktreePath, "ignored.txt")), true);
   assert.doesNotMatch(git(worktree.worktreePath, "show", "--pretty=format:", "--name-only"), /ignored\.txt/);
+});
+
+test("checkpoint preview includes complete tracked/untracked diffs without changing the index", async (t) => {
+  const temp = mkdtempSync(join(tmpdir(), "kanban-checkpoint-preview-"));
+  const repo = join(temp, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "Checkpoint Preview Test");
+  git(repo, "config", "user.email", "checkpoint-preview@example.invalid");
+  writeFileSync(join(repo, "tracked.txt"), "base\n");
+  writeFileSync(join(repo, "deleted.txt"), "remove me\n");
+  writeFileSync(join(repo, "rename-old.txt"), "rename me\n");
+  git(repo, "add", "tracked.txt", "deleted.txt", "rename-old.txt");
+  git(repo, "commit", "-m", "base");
+
+  const db = openDatabase(join(temp, "app.sqlite"));
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO projects (id, name, root_path, worktree_root, created_at, updated_at)
+    VALUES ('p', 'P', ?, ?, ?, ?)`).run(repo, join(temp, "worktrees"), now, now);
+  db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
+    VALUES ('t', 'p', 'Task', '', 'REVIEW', ?, ?)`).run(now, now);
+  t.after(() => { db.close(); rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  const manager = new WorktreeManager(db);
+  const worktree = await manager.createTaskWorktree("t");
+  writeFileSync(join(worktree.worktreePath, "tracked.txt"), "staged content\n");
+  git(worktree.worktreePath, "add", "tracked.txt");
+  writeFileSync(join(worktree.worktreePath, "tracked.txt"), "final tracked content\n");
+  unlinkSync(join(worktree.worktreePath, "deleted.txt"));
+  git(worktree.worktreePath, "mv", "rename-old.txt", "rename-new.txt");
+  const unusualName = "line break café [x].txt";
+  writeFileSync(join(worktree.worktreePath, unusualName), "unusual content\n");
+  writeFileSync(join(worktree.worktreePath, "binary.bin"), Buffer.from([0, 1, 2, 255]));
+  writeFileSync(join(worktree.worktreePath, "large.txt"), "large line\n".repeat(6000));
+  const originalIndexTree = git(worktree.worktreePath, "write-tree");
+  const originalStatus = git(worktree.worktreePath, "status", "--porcelain");
+
+  const preview = await manager.previewCheckpoint("t");
+  assert.ok(preview.trackedChanges.includes("tracked.txt"));
+  assert.ok(preview.trackedChanges.includes("deleted.txt"));
+  assert.ok(preview.trackedChanges.includes("rename-new.txt"));
+  assert.ok(preview.untrackedFiles.includes(unusualName));
+  assert.ok(preview.untrackedFiles.includes("binary.bin"));
+  assert.ok(preview.untrackedFiles.includes("large.txt"));
+  assert.match(preview.diff, /final tracked content/);
+  assert.match(preview.diff, /unusual content/);
+  assert.match(preview.diff, /Binary files .*binary\.bin differ/);
+  assert.match(preview.diff, /deleted file mode/);
+  assert.ok(preview.diff.length > 50_000, "large text patches are not truncated");
+  assert.equal(git(worktree.worktreePath, "write-tree"), originalIndexTree);
+  assert.equal(git(worktree.worktreePath, "status", "--porcelain"), originalStatus);
+
+  const repeated = await manager.previewCheckpoint("t");
+  assert.equal(repeated.stateToken, preview.stateToken, "identical worktree state has a stable token");
+  writeFileSync(join(worktree.worktreePath, unusualName), "edited unusual content\n");
+  const changed = await manager.previewCheckpoint("t");
+  assert.notEqual(changed.stateToken, preview.stateToken, "content edits invalidate the preview token");
+  assert.equal(git(worktree.worktreePath, "write-tree"), originalIndexTree);
+  assert.deepEqual(await getStatus(repo), [], "preview does not touch the primary checkout");
 });
 
 test("checkpoint failure preserves the existing index and worktree files", async (t) => {

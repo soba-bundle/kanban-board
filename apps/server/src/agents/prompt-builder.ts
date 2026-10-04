@@ -7,13 +7,12 @@ export interface RunPrompt {
 }
 
 interface PromptRow {
-  stage: string;
   title: string;
   description: string;
 }
 
 export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt {
-  const row = db.prepare(`SELECT r.stage, t.title, t.description FROM task_runs r
+  const row = db.prepare(`SELECT t.title, t.description FROM task_runs r
     JOIN tasks t ON t.id = r.task_id WHERE r.id = ?`).get(runId) as PromptRow | undefined;
   if (!row) throw new Error(`Run ${runId} not found.`);
 
@@ -26,7 +25,7 @@ export function buildRunPrompt(db: Database.Database, runId: string): RunPrompt 
   const queuedInputs = inputs.filter((input) => input.delivery_type === "QUEUED_INPUT");
 
   const sections = [
-    `${row.stage === "INVESTIGATION" ? "Investigate" : "Implement"} this task.`,
+    "Work on this task.",
     `Title: ${row.title}`,
     `User's initial instructions:\n${initialPrompt.content}`,
     `Task description:\n${row.description}`,

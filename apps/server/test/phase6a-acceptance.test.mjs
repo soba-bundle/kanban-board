@@ -54,18 +54,9 @@ class ControlledSession {
     this.started = true;
     this.appendUser(text);
     this.emitDelta(`started:${this.taskId}`);
-    return new Promise((resolve, reject) => { this.finishPrompt = async () => {
-      try {
-        await this.tools[0].execute("handover-call", {
-          stage: "INVESTIGATION",
-          summary: `Completed ${this.taskId}`,
-          confidence: "HIGH",
-          outcome: `Outcome for ${this.taskId}`,
-          recommended_next_step: "CLOSE",
-        }, undefined, undefined, {});
-        this.appendAssistant(`completed:${this.taskId}`);
-        resolve();
-      } catch (error) { reject(error); }
+    return new Promise((resolve) => { this.finishPrompt = () => {
+      this.appendAssistant(`completed:${this.taskId}`);
+      resolve();
     }; });
   }
 
@@ -137,7 +128,7 @@ test("two concurrent tickets survive refresh, reconnect, steering, and completio
 
   const starts = await Promise.all(["ticket-1", "ticket-2"].map((taskId) => app.inject({
     method: "POST", url: `/api/tasks/${taskId}/queue`,
-    payload: { task_id: taskId, stage: "INVESTIGATION", prompt: `Investigate ${taskId}`, idempotency_key: `start-${taskId}` },
+    payload: { task_id: taskId, prompt: `Work on ${taskId}`, idempotency_key: `start-${taskId}` },
   })));
   assert.deepEqual(starts.map((response) => response.statusCode), [201, 201]);
   const runIds = Object.fromEntries(starts.map((response, index) => [["ticket-1", "ticket-2"][index], response.json().run_id]));
@@ -187,7 +178,7 @@ test("two concurrent tickets survive refresh, reconnect, steering, and completio
   assert.equal(history2.statusCode, 200);
   for (const [taskId, history] of [["ticket-1", history1.json()], ["ticket-2", history2.json()]]) {
     const texts = history.entries.map((entry) => entry.message.content?.map((part) => part.text ?? "").join("") ?? "");
-    assert.ok(texts.some((text) => text.includes(`Investigate ${taskId}`)));
+    assert.ok(texts.some((text) => text.includes(`Work on ${taskId}`)));
     assert.ok(texts.includes(`Steering for ${taskId}`));
     assert.ok(texts.every((text) => !text.includes(taskId === "ticket-1" ? "ticket-2" : "ticket-1")));
     assert.equal(history.active_run_id, runIds[taskId]);

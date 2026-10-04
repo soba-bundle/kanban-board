@@ -7,8 +7,6 @@ import { AgentManager } from "../dist/agents/agent-manager.js";
 import { RunManager } from "../dist/agents/run-manager.js";
 import { registerRunRoutes } from "../dist/agents/run-routes.js";
 import { registerTaskRunRoutes } from "../dist/task-runs.js";
-import { QueueManager } from "../dist/queue/queue-manager.js";
-import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
 
 function makeFixture(t) {
   const db = openDatabase(":memory:");
@@ -18,10 +16,10 @@ function makeFixture(t) {
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Task', 'Details', 'IN_PROGRESS', ?, ?)`).run(now, now);
   db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, input_mode)
-    VALUES ('run-1', 'task-1', 'INVESTIGATION', 1, 'QUEUED', 'QUEUED')`).run();
+    VALUES ('run-1', 'task-1', 'WORK', 1, 'QUEUED', 'QUEUED')`).run();
 
   let session;
-  const agents = new AgentManager(db, "/tmp/steer-test", async (_cwd, manager, tools) => {
+  const agents = new AgentManager(db, "/tmp/steer-test", async (_cwd, manager) => {
     session = {
       sessionId: manager.getSessionId(),
       sessionFile: manager.getSessionFile(),
@@ -42,8 +40,6 @@ function makeFixture(t) {
           resolve();
         }; });
       },
-      submitHandover: (params) => tools.find((tool) => tool.name === "submit_handover")
-        .execute("test-handover", params, undefined, undefined, {}),
       steer: async (text) => { session.steered.push(text); },
       abort: async () => { session.finishPrompt?.(); },
       dispose() {},
@@ -62,12 +58,10 @@ function makeFixture(t) {
   });
   const runs = new RunManager(db, agents);
   const app = Fastify();
-  const queue = new QueueManager(db, runs, 1);
   registerRunRoutes(app, runs);
   registerTaskRunRoutes(app, db);
-  registerQueueRoutes(app, queue);
   t.after(async () => { await app.close(); agents.dispose("task-1"); db.close(); });
-  return { db, app, runs, queue, agents, getSession: () => session };
+  return { db, app, runs, getSession: () => session };
 }
 
 async function waitFor(check) {
@@ -186,134 +180,77 @@ test("an unrelated Pi user entry makes the next steering delivery unknown, not f
   await runs.stop("run-1");
 });
 
-test("a stale handover is replaced through submit_handover after accepted guidance is delivered", async (t) => {
+test("normal completion fails safely when accepted guidance is not confirmed in the transcript", async (t) => {
   const { db, app, runs, getSession } = makeFixture(t);
   db.prepare("UPDATE task_runs SET input_mode = 'STEERING'").run();
-  const started = runs.start("run-1", { text: "investigate", inputIds: [] });
+  const started = runs.start("run-1", { text: "work", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted);
 
-  const submit = (summary, outcome, evidence = []) => getSession().submitHandover({
-    stage: "INVESTIGATION",
-    summary,
-    confidence: "HIGH",
-    outcome,
-    evidence,
-    recommended_next_step: "CLOSE",
-  });
-  await submit("Initial candidate", "Before late guidance");
-  assert.equal(db.prepare("SELECT handover_input_sequence FROM task_runs WHERE id = 'run-1'").get().handover_input_sequence, 0);
-
-  await send(app, "input-1", "include the null case");
-  await waitFor(() => getSession().steered.length === 1);
-  getSession().deliver("include the null case", "late-guidance-entry");
-  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get().delivery_status, "DELIVERED");
-  getSession().finishPrompt();
-
-  await waitFor(() => getSession().promptCount === 2);
-  const afterClosure = await send(app, "input-2", "accepted after handover?");
-  assert.equal(afterClosure.statusCode, 409);
-  assert.equal(db.prepare("SELECT COUNT(*) n FROM run_inputs").get().n, 1);
-  await submit("Revised after late guidance", "Included the null case as requested", ["include the null case"]);
+  await send(app, "input-1", "do not lose this instruction");
+  await waitFor(() => db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get()?.delivery_status === "ACCEPTED");
   getSession().finishPrompt();
   await started;
 
-  const run = db.prepare("SELECT status, handover_json, handover_input_sequence FROM task_runs WHERE id = 'run-1'").get();
-  assert.equal(run.status, "COMPLETED");
-  assert.equal(run.handover_input_sequence, 1);
-  const expectedHandover = {
-    stage: "INVESTIGATION",
-    summary: "Revised after late guidance",
-    confidence: "HIGH",
-    outcome: "Included the null case as requested",
-    evidence: ["include the null case"],
-    root_cause: null,
-    affected_files: [],
-    recommended_changes: [],
-    missing_information: [],
-    human_verification_required: false,
-    recommended_next_step: "CLOSE",
-  };
-  assert.deepEqual(JSON.parse(run.handover_json), expectedHandover);
-  const runsResponse = await app.inject({ method: "GET", url: "/api/tasks/task-1/runs" });
-  assert.equal(runsResponse.statusCode, 200);
-  assert.equal(runsResponse.json().length, 1);
-  assert.deepEqual(runsResponse.json()[0].handover, expectedHandover);
-  assert.equal(db.prepare("SELECT workflow_state FROM tasks WHERE id = 'task-1'").get().workflow_state, "REVIEW");
+  assert.equal(getSession().promptCount, 1, "delivery failure must not trigger a handover retry");
+  assert.deepEqual(db.prepare("SELECT status, reason_code FROM task_runs WHERE id = 'run-1'").get(), {
+    status: "FAILED", reason_code: "INPUT_DELIVERY_FAILED",
+  });
+  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get().delivery_status, "DELIVERY_UNKNOWN");
+  assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
+    workflow_state: "REVIEW", review_tag: "RUN_FAILED",
+  });
 });
 
-test("Stop during handover drain interrupts the run and withholds the stale candidate", async (t) => {
-  const { db, app, runs, queue, agents, getSession } = makeFixture(t);
+test("completed work waits for accepted guidance delivery but needs no handover", async (t) => {
+  const { db, app, runs, getSession } = makeFixture(t);
   db.prepare("UPDATE task_runs SET input_mode = 'STEERING'").run();
-  const started = runs.start("run-1", { text: "investigate", inputIds: [] });
+  const started = runs.start("run-1", { text: "work", inputIds: [] });
   await waitFor(() => getSession()?.promptStarted);
 
-  await getSession().submitHandover({
-    stage: "INVESTIGATION",
-    summary: "Initial candidate",
-    confidence: "HIGH",
-    outcome: "Before late guidance",
-    recommended_next_step: "CLOSE",
-  });
   await send(app, "input-1", "include the null case");
   await waitFor(() => getSession().steered.length === 1);
   getSession().deliver("include the null case", "late-guidance-entry");
+  await waitFor(() => db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get()?.delivery_status === "DELIVERED");
   getSession().finishPrompt();
+  await started;
 
-  // The run manager is now awaiting the agent's updated handover.
-  await waitFor(() => getSession().promptCount === 2);
+  const afterClosure = await send(app, "input-2", "accepted after completion?");
+  assert.equal(afterClosure.statusCode, 409);
+  assert.equal(getSession().promptCount, 1, "completion must not prompt for handover or its revision");
+  assert.deepEqual(db.prepare("SELECT status, handover_json FROM task_runs WHERE id = 'run-1'").get(), {
+    status: "COMPLETED", handover_json: null,
+  });
+  assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
+    workflow_state: "REVIEW", review_tag: "WORK_COMPLETE",
+  });
+  const runsResponse = await app.inject({ method: "GET", url: "/api/tasks/task-1/runs" });
+  assert.equal(runsResponse.statusCode, 200);
+  assert.equal(runsResponse.json()[0].handover, null);
+});
+
+test("stopping active work preserves interruption status and accepted guidance history", async (t) => {
+  const { db, app, runs, getSession } = makeFixture(t);
+  db.prepare("UPDATE task_runs SET input_mode = 'STEERING'").run();
+  const started = runs.start("run-1", { text: "work", inputIds: [] });
+  await waitFor(() => getSession()?.promptStarted);
+
+  await send(app, "input-1", "include the null case");
+  await waitFor(() => getSession().steered.length === 1);
+  getSession().deliver("include the null case", "late-guidance-entry");
+  await waitFor(() => db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get()?.delivery_status === "DELIVERED");
   await runs.stop("run-1");
   await started;
 
   const run = db.prepare("SELECT status, reason_code, handover_json FROM task_runs WHERE id = 'run-1'").get();
   assert.equal(run.status, "INTERRUPTED");
   assert.equal(run.reason_code, "USER_STOPPED");
+  assert.equal(run.handover_json, null);
+  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get().delivery_status, "DELIVERED");
   assert.deepEqual(db.prepare("SELECT workflow_state, review_tag FROM tasks WHERE id = 'task-1'").get(), {
     workflow_state: "REVIEW", review_tag: "INTERRUPTED",
   });
-  assert.equal(db.prepare("SELECT delivery_status FROM run_inputs WHERE id = 'input-1'").get().delivery_status, "DELIVERED");
-
   const runsResponse = await app.inject({ method: "GET", url: "/api/tasks/task-1/runs" });
   assert.equal(runsResponse.statusCode, 200);
-  assert.equal(runsResponse.json().length, 1);
   assert.equal(runsResponse.json()[0].status, "INTERRUPTED");
   assert.equal(runsResponse.json()[0].handover, null);
-
-  const interruptedSessionId = db.prepare("SELECT session_id FROM task_runs WHERE id = 'run-1'").get().session_id;
-  getSession().emitPromptEntries = true;
-  queue.initialize();
-  const followupPrompt = "Continue from the interrupted run and finish the requested work.";
-  const queued = await app.inject({ method: "POST", url: "/api/tasks/task-1/queue", payload: {
-    task_id: "task-1", stage: "INVESTIGATION", prompt: followupPrompt, idempotency_key: "follow-up-after-stop",
-  } });
-  assert.equal(queued.statusCode, 201);
-  const followupRunId = queued.json().run_id;
-  assert.notEqual(followupRunId, "run-1");
-  await waitFor(() => getSession().promptCount === 3);
-
-  const followupRun = db.prepare("SELECT status, session_id FROM task_runs WHERE id = ?").get(followupRunId);
-  assert.equal(followupRun.status, "RUNNING");
-  assert.equal(followupRun.session_id, interruptedSessionId);
-  assert.match(getSession().prompts[2], /User's initial instructions:\nContinue from the interrupted run/);
-  const followupInput = db.prepare("SELECT content, delivery_status FROM run_inputs WHERE run_id = ?").get(followupRunId);
-  assert.deepEqual(followupInput, { content: followupPrompt, delivery_status: "DELIVERED" });
-
-  await getSession().submitHandover({
-    stage: "INVESTIGATION",
-    summary: "Follow-up completed",
-    confidence: "HIGH",
-    outcome: "Completed after the user supplied a new prompt",
-    recommended_next_step: "CLOSE",
-  });
-  getSession().finishPrompt();
-  await waitFor(() => db.prepare("SELECT status FROM task_runs WHERE id = ?").get(followupRunId)?.status === "COMPLETED");
-
-  const liveHistory = agents.historySnapshot("task-1");
-  assert.equal(liveHistory.session_id, interruptedSessionId);
-  assert.ok(liveHistory.inputs.some((input) => input.run_id === "run-1" && input.content === "include the null case"));
-  assert.ok(liveHistory.inputs.some((input) => input.run_id === followupRunId && input.content === followupPrompt));
-  const finalRuns = await app.inject({ method: "GET", url: "/api/tasks/task-1/runs" });
-  assert.deepEqual(finalRuns.json().map((item) => [item.status, item.handover?.summary ?? null]), [
-    ["INTERRUPTED", null],
-    ["COMPLETED", "Follow-up completed"],
-  ]);
 });

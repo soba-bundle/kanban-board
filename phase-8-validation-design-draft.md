@@ -1,8 +1,11 @@
 # Phase 8 — Independent Validation Design Draft
 
-**Status:** Phase 8 acceptance-test specification and implementation are complete. The real-provider Validation run passed, the independent review follow-up found no actionable issues, and the integrated suite passed. Phase 9 merge-back remains separate.
+**Status:** Historical Phase 8 design/implementation record. Automated Validation runtime was retired by W-15; this document does not describe current workflow or readiness behavior.
+**Current source of truth:** [Workflow Simplification, Sync, and Checkpoint Plan](workflow-simplification-sync-and-checkpoint-plan.md).
 
-## Implementation log
+> Validation records, schemas, and findings remain available as history. New work does not create Validation runs or snapshots, and Validation is not a merge gate. Current readiness is a Git-only Check sync; developers own app testing and code review.
+
+## Historical implementation log
 
 ### Slice 1 — Stage-aware Pi tools
 

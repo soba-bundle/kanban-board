@@ -55,7 +55,7 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
   legacy.close();
 
   db = openDatabase(path);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 14);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 15);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'git_sync_attempts'").get());
   assert.deepEqual(db.prepare("SELECT id, status FROM git_sync_attempts").all(), []);
@@ -82,7 +82,7 @@ test("migrations retire ticket comments and preserve legacy Human Requests and t
   assert.deepEqual(db.prepare("PRAGMA table_info(run_inputs)").all().map((column) => column.name), [
     "id", "task_id", "run_id", "sequence", "idempotency_key", "content", "delivery_type",
     "delivery_status", "accepted_at", "delivered_at", "session_id", "transcript_entry_id",
-    "failure_reason", "reused_from_input_id", "session_sequence", "transcript_boundary_entry_id",
+    "failure_reason", "reused_from_input_id", "session_sequence", "transcript_boundary_entry_id", "delivery_intent_at",
   ]);
   assert.deepEqual(db.prepare("PRAGMA table_info(run_transcript_entries)").all().map((column) => column.name), [
     "session_id", "entry_id", "run_id", "sequence",
@@ -114,7 +114,7 @@ test("version 13 preserves and safely interrupts earlier in-flight sync attempts
   const attempt = db.prepare("SELECT id, status, error_message FROM git_sync_attempts WHERE id = 'old-attempt'").get();
   assert.equal(attempt.status, "INTERRUPTED");
   assert.match(attempt.error_message, /interrupted during application upgrade/i);
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 14);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 15);
 });
 
 test("version 14 retires queued Validation work without deleting history", (t) => {
@@ -164,13 +164,13 @@ test("version 14 retires queued Validation work without deleting history", (t) =
   assert.deepEqual(db.prepare("SELECT approval_status, status, error_reason FROM merge_attempts WHERE id = 'old-attempt'").get(), {
     approval_status: "REVOKED", status: "VALIDATION_RETIRED", error_reason: "Automated Validation was retired.",
   });
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 14);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 15);
 });
 
 test("fresh databases apply migrations through validation result and run schemas", (t) => {
   const db = openDatabase(":memory:");
   t.after(() => db.close());
-  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 14);
+  assert.equal(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 15);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ticket_comments'").get(), undefined);
   assert.deepEqual(db.prepare("PRAGMA table_info(validation_snapshots)").all().map((column) => column.name), [
     "id", "task_id", "validation_run_id", "validated_task_sha", "validated_base_sha",

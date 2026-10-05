@@ -1091,11 +1091,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
               {!history && <p className="run-empty">Loading conversation…</p>}
               {history && buildLiveTimeline(history.entries, compactionSummaries).map((item) => item.type === "entry"
                 ? <LiveMessageCard
-                    key={item.entry.id}
+                    key={`entry:${item.entry.session_id}:${item.entry.entry_id}`}
                     entry={item.entry}
                     input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
                   />
-                : <details className="compaction-summary" key={item.summary.id}>
+                : <details className="compaction-summary" key={`compaction:${item.summary.id}`}>
                     <summary>Compaction summary</summary>
                     <div className="compaction-summary-text">{item.summary.summary}</div>
                   </details>)}

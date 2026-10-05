@@ -11,7 +11,7 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
     appType: "custom",
   });
   t.after(() => vite.close());
@@ -91,7 +91,7 @@ test("the task board renders legacy Validation readiness tags as ordinary work c
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
     appType: "custom",
   });
   t.after(() => vite.close());
@@ -119,7 +119,7 @@ test("legacy Validation tags are not rendered as active merge readiness", async 
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
     appType: "custom",
   });
   t.after(() => vite.close());

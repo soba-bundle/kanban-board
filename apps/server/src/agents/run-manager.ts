@@ -276,6 +276,10 @@ export class RunManager {
         this.markStopped(runId, taskId);
         return;
       }
+      const intentAt = new Date().toISOString();
+      const markInitialIntent = this.db.prepare(`UPDATE run_inputs SET delivery_intent_at = ?
+        WHERE id = ? AND run_id = ? AND delivery_status = 'PENDING' AND delivery_intent_at IS NULL`);
+      for (const inputId of prompt.inputIds ?? []) markInitialIntent.run(intentAt, inputId, runId);
       const promptPromise = this.agents.prompt(taskId, runId, prompt.text);
       this.flushPendingSteering(runId);
       await promptPromise;
@@ -334,6 +338,9 @@ export class RunManager {
       SELECT COALESCE(MAX(session_sequence), 0) + 1 FROM run_inputs WHERE session_id = ?
     ), transcript_boundary_entry_id = (SELECT transcript_end_entry_id FROM task_runs WHERE id = ?)
       WHERE id = ? AND session_id IS NULL`).run(run.session_id, run.session_id, runId, inputId);
+    this.db.prepare(`UPDATE run_inputs SET delivery_intent_at = ?
+      WHERE id = ? AND delivery_status = 'PENDING' AND delivery_intent_at IS NULL`)
+      .run(new Date().toISOString(), inputId);
     try {
       await this.agents.steer(run.task_id, text);
       this.db.prepare(`UPDATE run_inputs SET delivery_status = 'ACCEPTED'

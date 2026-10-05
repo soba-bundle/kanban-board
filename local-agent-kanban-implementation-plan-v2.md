@@ -568,27 +568,120 @@ The Pi SDK currently defaults to retries enabled (3 retries, 2-second base delay
 
 ## 8. Phase 11 — Backend Recovery and Git Reconciliation
 
-This section predates the simplified workflow. Sync-conflict recovery and merge
-restart reconciliation are implemented as recorded in W-11 and W-14 of the
-current workflow plan. Validation runs are no longer resumed or classified as a
-current runtime path: Migration 14 retires in-flight Validation work while
-preserving history. Future recovery work must preserve queue order, rebuild Human
-Requests, restore sessions/rebind subscriptions, and expose an authoritative
-snapshot. MERGE_HEAD routes to conflict; unexpected rebase/cherry-pick/revert
-needs manual recovery. Browser reconstruction from 6A is not a substitute for
-backend crash reconciliation.
+**Status:** Phase 11 restart-reconciliation implementation and verification complete for the current scope.
 
-Reconcile message delivery against actual transcript entries using the persisted
-per-session input sequence and Pi entry IDs. Compare only against the recorded
-transcript boundary on the active session branch. Mark delivered only on a unique
-ordered match; do not infer from a resolved `steer()` call, text alone, or a user
-message whose ownership is uncertain. Never resend delivered guidance. Inputs
-whose acceptance/call/append boundary cannot be resolved uniquely become
-delivery-unknown and are exposed for explicit user resolution/reuse, not silently
-retried or attached to another run. No silent resurrection of cancelled runs or
-approval. Verify crashes before the call, after the call, after transcript append,
-and before SQLite delivery metadata commits, as well as checkpoint persistence,
-Human Request and merge/sync recovery. Do not add automated Validation recovery.
+This phase completes backend crash recovery across durable run inputs, Pi session
+transcripts, Human Requests, queue state, checkpoints, sync, and merge operations.
+Existing recovery from Phase 7 and W-11/W-14 remains the foundation; do not rebuild
+it or add automated Validation recovery. Validation runs are not resumed or
+classified as a current runtime path: Migration 14 retires in-flight Validation
+work while preserving history.
+
+### Recovery policy
+
+- Ordinary interrupted work returns to Review / Backend interrupted; it does not
+automatically replay its prompt.
+- Queued work preserves its established order.
+- Human Requests resume in the same session after capacity is reacquired.
+- Delivered guidance is never resent. Uncertain delivery becomes
+  `DELIVERY_UNKNOWN` and requires explicit user reuse with a new input identity.
+- Cancelled runs and approvals are never silently resurrected.
+- Git recovery preserves user files, index state, conflict state, and history.
+- `MERGE_HEAD` enters conflict recovery; unexpected rebase/cherry-pick/revert
+  requires manual recovery.
+
+### 11.1 Establish the recovery contract and crash tests
+
+Add focused Phase 11 recovery tests using temporary file-backed SQLite databases,
+Pi transcripts, and Git repositories. Recreate managers after injected crash
+boundaries and include a process-restart integration case.
+
+### Restart-reconciliation execution tracker
+
+| Step | Status | Verification / notes |
+|---|---|---|
+| Document restart-reconciliation architecture and boundaries | DONE | Dedicated startup reconciler; AgentManager active-branch inspection; RunManager live delivery; QueueManager dispatch ordering; no automatic resend. |
+| Correct Phase 11 test harness and add durable send-intent contract | DONE | `phase11-recovery.test.mjs` now uses temporary file-backed SQLite and cleanup-safe restart fixtures. Migration 15 adds nullable `run_inputs.delivery_intent_at`; RunManager records intent before initial prompts and steering calls. Migration/build checks pass; 6/9 focused tests pass, with 3 expected red tests awaiting the reconciler. |
+| Implement `RunInputReconciler` and active-branch matching | DONE | Added `apps/server/src/agents/run-input-reconciler.ts`; it matches only unique ordered active-branch user entries, persists delivery metadata idempotently, and marks no-intent/ambiguous attempts safely. All five focused Phase 11 tests pass. |
+| Integrate startup ordering and queue dispatch guard | DONE | `index.ts` now awaits run-input reconciliation before Human Request reconciliation and queue initialization/dispatch. Focused migration, steering, Phase 11, build, and typecheck checks pass. |
+| Verify Human Request, Git, merge, and full regression behavior | DONE | Added restored `AgentManager` active-branch coverage. Focused recovery/queue/steering/Human Request tests pass; the previously flaky Git-sync test passed on rerun; full `npm test` passes shared 13, server 155, web 58; typecheck and `git diff --check` pass. WebSocket port and React key warnings are non-fatal existing test output. |
+
+Execution rule: after each step, update this tracker with the completed work,
+current status, and focused verification result before starting the next step.
+
+### Final hardening tracker
+
+| Item | Status | Verification / notes |
+|---|---|---|
+| Bundled initial and queued prompt reconciliation | DONE | Reconstructs the existing combined prompt, matches one active-branch user entry, marks every bundled input delivered once, and preserves ambiguity safety. Focused recovery coverage passes. |
+| Startup recovery orchestration | DONE | Added `startup-recovery.ts`; merge, input, Human Request, and queue recovery are strictly ordered. Deferred-gate tests prove queue dispatch waits and stops on reconciliation failure. |
+| Live timeline React keys | DONE | Namespaced entry/compaction keys and a regression assertion prevent duplicate-key warnings. Web typecheck and focused interaction tests pass. |
+| Vite middleware test warning | PARTIAL / NON-BLOCKING | Test-only HMR was disabled in all middleware Vite fixtures. The Vite suite can still emit a non-fatal port `24678` warning under parallel test execution; no test fails and no application WebSocket behavior is affected. |
+
+Final hardening verification: full `npm test` passes shared 13, server 158,
+and web 58; typecheck and `git diff --check` pass.
+
+Cover idempotent repeated recovery, no unexpected provider calls or Git mutations,
+and preservation of delivered, cancelled, and historical records.
+
+### 11.2 Durable input intent and transcript reconciliation
+
+Persist send intent and the transcript boundary before invoking Pi for initial
+bundled prompts and steering. During restart reconciliation, inspect only the
+recorded session's active branch and use sequence, boundary, expected content,
+and entry ownership together. Mark delivery only on a unique ordered match;
+classify ambiguous attempts as `DELIVERY_UNKNOWN`; never automatically resend.
+
+Verify crashes before the call, after the call, after transcript append, and before
+SQLite delivery metadata commits, including identical text, external entries,
+missing/off-branch boundaries, queued bundles, and explicit reuse.
+
+### 11.3 Human Request and queue continuation recovery
+
+Repair newly answered requests even when their session is cached. Ensure a
+recovered continuation can park and reacquire capacity for another questionnaire.
+Preserve existing queue positions, append only genuinely new continuations, and
+surface unmatched requests or session restoration failures. Preserve Stop and
+cancellation precedence.
+
+Verify pending → restart → answer → resume → second questionnaire, answered-before-
+crash repair, existing results, Stop races, competing jobs, repeated restarts, and
+absence of duplicate dispatch.
+
+### 11.4 Checkpoint and Git recovery boundaries
+
+Retain W-11/W-14 behavior and add only missing safeguards. Record a confirmed
+checkpoint attempt before Git mutation and reconcile commit success only from
+sufficient evidence tied to that attempt—not merely a newer HEAD or matching
+message. Ambiguous outcomes remain blocked with actionable guidance.
+
+Inspect Git state before recovered dispatch: `MERGE_HEAD` enters conflict recovery;
+unexpected rebase/cherry-pick/revert requires manual recovery. Never automatically
+reset, abort, recommit, or renew approval.
+
+Verify checkpoint commit-before-DB crashes, unrelated HEAD movement, sync/abort
+crashes, merge ref-update-before-DB recovery, and unchanged user files/index.
+
+### 11.5 Startup ordering and authoritative recovery state
+
+Make startup ordering explicit in `apps/server/src/index.ts`: reconcile durable
+Git, input, session, and Human Request state before final queue classification and
+dispatch. Extend existing API/history contracts only as needed to expose recovered
+run/job/request/input state and actionable blockers. Rebind restored-session
+subscriptions; keep broader rendering polish in Phase 12.
+
+Verify reconnect, refresh, task switching, recovery-before-dispatch ordering,
+no cross-task attribution, and no duplicate output.
+
+### 11.6 Integrated acceptance gate
+
+Run focused crash/recovery suites, full `npm test`, typecheck, builds, and
+`git diff --check`. Perform controlled backend kill/restart acceptance covering
+active work, questionnaire waits, and checkpoint/sync/merge boundaries.
+
+**Exit criterion:** every interrupted operation is safely reconciled or visibly
+blocked for explicit action, without lost guidance, duplicate execution, unsafe
+Git replay, or history deletion.
 
 ## 9. Phase 12 — Session Rendering and UI Polish
 

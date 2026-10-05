@@ -409,5 +409,15 @@ export function openDatabase(filename = process.env.KANBAN_DB_PATH ?? "data/kanb
     migrate();
   }
 
+  const runInputIntentApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 15").get();
+  if (!runInputIntentApplied) {
+    const migrate = db.transaction(() => {
+      db.exec("ALTER TABLE run_inputs ADD COLUMN delivery_intent_at TEXT;");
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (15, ?)")
+        .run(new Date().toISOString());
+    });
+    migrate();
+  }
+
   return db;
 }

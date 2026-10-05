@@ -100,7 +100,7 @@ async function mountPanel(t, requestState, fetchOverride) {
   vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
     appType: "custom",
   });
   const [{ TicketPanel }, { ToastProvider }, testingLibrary] = await Promise.all([

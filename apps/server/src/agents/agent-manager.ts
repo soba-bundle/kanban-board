@@ -13,6 +13,7 @@ import type { HumanRequestService } from "./human-requests.js";
 import { createKanbanQuestionnaireTool } from "../pi/questionnaire-tool.js";
 import { createKanbanResourceLoader } from "../pi/resource-loader.js";
 import { applyKanbanSettings, loadKanbanConfig } from "../kanban-config.js";
+import type { ActiveBranchSnapshot } from "./run-input-reconciler.js";
 
 type LiveEventHandler = (event: LiveEvent) => void;
 export interface WorkingSession {
@@ -151,6 +152,15 @@ export class AgentManager {
 
   transcriptLeafId(taskId: string): string | null {
     return this.sessions.get(taskId)?.sessionManager?.getLeafId() ?? null;
+  }
+
+  async inspectWorkingBranch(taskId: string): Promise<ActiveBranchSnapshot | null> {
+    const existing = this.sessions.get(taskId);
+    const session = existing ?? (this.getTask(taskId).working_session_file
+      ? await this.restoreWorkingSession(taskId)
+      : null);
+    if (!session?.sessionManager) return null;
+    return { sessionId: session.sessionId, branch: session.sessionManager.getBranch() as ActiveBranchSnapshot["branch"] };
   }
 
   questionnaireCallState(taskId: string, sessionId: string, toolCallId: string): "RESULT" | "DANGLING" | "MISSING" {

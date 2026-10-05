@@ -11,6 +11,7 @@ import { HumanRequestService } from "./agents/human-requests.js";
 import { registerHumanRequestRoutes } from "./agents/human-request-routes.js";
 import { registerLiveEventRoutes } from "./agents/live-event-routes.js";
 import { RunManager } from "./agents/run-manager.js";
+import { RunInputReconciler } from "./agents/run-input-reconciler.js";
 import { registerRunRoutes } from "./agents/run-routes.js";
 import { MergeManager } from "./agents/merge-manager.js";
 import { registerMergeRoutes } from "./agents/merge-routes.js";
@@ -20,6 +21,7 @@ import { QueueManager } from "./queue/queue-manager.js";
 import { WorktreeManager } from "./git/worktree-manager.js";
 import { registerQueueRoutes } from "./queue/queue-routes.js";
 import { TaskOperationCoordinator } from "./task-operation-coordinator.js";
+import { recoverBeforeDispatch } from "./startup-recovery.js";
 
 const databasePath = process.env.KANBAN_DB_PATH ?? "data/kanban.sqlite";
 const db = openDatabase(databasePath);
@@ -46,14 +48,18 @@ const agentManager = new AgentManager(db, undefined, undefined, undefined, human
 await registerLiveEventRoutes(app, db, agentManager);
 const runManager = new RunManager(db, agentManager, humanRequests);
 registerRunRoutes(app, runManager);
+const runInputReconciler = new RunInputReconciler(db, (taskId) => agentManager.inspectWorkingBranch(taskId));
 queueManager = new QueueManager(db, runManager, undefined, worktreeManager);
 const mergeManager = new MergeManager({ db, worktrees: worktreeManager, operations: taskOperations });
 const gitSyncManager = new GitSyncManager({ db, worktrees: worktreeManager, operations: taskOperations });
 registerGitSyncRoutes(app, gitSyncManager);
 registerMergeRoutes(app, mergeManager);
-await mergeManager.reconcileAfterRestart();
-await runManager.reconcileHumanRequests();
-queueManager.initialize();
+await recoverBeforeDispatch({
+  reconcileMerge: () => mergeManager.reconcileAfterRestart(),
+  reconcileRunInputs: () => runInputReconciler.reconcileAfterRestart(),
+  reconcileHumanRequests: () => runManager.reconcileHumanRequests(),
+  initializeQueue: () => queueManager.initialize(),
+});
 registerQueueRoutes(app, queueManager, taskOperations);
 registerHumanRequestRoutes(app, db, humanRequests, (runId) => queueManager.stopRun(runId));
 

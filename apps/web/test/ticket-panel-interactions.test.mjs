@@ -34,7 +34,7 @@ async function loadComponents(t) {
   const vite = await createServer({
     root: webRoot,
     configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
     optimizeDeps: { noDiscovery: true, include: [] },
     appType: "custom",
   });
@@ -1309,8 +1309,16 @@ test("persisted compaction summaries appear in transcript order after Live histo
     provisional_events: [{ eventId: "event-compact-1", sequence: 1, taskId: "task-1", runId: "run-1",
       timestamp, type: "compaction_end", data: { reason: "threshold", aborted: false, summary: summary1, tokensBefore: 4704 } }],
   };
+  const warnings = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => {
+    if (String(args[0]).includes("unique \"key\" prop")) warnings.push(args);
+    originalConsoleError(...args);
+  };
+  t.after(() => { console.error = originalConsoleError; });
   const { testing, view } = await mountPanelWithHistorySnapshot(t, snapshot);
   await testing.screen.findAllByText("Compaction summary");
+  assert.equal(warnings.length, 0, "Live timeline must not emit duplicate React key warnings");
   const details = view.container.querySelectorAll(".compaction-summary");
   assert.equal(details.length, 2, "the persisted summary and its live event are rendered once");
   assert.equal(details[0].open, false);

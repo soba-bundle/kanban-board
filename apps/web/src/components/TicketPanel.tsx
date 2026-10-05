@@ -169,6 +169,7 @@ export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls 
     const resultDetail = liveToolResult(call);
     return resultDetail === undefined ? call : { ...call, resultDetail };
   });
+  const runningToolCalls = renderedToolCalls.some((call) => call.status === "running");
   return (
     <article className={`live-message live-message-${entry.role}`}>
       <header className="live-message-header">
@@ -179,7 +180,7 @@ export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls 
       {reasoning.length > 0 && <details className="live-details"><summary>Reasoning</summary><p>{reasoning.join("\n")}</p></details>}
       {renderedToolCalls.length > 0 && <ChatToolCalls
         calls={renderedToolCalls}
-        className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}`}
+        className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}${runningToolCalls ? " live-tool-calls-running" : ""}`}
       />}
       {unmatchedToolCalls.length > 0 && <details className="live-details live-tool-unmatched">
         <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
@@ -203,8 +204,6 @@ function describeEvent(event: LiveEvent): string | null {
   switch (event.type) {
     case "message_update":
       return typeof data.delta === "string" ? data.delta : null;
-    case "tool_execution_start":
-      return `\n[tool] ${String(data.toolName ?? "unknown")}\n`;
     default:
       return null;
   }
@@ -554,6 +553,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         if (event.type === "auto_retry_start") setLiveLog("");
         const text = describeEvent(event);
         if (text) setLiveLog((value) => value + text);
+        if (event.type === "entry_appended") {
+          void refreshLiveHistory().catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));
+        }
         if (event.type === "run_input_status") {
           void refresh();
           void refreshLiveHistory().catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));

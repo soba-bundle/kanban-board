@@ -139,6 +139,7 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.equal(mappedCalls[0].data.resultContent, "README contents");
   assert.deepEqual(mappedCalls[0].data.resultDetails, { source: "workspace" });
   assert.equal(mappedCalls[1].errorMessage, "Write blocked");
+  assert.match(renderToStaticMarkup(liveToolResult(mappedCalls[1])), /Write blocked/);
   assert.deepEqual([...adapter.consumedResultEntryIds], [readResult.id, writeResult.id]);
   assert.equal(adapter.unmatchedByAssistantEntryId.get(callEntry.id)?.[0]?.id, "missing-1");
   const activeAdapter = adaptLiveToolCalls([callEntry, readResult, writeResult], "run-1");

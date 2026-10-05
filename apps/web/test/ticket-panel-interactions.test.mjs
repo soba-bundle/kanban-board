@@ -1175,7 +1175,7 @@ async function mountPanelWithRunningSocket(t) {
   }
   globalThis.WebSocket = FakeWebSocket;
   Object.defineProperty(globalThis, "location", { configurable: true, value: sharedDom.window.location });
-  const snapshot = { ...history(), session_id: "session-1", active_run_id: "run-1" };
+  let snapshot = { ...history(), session_id: "session-1", active_run_id: "run-1" };
   globalThis.fetch = async (url) => {
     const path = String(url);
     if (path.endsWith("/live/history")) return response(url, snapshot);
@@ -1203,7 +1203,7 @@ async function mountPanelWithRunningSocket(t) {
   t.after(() => view.unmount());
   await testing.waitFor(() => assert.ok(sockets.length > 0));
   await testing.waitFor(() => assert.ok(sockets.at(-1).listeners.get("message")?.size));
-  return { testing, socket: sockets.at(-1), view };
+  return { testing, socket: sockets.at(-1), getSocket: () => sockets.at(-1), setSnapshot: (next) => { snapshot = next; }, view };
 }
 
 test("Live history removes failed-attempt deltas when Pi schedules a retry", async (t) => {
@@ -1228,6 +1228,56 @@ test("Live history removes failed-attempt deltas when Pi schedules a retry", asy
   await testing.screen.findByText(/final answer/);
   assert.equal(view.container.querySelector(".live-provisional")?.textContent, "final answer");
   assert.equal(testing.screen.queryByText(/discard this partial answer/), null);
+});
+
+test("Live shows a formatted running tool row and reveals its output when the tool result arrives", async (t) => {
+  const { testing, getSocket, setSnapshot, view } = await mountPanelWithRunningSocket(t);
+  const timestamp = new Date().toISOString();
+  const assistantEntry = {
+    id: "session-1:assistant-tool", entry_id: "assistant-tool", session_id: "session-1", run_id: "run-1", timestamp,
+    role: "assistant", message: { role: "assistant", content: [
+      { type: "toolCall", id: "bash-call-1", name: "bash", arguments: { command: "python -c print('hello')" } },
+    ] },
+  };
+  const appCss = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
+
+  await testing.act(async () => getSocket().emit({ sequence: 1, type: "tool_execution_start", data: {
+    toolCallId: "bash-call-1", toolName: "bash", args: { command: "python -c print('hello')" },
+  } }));
+  assert.equal(view.container.querySelector(".live-provisional"), null,
+    "tool start is represented by the call row, not a raw provisional log line");
+  setSnapshot({ ...history(), session_id: "session-1", active_run_id: "run-1", cursor: 2, entries: [assistantEntry] });
+  await testing.act(async () => getSocket().emit({ sequence: 2, type: "entry_appended", data: { entryId: assistantEntry.entry_id } }));
+  await testing.screen.findByText("python -c print('hello')");
+  const runningCalls = view.container.querySelector(".live-tool-calls-running");
+  assert.ok(runningCalls, "the assistant tool call should appear while the run is active");
+  const activeTarget = [...runningCalls.querySelectorAll("span.x1g3ib7")]
+    .find((target) => target.parentElement?.querySelector("span.xqwr325"));
+  assert.equal(activeTarget?.textContent, "python -c print('hello')",
+    "the shimmer selector resolves to the target of the running tool row");
+  assert.equal(runningCalls.querySelector('[role="button"]'), null,
+    "a running tool has no result disclosure yet");
+  assert.match(appCss, /live-tool-calls-running div:has\(> span\.xqwr325\) > span\.x1g3ib7/,
+    "the running command target receives the shimmer treatment");
+  assert.doesNotMatch(view.container.textContent, /\[tool\] bash/,
+    "tool execution events should not be duplicated as raw log lines");
+
+  const toolResult = {
+    id: "session-1:bash-result", entry_id: "bash-result", session_id: "session-1", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "bash-call-1", toolName: "bash",
+      content: [{ type: "text", text: "Current directory:\nhello" }], isError: false },
+  };
+  setSnapshot({ ...history(), session_id: "session-1", active_run_id: "run-1", cursor: 3, entries: [assistantEntry, toolResult] });
+  await testing.act(async () => getSocket().emit({ sequence: 3, type: "entry_appended", data: { entryId: toolResult.entry_id } }));
+  const resultRow = await testing.waitFor(() => {
+    const row = view.container.querySelector(".live-tool-calls [role=button]");
+    assert.equal(row?.getAttribute("aria-expanded"), "false");
+    return row;
+  });
+  testing.fireEvent.click(resultRow);
+  await testing.waitFor(() => assert.equal(view.container.querySelector(".live-tool-output")?.textContent, "Current directory:\nhello"));
+  assert.ok(view.container.querySelector(".live-tool-output"), "the completed call reveals terminal-formatted output");
+  assert.equal(view.container.querySelector(".live-tool-calls-running"), null);
 });
 
 test("Live shows compaction while active, then a collapsed expandable summary", async (t) => {

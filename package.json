@@ -14,5 +14,17 @@
     "test": "npm run build && npm test --workspace @kanban-board/shared && npm test --workspace @kanban-board/server && npm test --workspace @kanban-board/web",
     "smoke:pi": "npm run build --workspace @kanban-board/shared && npm run build --workspace @kanban-board/server && node apps/server/smoke/pi-integration.mjs",
     "smoke:windows-process-tree": "npm run build --workspace @kanban-board/server && node apps/server/smoke/windows-process-tree.mjs"
+  },
+  "allowScripts": {
+    "@google/genai@1.52.0": true,
+    "protobufjs@7.6.5": true,
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.25.12": true
+  },
+  "dependencies": {
+    "@astryxdesign/cli": "^0.6.5",
+    "@astryxdesign/core": "^0.6.5",
+    "@astryxdesign/theme-neutral": "^0.6.5",
+    "@stylexjs/stylex": "^0.19.1"
   }
 }

@@ -16,6 +16,8 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   });
   t.after(() => vite.close());
   const { TicketPanel, LiveMessageCard } = await vite.ssrLoadModule("/src/components/TicketPanel.tsx");
+  const { adaptLiveToolCalls } = await vite.ssrLoadModule("/src/live-tool-adapter.ts");
+  const { liveToolResult } = await vite.ssrLoadModule("/src/live-tool-result.tsx");
   const { HandoverCard } = await vite.ssrLoadModule("/src/components/HandoverCard.tsx");
   const { ToastProvider } = await vite.ssrLoadModule("/src/components/ToastContext.tsx");
   const task = {
@@ -80,11 +82,102 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
     input: {
       id: "input-1", delivery_status: "DELIVERED", failure_reason: null,
     },
+    showMetadata: true,
   }));
+  assert.match(messageCard, /class="live-message live-message-assistant"/);
   assert.match(messageCard, /Delivered/);
   assert.match(messageCard, /reasoning details/);
-  assert.match(messageCard, /Tool calls/);
   assert.match(messageCard, /local · coder · in 14 · out 7 tokens/);
+  assert.match(messageCard, /<footer class="live-message-meta"><time dateTime=/);
+  const messageHeader = messageCard.match(/<header[^>]*>.*?<\/header>/s)?.[0] ?? "";
+  assert.doesNotMatch(messageHeader, /<time/);
+
+  const userMessageCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: {
+      id: "session:user-entry", entry_id: "user-entry", session_id: "session", run_id: "run-1", timestamp,
+      role: "user", message: { role: "user", content: "Write a README." },
+    },
+  }));
+  assert.match(userMessageCard, /class="live-message live-message-user"/);
+  assert.doesNotMatch(userMessageCard, /<time/);
+
+  const toolOnlyAssistantCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: {
+      id: "session:tool-only", entry_id: "tool-only", session_id: "session", run_id: "run-1", timestamp,
+      role: "assistant", message: {
+        role: "assistant", stopReason: "toolUse",
+        content: [{ type: "toolCall", name: "write", arguments: { path: "README.md" } }],
+      },
+    },
+    showMetadata: true,
+  }));
+  assert.doesNotMatch(toolOnlyAssistantCard, /live-message-meta/);
+
+  const callEntry = {
+    id: "session:assistant-tools", entry_id: "assistant-tools", session_id: "session", run_id: "run-1", timestamp,
+    role: "assistant", message: { role: "assistant", content: [
+      { type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } },
+      { type: "toolCall", id: "write-1", name: "write", arguments: { path: "README.md" } },
+      { type: "toolCall", id: "missing-1", name: "bash", arguments: { command: "npm test" } },
+    ] },
+  };
+  const readResult = {
+    id: "session:read-result", entry_id: "read-result", session_id: "session", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "read-1", toolName: "read",
+      content: [{ type: "text", text: "README contents" }], details: { source: "workspace" }, isError: false },
+  };
+  const writeResult = {
+    id: "session:write-result", entry_id: "write-result", session_id: "session", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "write-1", toolName: "write",
+      content: [{ type: "text", text: "Write blocked" }], isError: true },
+  };
+  const adapter = adaptLiveToolCalls([callEntry, readResult, writeResult]);
+  const mappedCalls = adapter.callsByAssistantEntryId.get(callEntry.id) ?? [];
+  assert.deepEqual(mappedCalls.map((call) => [call.name, call.status, call.target]), [
+    ["read", "complete", "README.md"], ["write", "error", "README.md"],
+  ]);
+  assert.equal(mappedCalls[0].data.resultContent, "README contents");
+  assert.deepEqual(mappedCalls[0].data.resultDetails, { source: "workspace" });
+  assert.equal(mappedCalls[1].errorMessage, "Write blocked");
+  assert.deepEqual([...adapter.consumedResultEntryIds], [readResult.id, writeResult.id]);
+  assert.equal(adapter.unmatchedByAssistantEntryId.get(callEntry.id)?.[0]?.id, "missing-1");
+  const activeAdapter = adaptLiveToolCalls([callEntry, readResult, writeResult], "run-1");
+  assert.equal(activeAdapter.callsByAssistantEntryId.get(callEntry.id)?.[2]?.status, "running");
+  assert.equal(activeAdapter.unmatchedByAssistantEntryId.has(callEntry.id), false);
+
+  const todoCall = { name: "todo", data: {
+    resultContent: "Added todo #1: Inspect the project files.",
+    resultDetails: { todos: [{ id: 1, text: "Inspect the project files.", status: "completed" }] },
+  } };
+  const todoDetail = renderToStaticMarkup(liveToolResult(todoCall));
+  assert.match(todoDetail, /Added todo #1: Inspect the project files\./);
+  assert.match(todoDetail, /Structured details/);
+  assert.match(todoDetail, /<pre>[\s\S]*&quot;status&quot;: &quot;completed&quot;[\s\S]*<\/pre>/);
+
+  const bashDetail = renderToStaticMarkup(liveToolResult({ name: "bash", data: {
+    resultContent: "first line\nsecond line", resultDetails: undefined,
+  } }));
+  assert.match(bashDetail, /<pre class="live-tool-output">first line\nsecond line<\/pre>/);
+
+  const customDetail = renderToStaticMarkup(liveToolResult({ name: "my_extension_tool", data: {
+    resultContent: "Completed custom action", resultDetails: undefined,
+  } }));
+  assert.match(customDetail, /<p class="live-tool-result-text">Completed custom action<\/p>/);
+
+  const adaptedCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: callEntry,
+    toolCalls: mappedCalls,
+    unmatchedToolCalls: adapter.unmatchedByAssistantEntryId.get(callEntry.id),
+  }));
+  assert.match(adaptedCard, /read/);
+  assert.match(adaptedCard, /write/);
+  assert.match(adaptedCard, /class="[^"]*live-tool-calls-grouped/);
+  assert.match(adaptedCard, /Unmatched tool calls — review needed/);
+  const singleCallCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: callEntry, toolCalls: [mappedCalls[0]], unmatchedToolCalls: [],
+  }));
+  assert.match(singleCallCard, /class="[^"]*live-tool-calls/);
+  assert.doesNotMatch(singleCallCard, /live-tool-calls-grouped/);
 });
 
 test("the task board renders legacy Validation readiness tags as ordinary work completion", async (t) => {

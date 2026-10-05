@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ChatToolCallItem } from "@astryxdesign/core/Chat";
+import { ChatToolCalls } from "@astryxdesign/core/Chat";
 import type { CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveCompactionSummary, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
+import { adaptLiveToolCalls, type UnmatchedToolCall } from "../live-tool-adapter.js";
+import { liveToolResult } from "../live-tool-result.js";
 import { HandoverCard } from "./HandoverCard.js";
 import { HumanRequestPanel } from "./HumanRequestPanel.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
@@ -148,31 +152,46 @@ function inputStatusLabel(status: string): string {
     DELIVERY_UNKNOWN: "Delivery unknown", CANCELLED: "Cancelled" } as Record<string, string>)[status] ?? status;
 }
 
-export function LiveMessageCard({ entry, input }: { entry: LiveHistoryEntry; input?: RunInput }) {
-  const message = entry.message as { role?: string; toolName?: string; content?: unknown; provider?: string; model?: string; usage?: Record<string, unknown> };
+export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls = [], unmatchedToolCalls = [] }: {
+  entry: LiveHistoryEntry; input?: RunInput; showMetadata?: boolean;
+  toolCalls?: ChatToolCallItem[]; unmatchedToolCalls?: UnmatchedToolCall[];
+}) {
+  const message = entry.message as { role?: string; toolName?: string; content?: unknown; provider?: string; model?: string; usage?: Record<string, unknown>; stopReason?: string; isError?: boolean };
   const parts = Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [];
   const reasoning = parts.filter((part) => part.type === "thinking").map((part) => String(part.thinking ?? "")).filter(Boolean);
-  const toolCalls = parts.filter((part) => part.type === "toolCall");
   const role = entry.role === "user" ? "You" : entry.role === "assistant" ? "Agent" : `Tool: ${message.toolName ?? entry.role}`;
   const usage = message.usage ?? {};
   const tokens = [
     typeof usage.input === "number" ? `in ${usage.input}` : null,
     typeof usage.output === "number" ? `out ${usage.output}` : null,
   ].filter(Boolean).join(" · ");
+  const renderedToolCalls = toolCalls.map((call) => {
+    const resultDetail = liveToolResult(call);
+    return resultDetail === undefined ? call : { ...call, resultDetail };
+  });
   return (
     <article className={`live-message live-message-${entry.role}`}>
       <header className="live-message-header">
         <strong>{role}</strong>
-        <time dateTime={entry.timestamp}>{new Date(entry.timestamp).toLocaleTimeString()}</time>
         {input && <span className={`input-status input-status-${input.delivery_status.toLowerCase()}`} title={input.failure_reason ?? undefined}>{inputStatusLabel(input.delivery_status)}</span>}
       </header>
       {entry.role !== "tool" && textContent(entry) && <p className="live-message-text">{textContent(entry)}</p>}
       {reasoning.length > 0 && <details className="live-details"><summary>Reasoning</summary><p>{reasoning.join("\n")}</p></details>}
-      {toolCalls.length > 0 && <details className="live-details"><summary>Tool calls ({toolCalls.length})</summary>
-        {toolCalls.map((call, index) => <pre key={index}>{String(call.name ?? "tool")} {JSON.stringify(call.arguments ?? {})}</pre>)}
+      {renderedToolCalls.length > 0 && <ChatToolCalls
+        calls={renderedToolCalls}
+        className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}`}
+      />}
+      {unmatchedToolCalls.length > 0 && <details className="live-details live-tool-unmatched">
+        <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
+        {unmatchedToolCalls.map((call, index) => <section key={call.id ?? index}>
+          <strong>{call.name}</strong><p>{call.reason}</p>
+          {call.arguments !== undefined && <pre>{JSON.stringify(call.arguments, null, 2)}</pre>}
+          {call.id && <code>{call.id}</code>}
+        </section>)}
       </details>}
-      {entry.role === "tool" && textContent(entry) && <details className="live-details"><summary>Tool result</summary><pre>{textContent(entry)}</pre></details>}
-      {(message.provider || message.model || tokens) && <footer className="live-message-meta">
+      {entry.role === "tool" && textContent(entry) && <details className="live-details"><summary>Tool result{message.isError === true ? " (error)" : ""}</summary><pre>{textContent(entry)}</pre></details>}
+      {showMetadata && entry.role === "assistant" && textContent(entry) && message.stopReason !== "toolUse" && <footer className="live-message-meta">
+        <time dateTime={entry.timestamp}>{new Date(entry.timestamp).toLocaleTimeString()}</time>
         {[message.provider, message.model, tokens].filter(Boolean).join(" · ")}{tokens ? " tokens" : ""}
       </footer>}
     </article>
@@ -747,6 +766,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setStartingRun(true);
   }
 
+  const latestAssistantEntryId = liveHistory?.entries.filter((entry) => entry.role === "assistant").at(-1)?.id;
+  const liveToolAdapter = adaptLiveToolCalls(liveHistory?.entries ?? [], liveHistory?.active_run_id ?? null);
+
   return (
     <div className="panel-backdrop" onClick={onClose}>
       <aside className="ticket-panel" onClick={(event) => event.stopPropagation()} aria-label={`Ticket ${task.title}`}>
@@ -1089,16 +1111,21 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 setHistoryRetry((value) => value + 1);
               }}>Retry history</button>}
               {!history && <p className="run-empty">Loading conversation…</p>}
-              {history && buildLiveTimeline(history.entries, compactionSummaries).map((item) => item.type === "entry"
-                ? <LiveMessageCard
-                    key={`entry:${item.entry.session_id}:${item.entry.entry_id}`}
-                    entry={item.entry}
-                    input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
-                  />
-                : <details className="compaction-summary" key={`compaction:${item.summary.id}`}>
-                    <summary>Compaction summary</summary>
-                    <div className="compaction-summary-text">{item.summary.summary}</div>
-                  </details>)}
+              {history && buildLiveTimeline(history.entries, compactionSummaries).map((item) => {
+                if (item.type === "compaction") return <details className="compaction-summary" key={`compaction:${item.summary.id}`}>
+                  <summary>Compaction summary</summary>
+                  <div className="compaction-summary-text">{item.summary.summary}</div>
+                </details>;
+                if (liveToolAdapter.consumedResultEntryIds.has(item.entry.id)) return null;
+                return <LiveMessageCard
+                  key={`entry:${item.entry.session_id}:${item.entry.entry_id}`}
+                  entry={item.entry}
+                  input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
+                  showMetadata={item.entry.id === latestAssistantEntryId && !runningRunId}
+                  toolCalls={liveToolAdapter.callsByAssistantEntryId.get(item.entry.id)}
+                  unmatchedToolCalls={liveToolAdapter.unmatchedByAssistantEntryId.get(item.entry.id)}
+                />;
+              })}
               {unattachedInputs.map((input) => <article className="live-input-status" key={input.id}>
                 <header><strong>You</strong><span className={`input-status input-status-${input.delivery_status.toLowerCase()}`}>{inputStatusLabel(input.delivery_status)}</span></header>
                 <p>{input.content}</p>

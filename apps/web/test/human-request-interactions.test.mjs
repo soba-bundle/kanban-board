@@ -273,6 +273,8 @@ test("Live reloads a persisted Human Request from the real API after closing and
   const reopened = panel.reopen();
   await reopened.findByText(/Answered/i);
   assert.ok(reopened.getByText("A controlled rollout"));
+  const questionnaireCall = reopened.getByText("kanban_questionnaire", { exact: true });
+  panel.fireEvent.click(questionnaireCall.closest('[role="button"]'));
   assert.ok(reopened.getByText(/Scope: user selected: 2\. Large/),
     "reopened Live must rebuild the correlated questionnaire tool result from persisted session history");
   assert.equal(panel.calls.filter((call) => call.method === "GET" && call.url.endsWith("/human-requests")).length, 4,

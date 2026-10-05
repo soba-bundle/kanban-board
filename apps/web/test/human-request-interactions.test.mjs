@@ -30,9 +30,10 @@ const emptyHistory = (taskId) => ({
 });
 
 async function mountPanel(t, requestState, fetchOverride) {
-  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost:5173" });
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost:5173", pretendToBeVisual: true });
+  dom.window.matchMedia = (media) => ({ media, matches: false, addEventListener() {}, removeEventListener() {} });
   const saved = new Map();
-  for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "MutationObserver", "getComputedStyle", "IS_REACT_ACT_ENVIRONMENT"]) {
+  for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "MutationObserver", "getComputedStyle", "requestAnimationFrame", "cancelAnimationFrame", "IS_REACT_ACT_ENVIRONMENT"]) {
     saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
   }
   const previousFetch = globalThis.fetch;
@@ -61,6 +62,8 @@ async function mountPanel(t, requestState, fetchOverride) {
     HTMLElement: dom.window.HTMLElement,
     Node: dom.window.Node,
     MutationObserver: dom.window.MutationObserver,
+    requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+    cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
     getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
     IS_REACT_ACT_ENVIRONMENT: true,
   });

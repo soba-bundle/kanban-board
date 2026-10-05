@@ -1,0 +1,7 @@
+{
+  "pi": {
+    "extensions": [
+      "./pi-todo-list/index.ts"
+    ]
+  }
+}

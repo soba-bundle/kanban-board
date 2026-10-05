@@ -11,7 +11,7 @@ let sharedDom;
 let sharedTesting;
 
 async function setupDom(t) {
-  if (!sharedDom) sharedDom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
+  if (!sharedDom) sharedDom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/", pretendToBeVisual: true });
   const values = {
     window: sharedDom.window,
     document: sharedDom.window.document,
@@ -19,12 +19,15 @@ async function setupDom(t) {
     HTMLElement: sharedDom.window.HTMLElement,
     Node: sharedDom.window.Node,
     MutationObserver: sharedDom.window.MutationObserver,
+    requestAnimationFrame: sharedDom.window.requestAnimationFrame.bind(sharedDom.window),
+    cancelAnimationFrame: sharedDom.window.cancelAnimationFrame.bind(sharedDom.window),
     getComputedStyle: sharedDom.window.getComputedStyle.bind(sharedDom.window),
     IS_REACT_ACT_ENVIRONMENT: true,
   };
   for (const [name, value] of Object.entries(values)) {
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
   }
+  sharedDom.window.matchMedia ??= (media) => ({ media, matches: false, addEventListener() {}, removeEventListener() {} });
   sharedTesting ??= await import("@testing-library/react");
   t.after(() => sharedTesting.cleanup());
   return sharedTesting;
@@ -81,6 +84,8 @@ test("composer gates on prompt, keeps Shift+Enter, and preserves draft through c
   assert.equal(startButton.disabled, false);
 
   testing.fireEvent.keyDown(composer, { key: "Enter", shiftKey: true });
+  assert.equal(testing.screen.queryByRole("dialog", { name: "Start a run" }), null);
+  testing.fireEvent.keyDown(composer, { key: "Enter", isComposing: true });
   assert.equal(testing.screen.queryByRole("dialog", { name: "Start a run" }), null);
   testing.fireEvent.keyDown(composer, { key: "Enter" });
   const startDialog = testing.screen.getByRole("dialog", { name: "Start a run" });
@@ -185,6 +190,15 @@ test("code changes show a review card with the summary, paths, and uncheckpointe
 
   assert.ok(await testing.screen.findByText("Changes to review"));
   const card = testing.screen.getByRole("region", { name: "Changes to review" });
+  assert.equal(card.closest(".ticket-panel-body") !== null, true, "the review summary stays in the Live transcript body");
+  assert.equal(card.previousElementSibling?.classList.contains("live-conversation"), true,
+    "the review summary follows the completed Live conversation");
+  for (const label of ["Check sync", "Update checkpoint", "Merge back to working branch"]) {
+    assert.ok(testing.screen.getByRole("button", { name: new RegExp(label, "i") }).closest(".ticket-panel-body"),
+      `${label} belongs in the scrollable review section`);
+  }
+  assert.equal(testing.screen.getAllByRole("button", { name: "Start run" }).length, 1,
+    "only the composer submit button remains; the redundant Next step action is removed");
   assert.ok(testing.within(card).getByText(/Updated the retry guard/));
   assert.equal(testing.within(card).queryByText("An earlier response must not be shown."), null);
   assert.ok(testing.within(card).getByText("src/retry.ts"));
@@ -289,12 +303,13 @@ test("Review exposes explicit Sync with main without running agent Validation", 
   })));
 
   const sync = await testing.screen.findByRole("button", { name: /Sync with main/i });
+  assert.ok(sync.closest(".ticket-panel-body"), "Sync with main stays in scrollable review actions");
   assert.equal(sync.disabled, false);
   assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/sync")), false,
     "sync must wait for an explicit user action");
   testing.fireEvent.click(sync);
   await testing.waitFor(() => assert.ok(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/sync"))));
-  assert.match((await testing.screen.findByRole("status")).textContent, /Synced main at d{12}/);
+  assert.ok(await testing.screen.findByText(/Synced main at d{12}/));
   assert.equal(requests.some((request) => request.path.endsWith("/validation")), false,
     "sync must not start automated agent Validation");
 });
@@ -444,9 +459,9 @@ test("Review and merge confirmation remind developers without adding an acknowle
     createElement(TicketPanel, { task: readyTask, queue: null, onClose() {}, onChanged() { changed += 1; } })));
 
   const mergeButton = await testing.screen.findByRole("button", { name: /Merge back to working branch/i });
-  const reviewReminder = await testing.screen.findByRole("note", { name: "Developer testing reminder" });
-  assert.match(reviewReminder.textContent, /test the app.*task worktree.*review the implemented code/i);
-  assert.match(reviewReminder.textContent, /Check sync.*Git state only/i);
+  assert.ok(mergeButton.closest(".ticket-panel-body"), "merge action stays in scrollable review actions");
+  assert.equal(testing.screen.queryByRole("note", { name: "Developer testing reminder" }), null,
+    "the reminder is omitted from the main Live view and reserved for merge confirmation");
   assert.equal(mergeButton.disabled, false);
   assert.equal(requests.some((request) => request.options.method === "POST" && request.path.endsWith("/merge")), false,
     "a fresh Check sync state still requires explicit merge approval");
@@ -506,7 +521,7 @@ test("stale merge response remains visible and never refreshes as successfully m
   testing.fireEvent.click(await testing.screen.findByRole("button", { name: /Merge back to working branch/i }));
   const confirmation = await testing.screen.findByRole("dialog", { name: /confirm merge back/i });
   testing.fireEvent.click(testing.within(confirmation).getByRole("button", { name: /Confirm merge/i }));
-  await testing.waitFor(() => assert.match(testing.screen.getByRole("status").textContent, /stale/i));
+  await testing.screen.findByText(/Check sync is stale/i);
   assert.equal(changed, 0, "failed integration must not be presented as a completed merge");
 });
 
@@ -805,7 +820,7 @@ test("explicit reuse starts a new run linked to the unresolved source input", as
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: task("REVIEW", "INTERRUPTED"), queue: null, onClose() {}, onChanged() {} })));
 
-  await testing.screen.findByRole("button", { name: "Runs (1)" });
+  await testing.screen.findByRole("tab", { name: "Runs (1)" });
   testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Reuse / Send again" }));
   const startDialog = testing.screen.getByRole("dialog", { name: "Start a run" });
   assert.equal(testing.within(startDialog).getByLabelText("Initial prompt").value, unresolved.content);
@@ -1048,7 +1063,7 @@ test("Review exposes a read-only Check sync action instead of agent Validation",
   assert.equal(get.options.method ?? "GET", "GET");
   assert.equal(requests.some((request) => request.url.endsWith("/validation")), false,
     "Check sync must not start an agent Validation run");
-  const checked = await testing.screen.findByRole("status");
+  const checked = await testing.screen.findByText(/Git state was in sync/i);
   assert.match(checked.textContent, /Git.*in sync/i);
   assert.match(checked.textContent, /Git-state check only, not application testing or code review/i);
 
@@ -1128,7 +1143,7 @@ test("validation findings are visible in Runs and copied by attribution category
   testing.render(createElement(ToastProvider, null, createElement("div", null,
     createElement(TicketPanel, { task: { ...task("REVIEW", "VALIDATION_ISSUES"), latest_task_commit_sha: "c".repeat(40) },
       queue: null, onClose() {}, onChanged() {} }), createElement(ToastViewport))));
-  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Runs (1)" }));
+  testing.fireEvent.click(await testing.screen.findByRole("tab", { name: "Runs (1)" }));
   await testing.screen.findByText("Changed parser rejects valid input");
   await testing.screen.findByText("Existing timeout is too short");
   testing.fireEvent.click(testing.screen.getByRole("button", { name: "Copy direct findings" }));
@@ -1225,12 +1240,49 @@ test("Live history removes failed-attempt deltas when Pi schedules a retry", asy
     createElement(TicketPanel, { task: task("IN_PROGRESS", "WORK_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
   t.after(() => view.unmount());
 
-  await testing.screen.findByText(/final answer/);
-  assert.equal(view.container.querySelector(".live-provisional")?.textContent, "final answer");
+  await testing.waitFor(() => assert.equal(view.container.querySelector(".live-provisional .astryx-markdown")?.textContent, "final answer"));
+  assert.equal(view.container.querySelectorAll(".live-provisional .live-message-header").length, 1);
   assert.equal(testing.screen.queryByText(/discard this partial answer/), null);
 });
 
-test("Live shows a formatted running tool row and reveals its output when the tool result arrives", async (t) => {
+test("Live pins the persisted todo list above the composer and scrolls lists beyond five rows", async (t) => {
+  const timestamp = new Date().toISOString();
+  const todos = Array.from({ length: 7 }, (_, index) => ({
+    id: index + 1, text: `Task ${index + 1}`,
+    status: index === 1 ? "in_progress" : index < 1 ? "completed" : "pending",
+  }));
+  const todoResult = {
+    id: "session-1:todo-result", entry_id: "todo-result", session_id: "session-1", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "todo-call-1", toolName: "todo",
+      content: [{ type: "text", text: "Updated todo list" }], details: { action: "list", todos, nextId: 8 }, isError: false },
+  };
+  const { testing, getSocket, setSnapshot, view } = await mountPanelWithRunningSocket(t);
+  setSnapshot({ ...history(), session_id: "session-1", active_run_id: "run-1", cursor: 1, entries: [todoResult] });
+  await testing.act(async () => getSocket().emit({ sequence: 1, type: "entry_appended", data: { entryId: todoResult.entry_id } }));
+  await testing.screen.findByText("Todos");
+  const widget = view.container.querySelector(".live-todo-widget");
+  assert.equal(widget?.previousElementSibling?.classList.contains("ticket-panel-body"), true,
+    "todo widget follows the Live panel body");
+  assert.equal(widget?.nextElementSibling?.classList.contains("ticket-composer"), true,
+    "todo widget sits outside and immediately above the composer");
+  assert.equal(widget?.querySelectorAll(".live-todo-item").length, 7, "all tasks remain available in the scroll viewport");
+  assert.equal(widget?.querySelector(".live-todo-scroll")?.getAttribute("aria-label"), "Todo list");
+  assert.ok(widget?.querySelector('[role="img"][aria-label="In progress"]'), "in-progress row uses an accessible status dot");
+  assert.ok(widget?.querySelector('[role="img"][aria-label="Waiting"]'), "waiting row uses an accessible neutral dot");
+  assert.ok(widget?.querySelector('[role="img"][aria-label="Completed"]'), "completed row uses an accessible success dot");
+  const appCss = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
+  assert.match(appCss,
+    /live-todo-scroll\s*\{[^}]*max-block-size:\s*calc\(var\(--text-supporting-size\)\s*\*\s*var\(--text-supporting-leading\)\s*\*\s*5\)/);
+  assert.match(appCss,
+    /live-todo-widget\s*\{[^}]*border-block-start:\s*var\(--border-width\) solid var\(--color-border\)/);
+  assert.ok(widget?.querySelector(".live-todo-item .astryx-text[data-type='supporting']"),
+    "todo row labels use Astryx supporting text for a smaller type size");
+  assert.match(readFileSync(new URL("../src/app.css", import.meta.url), "utf8"),
+    /live-todo-list\s*\{[^}]*gap:\s*0;/);
+  assert.doesNotMatch(widget?.textContent ?? "", /action=list|todo-call-1/);
+});
+
+test("Live shows a formatted running tool row and reveals full output when the tool result arrives", async (t) => {
   const { testing, getSocket, setSnapshot, view } = await mountPanelWithRunningSocket(t);
   const timestamp = new Date().toISOString();
   const assistantEntry = {
@@ -1265,7 +1317,7 @@ test("Live shows a formatted running tool row and reveals its output when the to
   const toolResult = {
     id: "session-1:bash-result", entry_id: "bash-result", session_id: "session-1", run_id: "run-1", timestamp,
     role: "tool", message: { role: "toolResult", toolCallId: "bash-call-1", toolName: "bash",
-      content: [{ type: "text", text: "Current directory:\nhello" }], isError: false },
+      content: [{ type: "text", text: "Current directory:\nsecond-line-secret" }], isError: false },
   };
   setSnapshot({ ...history(), session_id: "session-1", active_run_id: "run-1", cursor: 3, entries: [assistantEntry, toolResult] });
   await testing.act(async () => getSocket().emit({ sequence: 3, type: "entry_appended", data: { entryId: toolResult.entry_id } }));
@@ -1275,18 +1327,45 @@ test("Live shows a formatted running tool row and reveals its output when the to
     return row;
   });
   testing.fireEvent.click(resultRow);
-  await testing.waitFor(() => assert.equal(view.container.querySelector(".live-tool-output")?.textContent, "Current directory:\nhello"));
-  assert.ok(view.container.querySelector(".live-tool-output"), "the completed call reveals terminal-formatted output");
+  await testing.waitFor(() => assert.equal(view.container.querySelector(".live-tool-output")?.textContent, "Current directory:\nsecond-line-secret"));
+  assert.equal(view.container.querySelector(".live-tool-result-summary"), null, "non-todo results are not reduced to a summary");
   assert.equal(view.container.querySelector(".live-tool-calls-running"), null);
+});
+
+test("Live edit rows show compact change counts and expanded red/green before-and-after snippets", async (t) => {
+  const timestamp = new Date().toISOString();
+  const assistantEntry = {
+    id: "session-1:edit-call", entry_id: "edit-call", session_id: "session-1", run_id: "run-1", timestamp,
+    role: "assistant", message: { role: "assistant", content: [{ type: "toolCall", id: "edit-call-1", name: "edit",
+      arguments: { path: "src/retry.ts", edits: [{ oldText: "const retries = 1;", newText: "const retries = 2;" }] } }] },
+  };
+  const toolResult = {
+    id: "session-1:edit-result", entry_id: "edit-result", session_id: "session-1", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "edit-call-1", toolName: "edit", isError: false,
+      content: [{ type: "text", text: "Successfully replaced 1 block in src/retry.ts." }],
+      details: { diff: "-1 const retries = 1;\n+1 const retries = 2;", patch: "--- a/src/retry.ts\n+++ b/src/retry.ts\n@@ -1 +1 @@\n-const retries = 1;\n+const retries = 2;", firstChangedLine: 1 } },
+  };
+  const { testing, view } = await mountPanelWithHistorySnapshot(t,
+    { ...history(), session_id: "session-1", entries: [assistantEntry, toolResult] });
+  const row = await testing.screen.findByRole("button", { name: /edit.*src\/retry\.ts/i });
+  assert.match(row.textContent, /\+1/);
+  assert.match(row.textContent, /-1/);
+  assert.equal(testing.screen.queryByText("Before"), null, "snippets stay inside the collapsed result disclosure");
+  testing.fireEvent.click(row);
+  await testing.screen.findByText("Before");
+  await testing.screen.findByText("After");
+  assert.ok(view.container.querySelector(".live-edit-diff-before"));
+  assert.ok(view.container.querySelector(".live-edit-diff-after"));
+  const appCss = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
+  assert.ok(appCss.includes(".live-edit-diff-before { background: var(--color-background-red); }"));
+  assert.ok(appCss.includes(".live-edit-diff-after { background: var(--color-background-green); }"));
 });
 
 test("Live shows compaction while active, then a collapsed expandable summary", async (t) => {
   const { testing, socket } = await mountPanelWithRunningSocket(t);
   await testing.act(async () => socket.emit({ sequence: 1, type: "compaction_start", data: { reason: "threshold" } }));
-  const status = await testing.screen.findByText(/Compacting context/i);
-  assert.ok(status.classList.contains("compaction-status"));
-  const appCss = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
-  assert.match(appCss, /\.compaction-status::after\s*\{[^}]*animation:\s*compaction-shimmer/);
+  const status = await testing.screen.findByRole("progressbar", { name: /Compacting context/i });
+  assert.equal(status.hasAttribute("aria-valuenow"), false);
   const summary = "Goal: keep retries bounded. Next: run the regression tests.";
   await testing.act(async () => socket.emit({ sequence: 2, type: "compaction_end", data: {
     reason: "threshold", aborted: false, willRetry: false, summary,
@@ -1455,7 +1534,29 @@ test("Validation Review progress is identified in the Runs history while it is r
   };
   testing.render(createElement(ToastProvider, null,
     createElement(TicketPanel, { task: task("REVIEW", "IMPLEMENTATION_COMPLETE"), queue: null, onClose() {}, onChanged() {} })));
-  testing.fireEvent.click(await testing.screen.findByRole("button", { name: "Runs (1)" }));
+  testing.fireEvent.click(await testing.screen.findByRole("tab", { name: "Runs (1)" }));
   await testing.screen.findByText("Validation #4");
   await testing.screen.findByText("RUNNING");
+  const runsTab = testing.screen.getByRole("tab", { name: "Runs (1)" });
+  assert.equal(runsTab.getAttribute("aria-selected"), "true");
+  assert.equal(runsTab.getAttribute("aria-controls"), testing.screen.getByRole("tabpanel", { name: "Runs" }).id);
+  testing.fireEvent.click(testing.screen.getByRole("tab", { name: "Live" }));
+  assert.ok(testing.screen.getByRole("tabpanel", { name: "Live" }));
+});
+
+test("pinned metadata shows task description, worktree and created time without inventing cwd", async (t) => {
+  const testing = await setupDom(t);
+  const { TicketPanel, ToastProvider } = await loadComponents(t);
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => response(url, String(url).endsWith("/live/history") ? history() : []);
+  t.after(() => { globalThis.fetch = previousFetch; });
+  const fixture = { ...task(), worktree_path: "C:/worktrees/retries", created_at: "2026-01-02T03:04:05Z" };
+  const view = testing.render(createElement(ToastProvider, null, createElement(TicketPanel, {
+    task: fixture, queue: null, onClose() {}, onChanged() {},
+  })));
+  const header = view.container.querySelector(".ticket-panel-header");
+  assert.match(header.textContent, /Avoid duplicate requests/);
+  assert.match(header.textContent, /Working directory.*C:\/worktrees\/retries/);
+  assert.equal(header.querySelector("time").getAttribute("datetime"), fixture.created_at);
+  assert.ok(testing.within(header).getByRole("button", { name: "Close ticket" }));
 });

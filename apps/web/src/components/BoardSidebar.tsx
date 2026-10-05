@@ -1,4 +1,6 @@
 import type { BoardSnapshot, Project, QueueSnapshot } from "@kanban-board/shared";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Icon } from "@astryxdesign/core/Icon";
 import { AddIconButton } from "./AddIconButton.js";
 import { CountBadge } from "./CountBadge.js";
 import { DeleteIcon } from "./DeleteIcon.js";
@@ -53,9 +55,8 @@ export function BoardSidebar({ projects, selectedProject, board, queue, onSelect
                 <span className="project-name">{project.name}</span>
                 <CountBadge value={count} className="project-count" />
               </button>
-              <button className="project-delete" aria-label={`Delete project ${project.name}`} title={hasQueuedWork ? "Remove queued work or stop runs before deleting" : "Delete project"} disabled={hasQueuedWork} onClick={() => onDeleteProject(project)}>
-                <DeleteIcon />
-              </button>
+              <IconButton className="project-delete" label={`Delete project ${project.name}`} tooltip={hasQueuedWork ? "Remove queued work or stop runs before deleting" : "Delete project"}
+                isDisabled={hasQueuedWork} onClick={() => onDeleteProject(project)} icon={<Icon icon={DeleteIcon} />} size="sm" variant="ghost" />
             </div>
           );
         })}

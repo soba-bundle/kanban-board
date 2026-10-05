@@ -6,12 +6,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { AgentManager } from "../dist/agents/agent-manager.js";
+import { createKanbanResourceLoader } from "../dist/pi/resource-loader.js";
 import { registerLiveEventRoutes } from "../dist/agents/live-event-routes.js";
 import { RunManager } from "../dist/agents/run-manager.js";
 import { QueueManager } from "../dist/queue/queue-manager.js";
 import { registerQueueRoutes } from "../dist/queue/queue-routes.js";
 import { openDatabase } from "../dist/db.js";
-import { SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 class FakeSession {
   constructor(sessionManager) {
@@ -38,7 +39,7 @@ function makeFixture(sessionDir) {
   const db = openDatabase(":memory:");
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO projects (id, name, root_path, created_at, updated_at)
-    VALUES ('project-1', 'Project', '/tmp/project', ?, ?)`).run(now, now);
+    VALUES ('project-1', 'Project', ?, ?, ?)`).run(tmpdir(), now, now);
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Task', '', 'IN_PROGRESS', ?, ?)`).run(now, now);
   for (const [index, id] of ["run-1", "run-2", "run-3"].entries()) {
@@ -73,9 +74,10 @@ async function waitFor(check) {
   assert.fail("Timed out waiting for run completion.");
 }
 
-test("production AgentManager excludes the configured pi-questions extension while retaining another user extension", async (t) => {
+test("production AgentManager loads only the Kanban repo extension allowlist", async (t) => {
   const agentDir = mkdtempSync(join(tmpdir(), "kanban-pi-agent-config-"));
   const sessionDir = mkdtempSync(join(tmpdir(), "kanban-pi-agent-sessions-"));
+  const projectDir = mkdtempSync(join(tmpdir(), "kanban-pi-project-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   let db;
   let agents;
@@ -86,40 +88,60 @@ test("production AgentManager excludes the configured pi-questions extension whi
         else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
         rmSync(agentDir, { recursive: true, force: true });
         rmSync(sessionDir, { recursive: true, force: true });
+        rmSync(projectDir, { recursive: true, force: true });
       }
     }
   });
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  const extensionRoot = join(agentDir, "extensions");
-  const incompatibleDir = join(extensionRoot, "pi-questions");
-  const retainedDir = join(extensionRoot, "other-user-extension");
-  mkdirSync(incompatibleDir, { recursive: true });
-  mkdirSync(retainedDir, { recursive: true });
-  writeFileSync(join(incompatibleDir, "index.ts"), `export default function(pi) {
-    pi.registerTool({ name: "questionnaire", label: "Questionnaire", description: "TUI-only fixture",
+  const globalExtension = join(agentDir, "extensions", "global-extension");
+  const projectExtensionRoot = join(projectDir, ".pi", "extensions");
+  const projectExtension = join(projectExtensionRoot, "task-project-extension");
+  mkdirSync(globalExtension, { recursive: true });
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [join(globalExtension, "index.ts")] }));
+  mkdirSync(projectExtension, { recursive: true });
+  writeFileSync(join(projectExtensionRoot, "package.json"), JSON.stringify({
+    pi: { extensions: ["./task-project-extension/index.ts"] },
+  }));
+  const toolExtension = (name) => `export default function(pi) {
+    pi.registerTool({ name: "${name}", label: "Fixture", description: "Extension fixture",
       parameters: { type: "object", properties: {}, additionalProperties: false },
-      async execute() { return { content: [{ type: "text", text: "TUI only" }], details: {} }; } });
-  }`);
-  writeFileSync(join(retainedDir, "index.ts"), `export default function(pi) {
-    pi.registerTool({ name: "other_extension_tool", label: "Other", description: "Retained fixture",
-      parameters: { type: "object", properties: {}, additionalProperties: false },
-      async execute() { return { content: [{ type: "text", text: "retained" }], details: {} }; } });
-  }`);
+      async execute() { return { content: [{ type: "text", text: "fixture" }], details: {} }; } });
+  }`;
+  writeFileSync(join(globalExtension, "index.ts"), toolExtension("global_extension_tool"));
+  writeFileSync(join(projectExtension, "index.ts"), toolExtension("task_project_extension_tool"));
 
   db = openDatabase(":memory:");
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO projects (id, name, root_path, created_at, updated_at)
-    VALUES ('project-1', 'Project', ?, ?, ?)`).run(tmpdir(), now, now);
+    VALUES ('project-1', 'Project', ?, ?, ?)`).run(projectDir, now, now);
   db.prepare(`INSERT INTO tasks (id, project_id, title, description, workflow_state, created_at, updated_at)
     VALUES ('task-1', 'project-1', 'Task', '', 'TODO', ?, ?)`).run(now, now);
   agents = new AgentManager(db, sessionDir);
 
   const session = await agents.getOrCreateWorkingSession("task-1");
-  assert.ok(session.getToolDefinition("other_extension_tool"), "unrelated user extensions must remain available");
-  assert.equal(session.getToolDefinition("questionnaire"), undefined,
-    "production hosted sessions must not expose the incompatible global TUI questionnaire");
+  assert.ok(session.getToolDefinition("todo"), "the checked-in Kanban repo extension allowlist is loaded");
+  assert.equal(session.getToolDefinition("global_extension_tool"), undefined, "global settings extensions are excluded");
+  assert.equal(session.getToolDefinition("task_project_extension_tool"), undefined,
+    "extensions from the task project's cwd are excluded");
   assert.ok(session.getToolDefinition("kanban_questionnaire"), "the repo-owned hosted questionnaire must be registered");
   assert.equal(session.extensionRunner.createContext().mode, "print");
+  assert.equal(session.settingsManager.isProjectTrusted(), false, "task-project settings cannot override Kanban config");
+});
+
+test("Kanban-owned Ollama model is available without external credentials", async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "kanban-ollama-model-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { agentDir } = createKanbanResourceLoader(cwd);
+  const runtime = await ModelRuntime.create({
+    authPath: join(cwd, "auth.json"),
+    modelsPath: join(agentDir, "models.json"),
+    modelsStorePath: join(cwd, "models-store.json"),
+    allowModelNetwork: false,
+    refreshOnCreate: false,
+  });
+  const available = await runtime.getAvailable("ollama");
+  assert.deepEqual(available.map((model) => model.id), ["kanban-omnicoder-9b-8k:latest"]);
+  assert.equal(runtime.getProviderAuthStatus("ollama").source, "models_json_key");
 });
 
 test("Kanban SDK sessions force auto-compaction without changing Pi user settings", async (t) => {
@@ -129,6 +151,10 @@ test("Kanban SDK sessions force auto-compaction without changing Pi user setting
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const globalSettingsPath = join(agentDir, "settings.json");
   const projectSettingsPath = join(cwd, ".pi", "settings.json");
+  const kanbanResourceLoader = createKanbanResourceLoader(cwd);
+  const kanbanSettingsPath = join(kanbanResourceLoader.agentDir, "settings.json");
+  const kanbanSettingsBefore = readFileSync(kanbanSettingsPath, "utf8");
+  const kanbanSettings = JSON.parse(kanbanSettingsBefore);
   mkdirSync(join(cwd, ".pi"), { recursive: true });
   writeFileSync(globalSettingsPath, JSON.stringify({
     compaction: { enabled: false, reserveTokens: 7000, keepRecentTokens: 9000 },
@@ -163,10 +189,16 @@ test("Kanban SDK sessions force auto-compaction without changing Pi user setting
   const first = await agents.getOrCreateWorkingSession("task-1");
   assert.equal(first.autoCompactionEnabled, true, "Kanban sessions must force Pi auto-compaction on");
   assert.deepEqual(first.settingsManager.getCompactionSettings(), {
-    enabled: true, reserveTokens: 8000, keepRecentTokens: 10000,
-  }, "Kanban overrides enablement but preserve the Pi native reserve settings");
+    enabled: true,
+    reserveTokens: kanbanSettings.compaction?.reserveTokens ?? 16384,
+    keepRecentTokens: kanbanSettings.compaction?.keepRecentTokens ?? 20000,
+  }, "Kanban overrides enablement while preserving Kanban-owned Pi settings");
+  assert.equal(first.settingsManager.isProjectTrusted(), false, "task-project Pi settings are ignored");
+  assert.equal(first.settingsManager.getDefaultProvider(), "ollama");
+  assert.equal(first.settingsManager.getDefaultModel(), "kanban-omnicoder-9b-8k:latest");
   assert.equal(readFileSync(globalSettingsPath, "utf8"), globalSettingsBefore);
   assert.equal(readFileSync(projectSettingsPath, "utf8"), projectSettingsBefore);
+  assert.equal(readFileSync(kanbanSettingsPath, "utf8"), kanbanSettingsBefore);
   assert.equal(SettingsManager.create(cwd, agentDir).getCompactionEnabled(), false,
     "normal Pi console settings must remain unchanged");
 
@@ -175,10 +207,13 @@ test("Kanban SDK sessions force auto-compaction without changing Pi user setting
   const restored = await agents.restoreWorkingSession("task-1");
   assert.equal(restored.autoCompactionEnabled, true, "restored Kanban sessions must reapply the SDK-only override");
   assert.deepEqual(restored.settingsManager.getCompactionSettings(), {
-    enabled: true, reserveTokens: 8000, keepRecentTokens: 10000,
+    enabled: true,
+    reserveTokens: kanbanSettings.compaction?.reserveTokens ?? 16384,
+    keepRecentTokens: kanbanSettings.compaction?.keepRecentTokens ?? 20000,
   });
   assert.equal(readFileSync(globalSettingsPath, "utf8"), globalSettingsBefore);
   assert.equal(readFileSync(projectSettingsPath, "utf8"), projectSettingsBefore);
+  assert.equal(readFileSync(kanbanSettingsPath, "utf8"), kanbanSettingsBefore);
 });
 
 test("resolved Pi prompt with failed compaction is durably failed, not completed", async (t) => {

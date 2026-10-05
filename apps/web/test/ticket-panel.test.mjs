@@ -18,6 +18,8 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   const { TicketPanel, LiveMessageCard } = await vite.ssrLoadModule("/src/components/TicketPanel.tsx");
   const { adaptLiveToolCalls } = await vite.ssrLoadModule("/src/live-tool-adapter.ts");
   const { liveToolResult } = await vite.ssrLoadModule("/src/live-tool-result.tsx");
+  const { LiveTodoWidget } = await vite.ssrLoadModule("/src/components/LiveTodoWidget.tsx");
+  const { latestLiveTodos } = await vite.ssrLoadModule("/src/live-todo-list.ts");
   const { HandoverCard } = await vite.ssrLoadModule("/src/components/HandoverCard.tsx");
   const { ToastProvider } = await vite.ssrLoadModule("/src/components/ToastContext.tsx");
   const task = {
@@ -101,6 +103,16 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
   assert.match(userMessageCard, /class="live-message live-message-user"/);
   assert.doesNotMatch(userMessageCard, /<time/);
 
+  const orphanToolCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: {
+      id: "session:orphan-tool", entry_id: "orphan-tool", session_id: "session", run_id: "run-1", timestamp,
+      role: "tool", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "first line\nsecond line" }] },
+    },
+  }));
+  assert.match(orphanToolCard, /first line/);
+  assert.match(orphanToolCard, /second line/);
+  assert.match(orphanToolCard, /<pre class="live-tool-output">/);
+
   const toolOnlyAssistantCard = renderToStaticMarkup(createElement(LiveMessageCard, {
     entry: {
       id: "session:tool-only", entry_id: "tool-only", session_id: "session", run_id: "run-1", timestamp,
@@ -151,19 +163,90 @@ test("ticket panel opens Live first with task context and no Timeline/comments s
     resultDetails: { todos: [{ id: 1, text: "Inspect the project files.", status: "completed" }] },
   } };
   const todoDetail = renderToStaticMarkup(liveToolResult(todoCall));
-  assert.match(todoDetail, /Added todo #1: Inspect the project files\./);
-  assert.match(todoDetail, /Structured details/);
-  assert.match(todoDetail, /<pre>[\s\S]*&quot;status&quot;: &quot;completed&quot;[\s\S]*<\/pre>/);
+  assert.match(todoDetail, /✓ Added todo #1: Inspect the project files\./);
+  assert.doesNotMatch(todoDetail, /Structured details|completed/);
+
+  const todoEntry = {
+    id: "session:todo-call", entry_id: "todo-call", session_id: "session", run_id: "run-1", timestamp,
+    role: "assistant", message: { role: "assistant", content: [{ type: "toolCall", id: "todo-1", name: "todo",
+      arguments: { action: "add", text: "Inspect the project files." } }] },
+  };
+  const todoResultEntry = {
+    id: "session:todo-result", entry_id: "todo-result", session_id: "session", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "todo-1", toolName: "todo",
+      content: [{ type: "text", text: "Added todo #1: Inspect the project files." }],
+      details: { todos: [{ id: 1, text: "Inspect the project files.", status: "pending" }] }, isError: false },
+  };
+  const todoAdapter = adaptLiveToolCalls([todoEntry, todoResultEntry]);
+  const todoCard = renderToStaticMarkup(createElement(LiveMessageCard, {
+    entry: todoEntry, toolCalls: todoAdapter.callsByAssistantEntryId.get(todoEntry.id),
+  }));
+  assert.match(todoCard, /✓ Added todo #1: Inspect the project files\./);
+  assert.match(todoCard, /live-tool-calls/);
+  assert.doesNotMatch(todoCard, /&quot;action&quot;|&quot;text&quot;|Structured details/);
+
+  const manyTodos = Array.from({ length: 7 }, (_, index) => ({
+    id: index + 1, text: `Task ${index + 1}`,
+    status: index === 1 ? "in_progress" : index < 1 ? "completed" : "pending",
+  }));
+  const latestTodoResult = {
+    ...todoResultEntry,
+    id: "session:latest-todo-result", entry_id: "latest-todo-result",
+    message: { ...todoResultEntry.message, details: { action: "list", todos: manyTodos, nextId: 8 } },
+  };
+  assert.deepEqual(latestLiveTodos([todoResultEntry, latestTodoResult]), manyTodos);
+  assert.deepEqual(latestLiveTodos([{ ...latestTodoResult,
+    message: { ...latestTodoResult.message, details: { action: "clear", todos: [], nextId: 1 } },
+  }]), []);
+  const todoWidget = renderToStaticMarkup(createElement(LiveTodoWidget, { entries: [latestTodoResult] }));
+  assert.match(todoWidget, /Todos/);
+  assert.match(todoWidget, /1\/7 complete/);
+  assert.match(todoWidget, /aria-label="In progress"/);
+  assert.match(todoWidget, /aria-label="Waiting"/);
+  assert.match(todoWidget, /aria-label="Completed"/);
+  assert.match(todoWidget, /live-todo-scroll/);
+  assert.equal((todoWidget.match(/astryx-list-item[^\"]*live-todo-item/g) ?? []).length, 7,
+    "all tasks remain in the native scroll viewport when the list exceeds five rows");
+  assert.equal(renderToStaticMarkup(createElement(LiveTodoWidget, { entries: [
+    { ...latestTodoResult, message: { ...latestTodoResult.message, details: { todos: [] } } },
+  ] })), "");
 
   const bashDetail = renderToStaticMarkup(liveToolResult({ name: "bash", data: {
     resultContent: "first line\nsecond line", resultDetails: undefined,
   } }));
-  assert.match(bashDetail, /<pre class="live-tool-output">first line\nsecond line<\/pre>/);
+  assert.match(bashDetail, /first line\nsecond line/);
+  assert.match(bashDetail, /<pre class="live-tool-output">/);
 
   const customDetail = renderToStaticMarkup(liveToolResult({ name: "my_extension_tool", data: {
-    resultContent: "Completed custom action", resultDetails: undefined,
+    resultContent: "Completed custom action\nAdditional output", resultDetails: { internal: "details" },
   } }));
-  assert.match(customDetail, /<p class="live-tool-result-text">Completed custom action<\/p>/);
+  assert.match(customDetail, /Completed custom action\nAdditional output/);
+  assert.match(customDetail, /Structured details/);
+  assert.match(customDetail, /&quot;internal&quot;: &quot;details&quot;/);
+
+  const editCallEntry = {
+    id: "session:edit-call", entry_id: "edit-call", session_id: "session", run_id: "run-1", timestamp,
+    role: "assistant", message: { role: "assistant", content: [{ type: "toolCall", id: "edit-1", name: "edit",
+      arguments: { path: "src/retry.ts", edits: [{ oldText: "const retries = 1;", newText: "const retries = 2;" }] } }] },
+  };
+  const editResult = {
+    id: "session:edit-result", entry_id: "edit-result", session_id: "session", run_id: "run-1", timestamp,
+    role: "tool", message: { role: "toolResult", toolCallId: "edit-1", toolName: "edit",
+      content: [{ type: "text", text: "Successfully replaced 1 block in src/retry.ts." }], isError: false,
+      details: { diff: "-1 const retries = 1;\n+1 const retries = 2;", patch: "--- a/src/retry.ts\n+++ b/src/retry.ts\n@@ -1 +1 @@\n-const retries = 1;\n+const retries = 2;", firstChangedLine: 1 } },
+  };
+  const editAdapter = adaptLiveToolCalls([editCallEntry, editResult]);
+  const editCall = editAdapter.callsByAssistantEntryId.get(editCallEntry.id)?.[0];
+  assert.equal(editCall?.additions, 1);
+  assert.equal(editCall?.deletions, 1);
+  const editMarkup = renderToStaticMarkup(liveToolResult(editCall));
+  assert.match(editMarkup, /Before/);
+  assert.match(editMarkup, /After/);
+  assert.match(editMarkup, /const retries = 1;/);
+  assert.match(editMarkup, /const retries = 2;/);
+  assert.match(editMarkup, /live-edit-diff-before/);
+  assert.match(editMarkup, /live-edit-diff-after/);
+  assert.doesNotMatch(editMarkup, /Structured details/);
 
   const adaptedCard = renderToStaticMarkup(createElement(LiveMessageCard, {
     entry: callEntry,

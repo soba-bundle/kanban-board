@@ -1,14 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatToolCallItem } from "@astryxdesign/core/Chat";
 import { ChatToolCalls } from "@astryxdesign/core/Chat";
+import { Collapsible } from "@astryxdesign/core/Collapsible";
+import { Button } from "@astryxdesign/core/Button";
+import { TabList, Tab as AstryxTab } from "@astryxdesign/core/TabList";
+import { ProgressBar } from "@astryxdesign/core/ProgressBar";
+import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList";
+import { Banner } from "@astryxdesign/core/Banner";
+import { VStack } from "@astryxdesign/core/VStack";
+import { HStack } from "@astryxdesign/core/HStack";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Icon } from "@astryxdesign/core/Icon";
+import { Text } from "@astryxdesign/core/Text";
+import { Markdown } from "@astryxdesign/core/Markdown";
+import { markdownSoftBreaksPlugin } from "@astryxdesign/core/Markdown/plugins";
 import type { CheckpointPreview, HumanRequest, HumanRequestAnswerInput, LiveCompactionSummary, LiveEvent, LiveHistoryEntry, LiveHistorySnapshot, QueueSnapshot, RunInput, Task, TaskRunSummary } from "@kanban-board/shared";
 import { adaptLiveToolCalls, type UnmatchedToolCall } from "../live-tool-adapter.js";
-import { liveToolResult } from "../live-tool-result.js";
+import { liveOrphanToolResult, liveToolResult, todoToolSummary } from "../live-tool-result.js";
 import { HandoverCard } from "./HandoverCard.js";
 import { HumanRequestPanel } from "./HumanRequestPanel.js";
+import { LiveTodoWidget } from "./LiveTodoWidget.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
 import { useToast } from "./ToastContext.js";
-import { completeTask, loadTaskCompletionStatus } from "../board-api.js";
+import { completeTask } from "../board-api.js";
 import {
   type TaskSyncCheck,
   type TaskSyncRecovery,
@@ -46,16 +60,16 @@ interface TicketPanelProps {
 const ACTIVE_POLL_MS = 3000;
 const DEVELOPER_TEST_REMINDER = "Before merging, test the app in the task worktree and review the implemented code and diff. Check sync verifies Git state only; it does not test the app.";
 
-function formatProvisional(snapshot: LiveHistorySnapshot): string {
+function formatProvisional(snapshot: LiveHistorySnapshot, thinking = false): string {
   let provisional = "";
   for (const event of snapshot.provisional_events) {
     if (event.type === "auto_retry_start") {
       provisional = "";
       continue;
     }
-    provisional += describeEvent(event) ?? "";
+    provisional += describeEvent(event, thinking) ?? "";
   }
-  return snapshot.provisional_truncated
+  return snapshot.provisional_truncated && !thinking
     ? `${provisional}\n[Some recent live output is unavailable; refresh to load persisted history.]\n`
     : provisional;
 }
@@ -152,11 +166,26 @@ function inputStatusLabel(status: string): string {
     DELIVERY_UNKNOWN: "Delivery unknown", CANCELLED: "Cancelled" } as Record<string, string>)[status] ?? status;
 }
 
-export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls = [], unmatchedToolCalls = [] }: {
-  entry: LiveHistoryEntry; input?: RunInput; showMetadata?: boolean;
+const assistantMarkdownPlugins = [markdownSoftBreaksPlugin];
+
+// Tool results and compaction do not start a new assistant turn.
+export function assistantTurnLabels(entries: LiveHistoryEntry[]): Set<string> {
+  const labels = new Set<string>();
+  let previousAssistant: LiveHistoryEntry | undefined;
+  for (const entry of entries) {
+    if (entry.role === "user") previousAssistant = undefined;
+    if (entry.role !== "assistant") continue;
+    if (!previousAssistant || previousAssistant.run_id !== entry.run_id || previousAssistant.session_id !== entry.session_id) labels.add(entry.id);
+    previousAssistant = entry;
+  }
+  return labels;
+}
+
+export function LiveMessageCard({ entry, input, showMetadata = false, showAgentLabel = true, toolCalls = [], unmatchedToolCalls = [] }: {
+  entry: LiveHistoryEntry; input?: RunInput; showMetadata?: boolean; showAgentLabel?: boolean;
   toolCalls?: ChatToolCallItem[]; unmatchedToolCalls?: UnmatchedToolCall[];
 }) {
-  const message = entry.message as { role?: string; toolName?: string; content?: unknown; provider?: string; model?: string; usage?: Record<string, unknown>; stopReason?: string; isError?: boolean };
+  const message = entry.message as { role?: string; toolName?: string; content?: unknown; details?: unknown; provider?: string; model?: string; usage?: Record<string, unknown>; stopReason?: string; isError?: boolean };
   const parts = Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [];
   const reasoning = parts.filter((part) => part.type === "thinking").map((part) => String(part.thinking ?? "")).filter(Boolean);
   const role = entry.role === "user" ? "You" : entry.role === "assistant" ? "Agent" : `Tool: ${message.toolName ?? entry.role}`;
@@ -166,17 +195,34 @@ export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls 
     typeof usage.output === "number" ? `out ${usage.output}` : null,
   ].filter(Boolean).join(" · ");
   const renderedToolCalls = toolCalls.map((call) => {
+    if (call.name === "todo") {
+      const data = call.data as { resultContent?: unknown } | undefined;
+      const summary = todoToolSummary(typeof data?.resultContent === "string" ? data.resultContent : "", call.status === "error");
+      const target = summary || (call.status === "running" || call.status === "pending" ? "Todo action in progress…" :
+        call.status === "error" ? "Error: Todo action failed." : "");
+      return target ? {
+        key: call.key,
+        name: "todo",
+        status: call.status,
+        target,
+        errorMessage: call.errorMessage,
+      } : null;
+    }
     const resultDetail = liveToolResult(call);
     return resultDetail === undefined ? call : { ...call, resultDetail };
-  });
+  }).filter((call): call is ChatToolCallItem => call !== null);
   const runningToolCalls = renderedToolCalls.some((call) => call.status === "running");
+  const orphanToolResult = entry.role === "tool"
+    ? liveOrphanToolResult(message.toolName ?? "", textContent(entry), message.details, message.isError === true)
+    : undefined;
   return (
     <article className={`live-message live-message-${entry.role}`}>
-      <header className="live-message-header">
+      {(entry.role !== "assistant" || showAgentLabel) && <header className="live-message-header">
         <strong>{role}</strong>
         {input && <span className={`input-status input-status-${input.delivery_status.toLowerCase()}`} title={input.failure_reason ?? undefined}>{inputStatusLabel(input.delivery_status)}</span>}
-      </header>
-      {entry.role !== "tool" && textContent(entry) && <p className="live-message-text">{textContent(entry)}</p>}
+      </header>}
+      {entry.role === "assistant" && textContent(entry) && <Markdown className="live-message-text" density="compact" headingLevelStart={3} plugins={assistantMarkdownPlugins}>{textContent(entry)}</Markdown>}
+      {entry.role === "user" && textContent(entry) && <p className="live-message-text">{textContent(entry)}</p>}
       {reasoning.length > 0 && <details className="live-details"><summary>Reasoning</summary><p>{reasoning.join("\n")}</p></details>}
       {renderedToolCalls.length > 0 && <ChatToolCalls
         calls={renderedToolCalls}
@@ -186,11 +232,11 @@ export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls 
         <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
         {unmatchedToolCalls.map((call, index) => <section key={call.id ?? index}>
           <strong>{call.name}</strong><p>{call.reason}</p>
-          {call.arguments !== undefined && <pre>{JSON.stringify(call.arguments, null, 2)}</pre>}
+          {call.name !== "todo" && call.arguments !== undefined && <pre>{JSON.stringify(call.arguments, null, 2)}</pre>}
           {call.id && <code>{call.id}</code>}
         </section>)}
       </details>}
-      {entry.role === "tool" && textContent(entry) && <details className="live-details"><summary>Tool result{message.isError === true ? " (error)" : ""}</summary><pre>{textContent(entry)}</pre></details>}
+      {orphanToolResult}
       {showMetadata && entry.role === "assistant" && textContent(entry) && message.stopReason !== "toolUse" && <footer className="live-message-meta">
         <time dateTime={entry.timestamp}>{new Date(entry.timestamp).toLocaleTimeString()}</time>
         {[message.provider, message.model, tokens].filter(Boolean).join(" · ")}{tokens ? " tokens" : ""}
@@ -199,10 +245,11 @@ export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls 
   );
 }
 
-function describeEvent(event: LiveEvent): string | null {
+function describeEvent(event: LiveEvent, thinking = false): string | null {
   const data = event.data as Record<string, unknown>;
   switch (event.type) {
     case "message_update":
+      if ((data.subtype === "thinking_delta") !== thinking) return null;
       return typeof data.delta === "string" ? data.delta : null;
     default:
       return null;
@@ -223,6 +270,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [startingRun, setStartingRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveLog, setLiveLog] = useState("");
+  const [liveThinking, setLiveThinking] = useState("");
   const [liveHistory, setLiveHistory] = useState<LiveHistorySnapshot | null>(null);
   const [compactionActive, setCompactionActive] = useState(false);
   const [compactionError, setCompactionError] = useState<string | null>(null);
@@ -237,10 +285,6 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [reviewDiffOpen, setReviewDiffOpen] = useState(false);
   const [selectedReviewFile, setSelectedReviewFile] = useState(0);
   const [checkpointStatusError, setCheckpointStatusError] = useState<string | null>(null);
-  const [completionStatus, setCompletionStatus] = useState<{
-    ready: boolean; reason: "WORKTREE_CHANGES" | "BRANCH_CHANGES" | "GIT_STATE_UNAVAILABLE" | null;
-  } | null>(null);
-  const [completionStatusError, setCompletionStatusError] = useState<string | null>(null);
   const [checkpointedSha, setCheckpointedSha] = useState<string | null>(null);
   const [checkpointDiff, setCheckpointDiff] = useState<{ files: string[]; diff: string; to_sha: string; from_sha?: string } | null>(null);
   const [selectedDiffFile, setSelectedDiffFile] = useState(0);
@@ -288,11 +332,6 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const currentSyncResult = syncResult?.taskId === task.id ? syncResult : null;
   const currentSyncCheck = syncCheckTaskId === task.id ? syncCheck : null;
   const currentSyncRecovery = syncRecoveryTaskId === task.id ? syncRecovery : null;
-  const latestWorkRun = currentRuns.slice().reverse().find((item) => item.status === "COMPLETED" && item.stage !== "VALIDATION_REVIEW");
-  const ordinaryResponse = latestWorkRun && liveHistory?.task_id === task.id
-    ? liveHistory.entries.filter((entry) => entry.run_id === latestWorkRun.id && entry.role === "assistant")
-      .map(textContent).filter(Boolean).slice(-1)[0] ?? ""
-    : "";
   const reviewFiles = currentCheckpointStatus
     ? [...currentCheckpointStatus.tracked_changes, ...currentCheckpointStatus.untracked_files]
     : [];
@@ -350,6 +389,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   function applyLiveHistorySnapshot(snapshot: LiveHistorySnapshot) {
     setLiveHistory(snapshot);
     setLiveLog(formatProvisional(snapshot));
+    setLiveThinking(formatProvisional(snapshot, true));
     const compaction = compactionState(snapshot);
     setCompactionActive(compaction.active);
     setCompactionError(compaction.error);
@@ -373,29 +413,6 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     const timer = setInterval(() => { void refresh(); }, ACTIVE_POLL_MS);
     return () => clearInterval(timer);
   }, [activeJob, refresh, runs]);
-
-  useEffect(() => {
-    setCompletionStatus(null);
-    setCompletionStatusError(null);
-    if (task.workflow_state !== "REVIEW") return;
-    let current = true;
-    const load = () => {
-      void loadTaskCompletionStatus(task.id).then((status) => {
-        if (current) {
-          setCompletionStatus(status);
-          setCompletionStatusError(null);
-        }
-      }).catch((caught) => {
-        if (current) {
-          setCompletionStatus(null);
-          setCompletionStatusError(caught instanceof Error ? caught.message : String(caught));
-        }
-      });
-    };
-    load();
-    const timer = setInterval(load, 5000);
-    return () => { current = false; clearInterval(timer); };
-  }, [task.id, task.workflow_state]);
 
   useEffect(() => {
     setCheckpointedSha(null);
@@ -470,6 +487,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     let current = true;
     setLiveHistory(null);
     setLiveLog("");
+    setLiveThinking("");
     setCompactionActive(false);
     setCompactionError(null);
     setCompactionSummaries([]);
@@ -550,7 +568,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             return [...current, summary].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
           });
         }
-        if (event.type === "auto_retry_start") setLiveLog("");
+        if (event.type === "auto_retry_start") { setLiveLog(""); setLiveThinking(""); }
+        const thinking = describeEvent(event, true);
+        if (thinking) setLiveThinking((value) => value + thinking);
         const text = describeEvent(event);
         if (text) setLiveLog((value) => value + text);
         if (event.type === "entry_appended") {
@@ -612,6 +632,24 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     }
   }
 
+  async function refreshReviewStatus() {
+    const taskId = task.id;
+    setMergePreview(null);
+    const [checkpoint, sync, recovery, merge] = await Promise.all([
+      loadCheckpointPreview(taskId), checkTaskSync(taskId), loadTaskSyncRecovery(taskId), loadMergePreview(taskId),
+    ]);
+    if (!mountedRef.current || liveTaskIdRef.current !== taskId) return;
+    setCheckpointStatus(checkpoint);
+    setCheckpointStatusTaskId(taskId);
+    setCheckpointStatusError(null);
+    setSyncCheck(sync);
+    setSyncCheckTaskId(taskId);
+    setSyncRecovery(recovery.recovery ?? null);
+    setSyncRecoveryTaskId(taskId);
+    setSyncRecoveryError(null);
+    setMergePreview(merge);
+  }
+
   async function refreshSyncRecovery() {
     const taskId = task.id;
     const result = await loadTaskSyncRecovery(taskId);
@@ -668,7 +706,8 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         result = await mergeAction(task.id, action);
       }
       setMergeConfirmation(false);
-      setMergeStatus(result.status === "MERGED" ? "Merged successfully." :
+      if (result.status === "MERGED") pushToast({ title: "Merged successfully", variant: "success" });
+      setMergeStatus(result.status === "MERGED" ? null :
         result.status === "CHECK_SYNC_REQUIRED" ? "Conflict resolution was committed. Check sync and confirm merge again." :
           result.status === "ABORTED" ? "Merge aborted; task changes were preserved." :
             result.status === "OPENED" ? "Opened the task worktree in the IDE." : `Merge status: ${result.status}`);
@@ -749,7 +788,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }
 
   function submitDraft() {
-    if (waitingForHuman) return;
+    if (busy || waitingForHuman) return;
     const text = draft.trim();
     if (!text) return;
     if (activeJob) {
@@ -768,178 +807,149 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setStartingRun(true);
   }
 
+  const turnLabels = assistantTurnLabels(history?.entries ?? []);
+  const lastConversationEntry = history?.entries.filter((entry) => entry.role !== "tool").at(-1);
+  const provisionalNeedsLabel = lastConversationEntry?.role !== "assistant" || lastConversationEntry.run_id !== history?.active_run_id;
   const latestAssistantEntryId = liveHistory?.entries.filter((entry) => entry.role === "assistant").at(-1)?.id;
   const liveToolAdapter = adaptLiveToolCalls(liveHistory?.entries ?? [], liveHistory?.active_run_id ?? null);
+  const changesReviewCard = !activeJob && canReviewAction && checkpointStatusTaskId === task.id && (
+    <VStack as="section" gap={2} padding={3} className="ticket-section changes-review-card" aria-labelledby="changes-review-title">
+      <HStack hAlign="between" vAlign="center" gap={2}>
+        <Text id="changes-review-title" weight="semibold">{checkpointHasChanges ? "Changes to review" : "Review progress"}</Text>
+        <IconButton label="Refresh review status" tooltip="Refresh review status" size="sm" variant="ghost" icon={<Text>↻</Text>} isDisabled={busy}
+          onClick={() => void run(refreshReviewStatus)} />
+      </HStack>
+      <Text type="supporting">{currentSyncRecovery ? "Resolve conflicts and commit manually, then refresh to continue." : checkpointHasChanges
+        ? "Review the diff and save a checkpoint."
+        : mergePreview?.eligible ? "Test your changes, then review and confirm the merge." : "Bring the latest main changes into this branch."}</Text>
+      <HStack gap={2} hAlign="between" vAlign="center" wrap="wrap">
+        <Text type="supporting">Checkpoint → Sync → Merge</Text>
+        {!currentSyncRecovery && (checkpointHasChanges ? <Button size="sm" variant="primary" label="Review & checkpoint" isDisabled={busy} onClick={() => void run(async () => {
+            setSelectedCheckpointFile(0);
+            setCheckpointPreview(await loadCheckpointPreview(task.id));
+          })} /> : mergePreview?.eligible && mergePreview.preview_id ? <Button size="sm" variant="primary" label="Merge back" isDisabled={busy}
+            onClick={() => void prepareMergeConfirmation()} /> : showMergeControls && task.base_branch && task.worktree_path && <Button size="sm" variant="primary" label="Sync with main" isDisabled={busy}
+          onClick={() => void run(async () => {
+            const taskId = task.id;
+            setSyncCheck(null);
+            setSyncCheckTaskId(null);
+            const result = await syncTaskWithBase(taskId);
+            if (liveTaskIdRef.current !== taskId) return;
+            if (result.status === "CONFLICT") {
+              setSyncResult(null);
+              await refreshSyncRecovery();
+            } else {
+              setSyncResult({ taskId, ...result });
+            }
+            await refreshReviewStatus();
+          })} />)}
+      </HStack>
+      {currentSyncCheck && <Text type="supporting" role="status">{currentSyncCheck.status === "IN_SYNC" ? "Git is in sync. Application testing and code review are still required." : currentSyncCheck.status === "STALE" ? "Main has changes to sync." : `Sync check blocked: ${currentSyncCheck.reasons.join(" ")}`}</Text>}
+      <Collapsible trigger="Git details" defaultIsOpen={false}>
+        <VStack gap={2}>
+          {latestCheckpointSha && <Text type="supporting">Checkpoint {latestCheckpointSha.slice(0, 12)}</Text>}
+          <Text type="supporting">{mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? "Refresh to check merge readiness."}</Text>
+          <Button size="sm" label="View checkpoint diff" isDisabled={busy} onClick={() => void openCheckpointDiff()} />
+        </VStack>
+      </Collapsible>
+    </VStack>
+  );
+  const reviewActions = canReviewAction && !activeJob && (currentSyncRecovery || task.review_tag === "MERGE_CONFLICT") && (
+    <section className="ticket-section review-actions">
+      {checkpointStatusError && <Banner status="error" title="Cannot inspect checkpoint" description={checkpointStatusError} />}
+      {syncRecoveryError && syncRecoveryTaskId === task.id && <p className="run-error" role="alert">Cannot inspect sync recovery: {syncRecoveryError}</p>}
+      {currentSyncResult?.status === "SYNCED" && <p className="run-empty" role="status">
+        Synced main at {currentSyncResult.synced_base_sha.slice(0, 12)} into task commit {currentSyncResult.candidate_sha.slice(0, 12)}.
+      </p>}
+      {currentSyncCheck && <Banner status={currentSyncCheck.status === "IN_SYNC" ? "info" : "warning"}
+        title="Git sync check" description={<>
+        {currentSyncCheck.status === "IN_SYNC" ?
+          `Git state was in sync with base ${currentSyncCheck.base_sha?.slice(0, 12)} at task commit ${currentSyncCheck.task_sha?.slice(0, 12)} when checked at ${new Date(currentSyncCheck.checked_at).toLocaleTimeString()}. Recheck after Git changes.` :
+          currentSyncCheck.status === "STALE" ?
+            `The current base ${currentSyncCheck.base_sha?.slice(0, 12)} is not in the task history. Use Sync with main, then check again.` :
+            `Git sync check is blocked: ${currentSyncCheck.reasons.join(" ")}`}
+        {currentSyncCheck.base_moved && ` The base moved from recorded ${currentSyncCheck.recorded_base_sha?.slice(0, 12)} to ${currentSyncCheck.base_sha?.slice(0, 12)}.`}
+        {" This is a Git-state check only, not application testing or code review."}
+      </>} />}
+      {currentSyncRecovery && <Banner status="warning" title="Sync recovery required" description={
+        currentSyncRecovery.state === "CONFLICT" ? `Sync stopped on conflicts. Git state is preserved; resolve and commit the conflict before continuing.${currentSyncRecovery.can_abort ? "" : " Abort is unavailable because the conflict snapshot is missing or changed."}` :
+          currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "The manual conflict resolution is committed and ready to finish sync." :
+            currentSyncRecovery.state === "SAFE_TO_RETRY" ? "No merge is in progress and the task branch is unchanged; explicit Retry will start a fresh sync." :
+              `Sync was interrupted and Git state needs inspection. ${currentSyncRecovery.error_message ?? "Preserve the worktree and inspect it before continuing."}`
+      } />}
+      <div className="dialog-actions">
+        {currentSyncRecovery ? <>
+          <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
+            await viewTaskSyncConflicts(task.id);
+          })}>{currentSyncRecovery.state === "CONFLICT" ? "View Conflicts" : "Open task worktree"}</button>
+          {(currentSyncRecovery.state === "RESOLUTION_COMMITTED" || currentSyncRecovery.state === "SAFE_TO_RETRY") &&
+            <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
+              const taskId = task.id;
+              setSyncCheck(null);
+              setSyncCheckTaskId(null);
+              const result = await retryTaskSync(taskId);
+              if (liveTaskIdRef.current !== taskId) return;
+              if (result.status === "SYNCED") {
+                setSyncRecovery(null);
+                setSyncRecoveryTaskId(taskId);
+                setSyncResult({ taskId, status: "SYNCED",
+                  synced_base_sha: result.synced_base_sha,
+                  candidate_sha: result.candidate_sha });
+              } else {
+                await refreshSyncRecovery();
+              }
+            }, "Sync recovered")}>{currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "Finish sync" : "Retry Sync"}</button>}
+          {currentSyncRecovery.can_abort && (currentSyncRecovery.state === "CONFLICT" || currentSyncRecovery.state === "INTERRUPTED") &&
+            <button className="button-quiet" disabled={busy} onClick={() => setSyncAbortConfirmation(true)}>
+              {currentSyncRecovery.state === "CONFLICT" ? "Abort sync" : "Clear sync recovery"}
+            </button>}
+          <button className="button-quiet" disabled={busy} onClick={() => void run(refreshSyncRecovery)}>Refresh recovery</button>
+        </> : null}
+        {mergeStatus && <p className="run-empty" role="status">{mergeStatus}</p>}
+
+        {showMergeControls && task.review_tag === "MERGE_CONFLICT" && <>
+          <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("view-conflicts")}>View Conflicts</button>
+          <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("retry")}>Retry</button>
+          <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("abort")}>Abort merge</button>
+        </>}
+      </div>
+    </section>
+  );
 
   return (
     <div className="panel-backdrop" onClick={onClose}>
       <aside className="ticket-panel" onClick={(event) => event.stopPropagation()} aria-label={`Ticket ${task.title}`}>
         <header className="ticket-panel-header">
-          <div className="ticket-panel-heading">
-            <span className="ticket-state">{task.workflow_state.replaceAll("_", " ")}</span>
-            {visibleReviewTag && <span className="review-tag">{visibleReviewTag.replaceAll("_", " ")}</span>}
-            <h2>{task.title}</h2>
-          </div>
-          <button className="icon-button" aria-label="Close ticket" onClick={onClose}>×</button>
+          <VStack gap={2} className="ticket-panel-heading">
+            <HStack gap={2} vAlign="center" hAlign="between">
+              <Text weight="semibold" maxLines={1}>{task.title}</Text>
+              <Text type="supporting">{task.workflow_state.replaceAll("_", " ")}</Text>
+            </HStack>
+            <Collapsible key={task.id} trigger="Details" defaultIsOpen={false}>
+            <MetadataList label={{ position: "start" }}>
+              <MetadataListItem label="Description"><Text type="supporting">{task.description || "No description."}</Text></MetadataListItem>
+              {task.worktree_path && <MetadataListItem label="Working directory">
+                <HStack gap={1} vAlign="start">
+                  <Text type="code">{task.worktree_path}</Text>
+                  <IconButton size="sm" variant="ghost" label="Copy working directory" tooltip="Copy working directory" icon={<Icon icon="copy" size="xsm" />}
+                    onClick={() => void run(() => navigator.clipboard.writeText(task.worktree_path!), "Working directory copied")} />
+                </HStack>
+              </MetadataListItem>}
+              <MetadataListItem label="Created"><Text type="supporting"><time dateTime={task.created_at}>{new Date(task.created_at).toLocaleString()}</time></Text></MetadataListItem>
+              {visibleReviewTag && <MetadataListItem label="Workflow"><Text type="supporting">{visibleReviewTag.replaceAll("_", " ")}</Text></MetadataListItem>}
+            </MetadataList>
+            </Collapsible>
+          </VStack>
+          <IconButton label="Close ticket" tooltip="Close ticket" icon={<Icon icon="close" />} variant="ghost" size="sm" onClick={onClose} />
         </header>
 
-        <nav className="ticket-tabs">
-          {(["live", "runs"] as Tab[]).map((value) => (
-            <button
-              key={value}
-              className={`ticket-tab${tab === value ? " ticket-tab-active" : ""}`}
-              onClick={() => setTab(value)}
-            >
-              {value === "runs" ? `Runs (${runs.length})` : "Live"}
-            </button>
-          ))}
-        </nav>
+        <TabList role="tablist" aria-label="Ticket views" className="ticket-tabs" value={tab} onChange={(value) => setTab(value as Tab)} hasDivider>
+          <AstryxTab value="live" label="Live" panelId="ticket-live-panel" />
+          <AstryxTab value="runs" label={`Runs (${runs.length})`} panelId="ticket-runs-panel" />
+        </TabList>
 
         <div className="ticket-panel-body" ref={logRef}>
-          {error && <div className="error-banner" role="alert"><span>{error}</span></div>}
-
-          {tab === "live" && (
-            <>
-              <section className="ticket-section live-task-context">
-                <p className="ticket-description">{task.description || "No description."}</p>
-              </section>
-              {showMergeControls && <aside className="developer-test-reminder" role="note" aria-label="Developer testing reminder">
-                {DEVELOPER_TEST_REMINDER}
-              </aside>}
-              {canCheckpoint && checkpointStatusTaskId === task.id && checkpointHasChanges && (
-                <section className="ticket-section changes-review-card" aria-labelledby="changes-review-title">
-                  <h3 id="changes-review-title">Changes to review</h3>
-                  {ordinaryResponse
-                    ? <p className="changes-review-summary">{ordinaryResponse.length > 420 ? `${ordinaryResponse.slice(0, 420).trimEnd()}…` : ordinaryResponse}</p>
-                    : <p className="changes-review-summary">Review the changed files before updating the checkpoint.</p>}
-                  <p><strong>Changed files</strong></p>
-                  <ul>{reviewFiles.map((file) => <li key={file}>{file}</li>)}</ul>
-                  <button className="button-primary" onClick={() => { setSelectedReviewFile(0); setReviewDiffOpen(true); }}>Preview changes</button>
-                </section>
-              )}
-              {canReviewAction && (
-                <section className="ticket-section review-actions">
-                  <p className="ticket-section-title">Next step</p>
-                  {checkpointStatusError && <p className="error-banner" role="alert">{checkpointStatusError}</p>}
-                  {syncRecoveryError && syncRecoveryTaskId === task.id && <p className="run-error" role="alert">Cannot inspect sync recovery: {syncRecoveryError}</p>}
-                  {currentSyncResult?.status === "SYNCED" && <p className="run-empty" role="status">
-                    Synced main at {currentSyncResult.synced_base_sha.slice(0, 12)} into task commit {currentSyncResult.candidate_sha.slice(0, 12)}.
-                  </p>}
-                  {currentSyncCheck && <p className={currentSyncCheck.status === "IN_SYNC" ? "run-empty" : "run-error"}
-                    role={currentSyncCheck.status === "IN_SYNC" ? "status" : "alert"}>
-                    {currentSyncCheck.status === "IN_SYNC" ?
-                      `Git state was in sync with base ${currentSyncCheck.base_sha?.slice(0, 12)} at task commit ${currentSyncCheck.task_sha?.slice(0, 12)} when checked at ${new Date(currentSyncCheck.checked_at).toLocaleTimeString()}. Recheck after Git changes.` :
-                      currentSyncCheck.status === "STALE" ?
-                        `The current base ${currentSyncCheck.base_sha?.slice(0, 12)} is not in the task history. Use Sync with main, then check again.` :
-                        `Git sync check is blocked: ${currentSyncCheck.reasons.join(" ")}`}
-                    {currentSyncCheck.base_moved && ` The base moved from recorded ${currentSyncCheck.recorded_base_sha?.slice(0, 12)} to ${currentSyncCheck.base_sha?.slice(0, 12)}.`}
-                    {" This is a Git-state check only, not application testing or code review."}
-                  </p>}
-                  {currentSyncRecovery && <p className={currentSyncRecovery.state === "CONFLICT" ? "run-error" : "run-empty"}
-                    role={currentSyncRecovery.state === "CONFLICT" ? "alert" : "status"}>
-                    {currentSyncRecovery.state === "CONFLICT" ? `Sync stopped on conflicts. Git state is preserved; resolve and commit the conflict before continuing.${currentSyncRecovery.can_abort ? "" : " Abort is unavailable because the conflict snapshot is missing or changed."}` :
-                      currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "The manual conflict resolution is committed and ready to finish sync." :
-                        currentSyncRecovery.state === "SAFE_TO_RETRY" ? "No merge is in progress and the task branch is unchanged; explicit Retry will start a fresh sync." :
-                          `Sync was interrupted and Git state needs inspection. ${currentSyncRecovery.error_message ?? "Preserve the worktree and inspect it before continuing."}`}
-                  </p>}
-                  <div className="dialog-actions">
-                    {showMergeControls && <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
-                      const taskId = task.id;
-                      setSyncCheck(null);
-                      setSyncCheckTaskId(null);
-                      const result = await checkTaskSync(taskId);
-                      if (liveTaskIdRef.current !== taskId) return;
-                      setSyncCheck(result);
-                      setSyncCheckTaskId(taskId);
-                    })}>Check sync</button>}
-                    {currentSyncRecovery ? <>
-                      <button className="button-quiet" disabled={busy} onClick={() => void run(async () => {
-                        await viewTaskSyncConflicts(task.id);
-                      })}>{currentSyncRecovery.state === "CONFLICT" ? "View Conflicts" : "Open task worktree"}</button>
-                      {(currentSyncRecovery.state === "RESOLUTION_COMMITTED" || currentSyncRecovery.state === "SAFE_TO_RETRY") &&
-                        <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
-                          const taskId = task.id;
-                          setSyncCheck(null);
-                          setSyncCheckTaskId(null);
-                          const result = await retryTaskSync(taskId);
-                          if (liveTaskIdRef.current !== taskId) return;
-                          if (result.status === "SYNCED") {
-                            setSyncRecovery(null);
-                            setSyncRecoveryTaskId(taskId);
-                            setSyncResult({ taskId, status: "SYNCED",
-                              synced_base_sha: result.synced_base_sha,
-                              candidate_sha: result.candidate_sha });
-                          } else {
-                            await refreshSyncRecovery();
-                          }
-                        }, "Sync recovered")}>{currentSyncRecovery.state === "RESOLUTION_COMMITTED" ? "Finish sync" : "Retry Sync"}</button>}
-                      {currentSyncRecovery.can_abort && (currentSyncRecovery.state === "CONFLICT" || currentSyncRecovery.state === "INTERRUPTED") &&
-                        <button className="button-quiet" disabled={busy} onClick={() => setSyncAbortConfirmation(true)}>
-                          {currentSyncRecovery.state === "CONFLICT" ? "Abort sync" : "Clear sync recovery"}
-                        </button>}
-                      <button className="button-quiet" disabled={busy} onClick={() => void run(refreshSyncRecovery)}>Refresh recovery</button>
-                    </> : showMergeControls && task.base_branch && task.worktree_path && <button className="button-quiet"
-                      disabled={busy}
-                      onClick={() => void run(async () => {
-                        const taskId = task.id;
-                        setSyncCheck(null);
-                        setSyncCheckTaskId(null);
-                        const result = await syncTaskWithBase(taskId);
-                        if (liveTaskIdRef.current !== taskId) return;
-                        if (result.status === "CONFLICT") {
-                          setSyncResult(null);
-                          await refreshSyncRecovery();
-                        } else {
-                          setSyncResult({ taskId, ...result });
-                        }
-                      })}>Sync with main</button>}
-                    {canCheckpoint && (checkpointStatus === null ? (
-                      <button className="button-primary" disabled>Checking worktree…</button>
-                    ) : checkpointHasChanges ? (
-                      <button className="button-primary" disabled={busy} onClick={() => void run(async () => {
-                        setSelectedCheckpointFile(0);
-                        setCheckpointPreview(await loadCheckpointPreview(task.id));
-                      })}>Update checkpoint</button>
-                    ) : latestCheckpointSha ? (
-                      <span className="run-empty">Checkpoint {latestCheckpointSha.slice(0, 12)} is ready for review.</span>
-                    ) : (
-                      <span className="run-empty">No changes to checkpoint.</span>
-                    ))}
-                    <button className="button-quiet" disabled={busy} onClick={() => setStartingRun(true)}>Start run</button>
-                    {showMergeControls && task.review_tag !== "MERGE_CONFLICT" && <>
-                      <button className="button-primary" disabled={busy || mergePreview?.eligible !== true || !mergePreview.preview_id}
-                        title={mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? undefined}
-                        onClick={() => void prepareMergeConfirmation()}>Merge back to working branch</button>
-                      {mergePreview?.eligible !== true && <span className="run-error">
-                        {(mergePreview?.reasons?.join(" ") ?? mergePreview?.reason ?? "Check sync before merging.").replaceAll("_", " ")}
-                      </span>}
-                    </>}
-                    {mergeStatus && <p className="run-empty" role="status">{mergeStatus}</p>}
-
-                    {completionStatus?.ready ? (
-                      <button className="button-primary" disabled={busy || !!activeJob} onClick={() => void run(async () => {
-                        await completeTask(task.id);
-                      }, "Task marked as done")}>Mark as done</button>
-                    ) : completionStatus?.reason === "BRANCH_CHANGES" ? (
-                      <button className="button-quiet" disabled>Merge back to source (unavailable until Phase 9)</button>
-                    ) : completionStatus?.reason === "WORKTREE_CHANGES" ? (
-                      <span className="run-error">Commit or discard Git changes before marking this task as done.</span>
-                    ) : completionStatus?.reason === "GIT_STATE_UNAVAILABLE" ? (
-                      <span className="run-error">Git state could not be verified; this task cannot be marked as done.</span>
-                    ) : completionStatusError ? (
-                      <span className="run-error">Cannot verify task Git state: {completionStatusError}</span>
-                    ) : <button className="button-quiet" disabled>Checking Git status…</button>}
-                    {showMergeControls && task.review_tag === "MERGE_CONFLICT" && <>
-                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("view-conflicts")}>View Conflicts</button>
-                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("retry")}>Retry</button>
-                      <button className="button-quiet" disabled={busy} onClick={() => void runMergeAction("abort")}>Abort merge</button>
-                    </>}
-                    <button className="button-quiet" disabled={busy} onClick={() => void openCheckpointDiff()}>View checkpoint diff</button>
-                  </div>
-                </section>
-              )}
-            </>
-          )}
+          {error && <Banner status="error" title="Action failed" description={error} />}
 
           {reviewDiffOpen && currentCheckpointStatus && (
             <div className="dialog-backdrop" role="presentation">
@@ -1094,14 +1104,14 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
           )}
 
           {tab === "runs" && (
-            <section className="ticket-section">
+            <section className="ticket-section" id="ticket-runs-panel" role="tabpanel" aria-label="Runs" tabIndex={0}>
               {runs.length === 0 && <p className="run-empty">This ticket has no runs yet.</p>}
               {runs.map((item) => <HandoverCard run={item} key={item.id} />)}
             </section>
           )}
 
           {tab === "live" && (
-            <section className="ticket-section live-conversation">
+            <section className="ticket-section live-conversation" id="ticket-live-panel" role="tabpanel" aria-label="Live" tabIndex={0}>
               {activeJob && <p className="run-empty live-state">
                 {runningRunId
                   ? (streamState === "open" ? "Streaming." : streamState === "error" ? "Live stream unavailable; reconnecting…" : "Connecting to live output…")
@@ -1122,6 +1132,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 return <LiveMessageCard
                   key={`entry:${item.entry.session_id}:${item.entry.entry_id}`}
                   entry={item.entry}
+                  showAgentLabel={turnLabels.has(item.entry.id)}
                   input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
                   showMetadata={item.entry.id === latestAssistantEntryId && !runningRunId}
                   toolCalls={liveToolAdapter.callsByAssistantEntryId.get(item.entry.id)}
@@ -1136,15 +1147,22 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 {(["UNDELIVERED", "DELIVERY_UNKNOWN"].includes(input.delivery_status) && (activeJob || canStartRun)) &&
                   <button className="button-quiet" disabled={busy} onClick={() => reuseInput(input)}>Reuse / Send again</button>}
               </article>)}
-              {liveLog && <pre className="live-log live-provisional">{liveLog}</pre>}
-              {compactionActive && <p className="run-empty live-state compaction-status" role="status">Compacting context…</p>}
+              {(liveLog || liveThinking) && <article className="live-message live-message-assistant live-provisional">
+                {provisionalNeedsLabel && <header className="live-message-header"><strong>Agent</strong></header>}
+                {liveThinking && <details className="live-details"><summary>Reasoning</summary><p>{liveThinking}</p></details>}
+                {liveLog && <Markdown density="compact" headingLevelStart={3} isStreaming plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
+              </article>}
+              {compactionActive && <ProgressBar label="Compacting context…" isIndeterminate />}
               {(persistedRunError || compactionError) && <p className="run-error live-state" role="alert">{persistedRunError || compactionError}</p>}
               {history && history.entries.length === 0 && unattachedInputs.length === 0 && !activeJob &&
                 <p className="run-empty">No agent messages yet.</p>}
             </section>
           )}
+          {tab === "live" && changesReviewCard}
+          {tab === "live" && reviewActions}
         </div>
 
+        {tab === "live" && liveHistory && <LiveTodoWidget entries={liveHistory.entries} />}
         {tab === "live" && activeHumanRequest && <HumanRequestPanel key={activeHumanRequest.id}
           request={activeHumanRequest} busy={humanRequestBusy} error={humanRequestError}
           onAnswer={(answers) => { void submitHumanAnswers(answers); }}
@@ -1152,32 +1170,29 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
         {tab === "live" && !activeHumanRequest && humanRequestError &&
           <div className="human-request-load-error" role="alert">Human Request status: {humanRequestError}</div>}
         {tab === "live" && <footer className="ticket-composer">
-          <p className="composer-hint">
+          {(waitingForHuman || activeJob || !canStartRun) && <p className="composer-hint">
             {waitingForHuman ? "Answer the Human Request above or stop the run before sending other guidance."
               : runningRunId
               ? "New guidance is saved before being steered. Delivery status updates when its transcript entry is confirmed."
               : activeJob
                 ? "Guidance sent now is saved to this queued run in send order."
-                : canStartRun ? "Enter a prompt to start a run." : "This ticket is read-only."}
-          </p>
-          <textarea
-            value={draft}
-            rows={3}
-            placeholder={activeJob ? "Add guidance to this run…" : "What should the agent do?"}
-            disabled={!!waitingForHuman || (!activeJob && !canStartRun)}
-            onChange={(event) => { setDraft(event.target.value); setDraftInputId(null); setReuseInputId(null); }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                submitDraft();
-              }
-            }}
-          />
-          <div className="dialog-actions">
-            <button className="button-primary" disabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && !canStartRun)} onClick={submitDraft}>
-              {activeJob ? "Send guidance" : "Start run"}
-            </button>
-          </div>
+                : "This ticket is read-only."}
+          </p>}
+          <HStack gap={2} vAlign="end">
+            <textarea aria-label="Message input" rows={1} value={draft}
+              onChange={(event) => { setDraft(event.target.value); setDraftInputId(null); setReuseInputId(null); }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  submitDraft();
+                }
+              }}
+              placeholder={activeJob ? "Add guidance to this run…" : "What should the agent do?"}
+              disabled={busy || !!waitingForHuman || (!activeJob && !canStartRun)} />
+            <IconButton size="sm" variant="primary" icon={<Text>↑</Text>} label={activeJob ? "Send guidance" : "Start run"}
+              tooltip={activeJob ? "Send guidance" : "Start run"}
+              isDisabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && !canStartRun)} onClick={submitDraft} />
+          </HStack>
         </footer>}
         {startingRun && <StartTaskDialog
           task={task}

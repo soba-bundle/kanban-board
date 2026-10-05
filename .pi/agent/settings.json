@@ -1,0 +1,47 @@
+{
+  "lastChangelogVersion": "0.85.1",
+  "packages": [
+    "npm:pi-undo-redo",
+    "npm:@gotgenes/pi-anthropic-auth",
+    "npm:pi-web-search"
+  ],
+  "defaultProvider": "ollama",
+  "defaultModel": "kanban-omnicoder-9b-8k:latest",
+  "defaultThinkingLevel": "low",
+  "hideThinkingBlock": false,
+  "piOmpTheme": {
+    "theme": {
+      "autoApply": "off"
+    },
+    "statusLine": {
+      "layout": {
+        "left": [
+          "model_effort",
+          "path",
+          "git",
+          "plan_build_mode"
+        ],
+        "right": [
+          "claude_context"
+        ],
+        "secondary": []
+      },
+      "customItems": [
+        {
+          "id": "plan_build_mode",
+          "statusKey": "planBuildMode",
+          "placement": "left"
+        }
+      ]
+    }
+  },
+  "theme": "matrix",
+  "compaction": {
+    "enabled": true
+  },
+  "undoRedo": {
+    "largeFileLimitBytes": 4194304,
+    "gitTimeoutMs": 30000,
+    "enabled": true
+  }
+}

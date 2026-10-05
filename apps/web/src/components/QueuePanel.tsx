@@ -1,4 +1,9 @@
 import type { QueueItem, QueueSnapshot } from "@kanban-board/shared";
+import { Badge } from "@astryxdesign/core/Badge";
+import { HStack } from "@astryxdesign/core/HStack";
+import { Text } from "@astryxdesign/core/Text";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Icon } from "@astryxdesign/core/Icon";
 import { Avatar } from "./Avatar.js";
 
 interface QueuePanelProps {
@@ -19,7 +24,7 @@ export function QueuePanel({ queue, loading, busyId, onMove, onRemove, onStop }:
           <p className="eyebrow">GLOBAL SCHEDULER</p>
           <h2 id="queue-heading">Agent queue</h2>
         </div>
-        {queue && <span className="capacity-pill">{queue.active_count} active <i /> {queue.max_concurrent_agents} max</span>}
+        {queue && <HStack gap={1} vAlign="center"><Badge label={queue.active_count} /><Text type="supporting">active / {queue.max_concurrent_agents} max</Text></HStack>}
       </div>
       {!queue && <p className="queue-empty">{loading ? "Loading queue…" : "Queue unavailable. Check the API error above, then refresh."}</p>}
       {queue?.jobs.length === 0 && <p className="queue-empty">The queue is clear. Start a Todo task to put an agent to work.</p>}
@@ -42,9 +47,9 @@ export function QueuePanel({ queue, loading, busyId, onMove, onRemove, onStop }:
                   </button>
                 ) : (
                   <div className="queue-controls">
-                    <button aria-label={`Move ${job.title} up`} title="Move up" disabled={busyId !== null || position <= 1} onClick={() => onMove(job.job_id, position - 1)}>↑</button>
-                    <button aria-label={`Move ${job.title} down`} title="Move down" disabled={busyId !== null || position >= queued.length} onClick={() => onMove(job.job_id, position + 1)}>↓</button>
-                    <button className="remove-queue" aria-label={`Remove ${job.title} from queue`} title="Remove from queue" disabled={busyId !== null} onClick={() => onRemove(job)}>×</button>
+                    <IconButton label={`Move ${job.title} up`} tooltip="Move up" icon={<Icon icon="arrowUp" />} size="sm" variant="ghost" isDisabled={busyId !== null || position <= 1} onClick={() => onMove(job.job_id, position - 1)} />
+                    <IconButton label={`Move ${job.title} down`} tooltip="Move down" icon={<Icon icon="arrowDown" />} size="sm" variant="ghost" isDisabled={busyId !== null || position >= queued.length} onClick={() => onMove(job.job_id, position + 1)} />
+                    <IconButton label={`Remove ${job.title} from queue`} tooltip="Remove from queue" icon={<Icon icon="close" />} size="sm" variant="ghost" isDisabled={busyId !== null} onClick={() => onRemove(job)} />
                   </div>
                 )}
               </article>

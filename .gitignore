@@ -6,3 +6,6 @@ __MACOSX/
 **/dist/
 **/node_modules/
 archived
+.pi/agent/auth.json
+.pi/agent/models-store.json
+.pi/agent/npm/

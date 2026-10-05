@@ -47,6 +47,14 @@ function resultDetails(entry: LiveHistoryEntry): unknown {
   return details;
 }
 
+function editDiffStats(details: unknown): { additions: number; deletions: number } | undefined {
+  if (typeof details !== "object" || details === null || typeof (details as { patch?: unknown }).patch !== "string") return undefined;
+  const lines = (details as { patch: string }).patch.split(/\r?\n/);
+  const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
+  const deletions = lines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+  return additions + deletions > 0 ? { additions, deletions } : undefined;
+}
+
 export function adaptLiveToolCalls(entries: LiveHistoryEntry[], activeRunId: string | null = null): LiveToolCallAdapter {
   const resultsByCallId = new Map<string, LiveHistoryEntry[]>();
   for (const entry of entries) {
@@ -110,11 +118,13 @@ export function adaptLiveToolCalls(entries: LiveHistoryEntry[], activeRunId: str
       const isError = resultMessage.isError === true;
       const content = resultContent(result);
       const details = resultDetails(result);
+      const diffStats = !isError && call.name === "edit" ? editDiffStats(details) : undefined;
       calls.push({
         ...baseCall,
         name: call.name ?? (typeof resultName === "string" ? resultName : "tool"),
         status: isError ? "error" : "complete",
         errorMessage: isError ? content || "Tool returned an error." : undefined,
+        ...diffStats,
         data: { callId: call.id, arguments: call.arguments, resultContent: content, resultDetails: details },
       });
       consumedResultEntryIds.add(result.id);

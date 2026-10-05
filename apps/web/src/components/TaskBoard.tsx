@@ -1,4 +1,6 @@
 import type { BoardSnapshot, Project, QueueItem, QueueSnapshot, Task, WorkflowState } from "@kanban-board/shared";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Icon } from "@astryxdesign/core/Icon";
 import { AddIconButton } from "./AddIconButton.js";
 import { Avatar } from "./Avatar.js";
 import { CountBadge } from "./CountBadge.js";
@@ -70,7 +72,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                       tabIndex={0}
                       title="Open ticket"
                       onClick={() => onOpenTask(task)}
-                      onKeyDown={(event) => { if (event.key === "Enter") onOpenTask(task); }}
+                      onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) onOpenTask(task); }}
                     >
                       <div className="task-card-topline">
                         <div className="task-project-heading">
@@ -99,9 +101,8 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                           {state === "IN_PROGRESS" ? (
                             <button className="button-stop" disabled={!activeJob} title={activeJob ? "Cancel active task" : "No queued or running job to cancel"} onClick={() => activeJob && onCancelTask(task, activeJob)}>Cancel task</button>
                           ) : (
-                            <button className="card-delete" aria-label={`Delete ${task.title}`} title={activeJob ? "Cancel queued or running work before deleting" : "Delete task"} disabled={!!activeJob} onClick={() => onDeleteTask(task)}>
-                              <DeleteIcon />
-                            </button>
+                            <IconButton label={`Delete ${task.title}`} tooltip={activeJob ? "Cancel queued or running work before deleting" : "Delete task"}
+                              isDisabled={!!activeJob} onClick={() => onDeleteTask(task)} icon={<Icon icon={DeleteIcon} />} size="sm" variant="ghost" />
                           )}
                         </div>
                       </footer>

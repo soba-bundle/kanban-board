@@ -6,6 +6,7 @@ import { Avatar } from "./Avatar.js";
 import { CountBadge } from "./CountBadge.js";
 import { DeleteIcon } from "./DeleteIcon.js";
 import { ProjectMark } from "./ProjectMark.js";
+import { displayTaskTitle } from "../display-task-title.js";
 
 const columns: Array<{ state: WorkflowState; title: string; description: string }> = [
   { state: "TODO", title: "Todo", description: "Ready to be picked up" },
@@ -61,6 +62,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
               <div className="column-cards">
                 {tasks.map((task) => {
                   const agent = agentFor(task, queue);
+                  const title = displayTaskTitle(task.title);
                   const activeJob = queue?.jobs.find((job) => job.task_id === task.id);
                   const reviewTag = ["READY_TO_MERGE", "VALIDATION_ISSUES", "VALIDATION_FAILED"].includes(task.review_tag ?? "")
                     ? "WORK_COMPLETE" : task.review_tag;
@@ -81,7 +83,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                         </div>
                         {reviewTag && <span className="review-tag">{reviewTag.replaceAll("_", " ")}</span>}
                       </div>
-                      <h3>{task.title}</h3>
+                      <h3>{title}</h3>
                       {task.description && <p className="task-description">{task.description}</p>}
                       <footer className="task-card-footer">
                         {agent ? (
@@ -101,7 +103,7 @@ export function TaskBoard({ board, queue, projects, projectId, onStartTask, onOp
                           {state === "IN_PROGRESS" ? (
                             <button className="button-stop" disabled={!activeJob} title={activeJob ? "Cancel active task" : "No queued or running job to cancel"} onClick={() => activeJob && onCancelTask(task, activeJob)}>Cancel task</button>
                           ) : (
-                            <IconButton label={`Delete ${task.title}`} tooltip={activeJob ? "Cancel queued or running work before deleting" : "Delete task"}
+                            <IconButton label={`Delete ${title}`} tooltip={activeJob ? "Cancel queued or running work before deleting" : "Delete task"}
                               isDisabled={!!activeJob} onClick={() => onDeleteTask(task)} icon={<Icon icon={DeleteIcon} />} size="sm" variant="ghost" />
                           )}
                         </div>

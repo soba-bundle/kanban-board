@@ -78,10 +78,10 @@ test("composer gates on prompt, keeps Shift+Enter, and preserves draft through c
 
   const composer = await testing.screen.findByPlaceholderText("What should the agent do?");
   const startButton = testing.screen.getByRole("button", { name: "Start run" });
-  assert.equal(startButton.disabled, true);
+  assert.equal(startButton.getAttribute("aria-disabled"), "true");
   assert.equal(testing.screen.queryByRole("radio", { name: /Investigation|Implementation/ }), null);
   testing.fireEvent.change(composer, { target: { value: "Fix retries" } });
-  assert.equal(startButton.disabled, false);
+  assert.equal(startButton.getAttribute("aria-disabled"), null);
 
   testing.fireEvent.keyDown(composer, { key: "Enter", shiftKey: true });
   assert.equal(testing.screen.queryByRole("dialog", { name: "Start a run" }), null);
@@ -118,7 +118,7 @@ test("TODO starts from a prompt without requiring an Investigation or Implementa
   assert.equal(testing.screen.queryByRole("radio", { name: /Investigation|Implementation/ }), null);
   testing.fireEvent.change(composer, { target: { value: "Explore the retry bug and fix it if needed" } });
   const start = testing.screen.getByRole("button", { name: "Start run" });
-  assert.equal(start.disabled, false);
+  assert.equal(start.getAttribute("aria-disabled"), null);
   testing.fireEvent.click(start);
   const startDialog = await testing.screen.findByRole("dialog", { name: "Start a run" });
   testing.fireEvent.click(testing.within(startDialog).getByRole("button", { name: "Send" }));
@@ -1222,6 +1222,38 @@ async function mountPanelWithRunningSocket(t, initialSnapshot = {}, prepareDom =
   return { testing, socket: sockets.at(-1), getSocket: () => sockets.at(-1), setSnapshot: (next) => { snapshot = next; }, view };
 }
 
+test("running ChatComposer keeps guidance sending available beside a separate Stop action", async (t) => {
+  const timestamp = new Date().toISOString();
+  const { testing } = await mountPanelWithRunningSocket(t, {
+    provisional_output: { text: "Working", thinking: "" },
+  });
+  const originalFetch = globalThis.fetch;
+  let stopRequest;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url);
+    if (path.endsWith("/api/runs/run-1/stop")) {
+      stopRequest = { path, method: options.method };
+      return response(url, { status: "STOPPED" });
+    }
+    if (path.endsWith("/live/history")) return response(url, { ...history(), timestamp });
+    if (path.endsWith("/runs")) return response(url, [{
+      id: "run-1", stage: "WORK", sequence: 1, status: "RUNNING", reason_code: null,
+      error_message: null, started_at: timestamp, completed_at: null, handover: null,
+    }]);
+    return response(url, []);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const composer = testing.screen.getByRole("textbox", { name: "Message input" });
+  testing.fireEvent.change(composer, { target: { value: "Keep the setup section concise" } });
+  const send = testing.screen.getByRole("button", { name: "Send guidance" });
+  assert.equal(send.disabled, false);
+  assert.equal(testing.screen.getByRole("button", { name: "Stop" }).disabled, false);
+
+  testing.fireEvent.click(testing.screen.getByRole("button", { name: "Stop" }));
+  await testing.waitFor(() => assert.deepEqual(stopRequest, { path: "/api/runs/run-1/stop", method: "POST" }));
+});
+
 test("Live restores existing streamed text immediately and appends only later deltas", async (t) => {
   const timestamp = new Date().toISOString();
   const restored = {
@@ -1275,7 +1307,7 @@ test("Live history removes failed-attempt deltas when Pi schedules a retry", asy
   t.after(() => view.unmount());
 
   await testing.waitFor(() => assert.equal(view.container.querySelector(".live-provisional .astryx-markdown")?.textContent, "final answer"));
-  assert.equal(view.container.querySelectorAll(".live-provisional .live-message-header").length, 1);
+  assert.equal(view.container.querySelectorAll(".live-provisional .live-message-header").length, 0);
   assert.equal(testing.screen.queryByText(/discard this partial answer/), null);
 });
 

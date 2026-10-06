@@ -26,6 +26,7 @@ try {
     base_branch: "main", base_commit_sha: "b".repeat(40), latest_task_commit_sha: "c".repeat(40),
     created_at: timestamp, updated_at: timestamp,
   };
+  const displayTitle = `${task.title[0].toUpperCase()}${task.title.slice(1)}`;
   const entry = (id, role, content) => ({ id, entry_id: id, session_id: "session-1", run_id: "run-1", timestamp, role, message: { role, content } });
   const snapshot = {
     task_id: task.id, session_id: "session-1", active_run_id: null, cursor: 1, inputs: [], provisional_truncated: false,
@@ -55,12 +56,20 @@ try {
     await route.fulfill({ json: body });
   });
   await page.goto(server.resolvedUrls.local[0]);
-  await page.getByRole("heading", { name: task.title }).click();
-  const panel = page.getByRole("complementary", { name: `Ticket ${task.title}` });
+  await page.getByRole("heading", { name: displayTitle }).click();
+  const panel = page.getByRole("complementary", { name: `Ticket ${displayTitle}` });
   await panel.getByRole("tabpanel", { name: "Live" }).getByText("Ready for human review.").waitFor();
-  assert.equal(await panel.locator(".live-message-header").getByText("Agent", { exact: true }).count(), 1);
+  assert.equal(await panel.locator(".live-message-header").count(), 0);
   assert.equal(await panel.locator(".astryx-markdown strong").first().textContent(), "Review");
   assert.ok(await panel.locator(".astryx-markdown br").count() >= 2);
+  const detailsToggle = panel.getByRole("button", { name: "Show ticket details" });
+  assert.equal(await detailsToggle.getAttribute("aria-expanded"), "false");
+  await panel.locator(".ticket-title-text").click();
+  assert.equal(await detailsToggle.getAttribute("aria-expanded"), "false", "only the chevron toggles Details");
+  await detailsToggle.click();
+  assert.equal(await panel.getByRole("button", { name: "Hide ticket details" }).getAttribute("aria-expanded"), "true");
+  assert.equal(await panel.locator(".ticket-details-content").isVisible(), true);
+  await panel.getByRole("button", { name: "Hide ticket details" }).click();
   await panel.getByRole("progressbar", { name: "Compacting context…" }).waitFor();
   const animations = await panel.locator(".astryx-progress-bar-fill").evaluateAll((elements) => elements.map((el) => getComputedStyle(el).animationName));
   assert.ok(animations.every((name) => name === "none"), `Reduced motion: ${animations}`);
@@ -112,23 +121,23 @@ try {
   const connected = new Promise((resolve) => { resolveSocket = resolve; });
   await page.routeWebSocket("**/api/**", (socket) => resolveSocket(socket));
   await page.reload();
-  await page.getByRole("heading", { name: task.title }).click();
+  await page.getByRole("heading", { name: displayTitle }).click();
   const socket = await connected;
   const send = (sequence, type, data) => socket.send(JSON.stringify({ sequence, type, data, timestamp, eventId: `event-${sequence}`, taskId: task.id, runId: "run-1" }));
   send(2, "message_update", { subtype: "thinking_delta", delta: "Private reasoning stays plain." });
   send(3, "message_update", { subtype: "text_delta", delta: "**Streamed" });
   send(4, "message_update", { subtype: "text_delta", delta: " answer**\nSecond streamed line" });
   await page.waitForFunction(() => document.querySelector(".live-provisional .astryx-markdown strong")?.textContent === "Streamed answer");
-  assert.equal(await panel.locator(".live-message-header").getByText("Agent", { exact: true }).count(), 1);
+  assert.equal(await panel.locator(".live-message-header").count(), 0);
   assert.equal(await panel.locator(".live-provisional .astryx-markdown").getByText("Private reasoning stays plain.").count(), 0);
   snapshot.entries.push(entry("streamed", "assistant", [{ type: "text", text: "**Streamed answer**\nSecond streamed line" }]));
   snapshot.cursor = 5;
   send(5, "entry_appended", {});
   await page.waitForFunction(() => !document.querySelector(".live-provisional") && [...document.querySelectorAll(".astryx-markdown strong")].some((el) => el.textContent === "Streamed answer"));
-  assert.equal(await panel.locator(".live-message-header").getByText("Agent", { exact: true }).count(), 1);
+  assert.equal(await panel.locator(".live-message-header").count(), 0);
   assert.equal(requests.some(({ method }) => method !== "GET"), false, "Preview acceptance must not mutate Git or start agents");
   assert.deepEqual(errors, []);
-  console.log("Browser acceptance passed: desktop/narrow, Markdown, labels, composer, tabs, progress/reduced motion, metadata, Git previews, popover focus and tooltips.");
+  console.log("Browser acceptance passed: desktop/narrow, Markdown, title/disclosure, unlabeled chat messages, composer, tabs, progress/reduced motion, Git previews, popover focus and tooltips.");
 } finally {
   await browser?.close();
   await server.close();

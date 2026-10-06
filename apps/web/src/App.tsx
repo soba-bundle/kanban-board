@@ -11,6 +11,7 @@ import { StartTaskDialog } from "./components/StartTaskDialog.js";
 import { TaskBoard } from "./components/TaskBoard.js";
 import { TicketPanel } from "./components/TicketPanel.js";
 import { useToast } from "./components/ToastContext.js";
+import { displayTaskTitle } from "./display-task-title.js";
 import { deleteProject, deleteTask, loadBoard, loadProjects, loadQueue, removeQueueJob, reorderQueueJob, stopRun } from "./board-api.js";
 import "./app.css";
 
@@ -127,7 +128,7 @@ export function App() {
         <StartTaskDialog
           task={selectedTask}
           onCancel={() => setSelectedTask(null)}
-          onStarted={() => { setSelectedTask(null); pushToast({ title: "Task queued", description: `${selectedTask.title} queued for work.`, variant: "success" }); void refreshData(); }}
+          onStarted={() => { setSelectedTask(null); pushToast({ title: "Task queued", description: `${displayTaskTitle(selectedTask.title)} queued for work.`, variant: "success" }); void refreshData(); }}
         />
       )}
       {addingProject && (
@@ -143,10 +144,10 @@ export function App() {
       )}
       {deleteTarget && deleteTarget.kind === "cancel" && (
         <ConfirmDialog
-          title={`Cancel “${deleteTarget.job.title}”?`}
+          title={`Cancel “${displayTaskTitle(deleteTarget.job.title)}”?`}
           message={deleteTarget.job.job_status === "QUEUED"
-            ? (<>Cancel <strong>{deleteTarget.job.title}</strong>? It will be removed from the queue and returned to its previous column. You can delete it after cancellation.</>)
-            : (<>Cancel <strong>{deleteTarget.job.title}</strong>? The active run will stop and the task will move to Review / Interrupted. You can delete it from there afterward.</>)
+            ? (<>Cancel <strong>{displayTaskTitle(deleteTarget.job.title)}</strong>? It will be removed from the queue and returned to its previous column. You can delete it after cancellation.</>)
+            : (<>Cancel <strong>{displayTaskTitle(deleteTarget.job.title)}</strong>? The active run will stop and the task will move to Review / Interrupted. You can delete it from there afterward.</>)
           }
           confirmLabel={deleteTarget.job.job_status === "QUEUED" ? "Remove from queue" : "Stop run"}
           busyLabel={deleteTarget.job.job_status === "QUEUED" ? "Removing…" : "Stopping…"}
@@ -167,7 +168,7 @@ export function App() {
       {deleteTarget && deleteTarget.kind !== "cancel" && (
         <DangerConfirmDialog
           name={deleteTarget.kind === "task"
-            ? `${projects.find((project) => project.id === deleteTarget.item.project_id)?.name ?? "Project"}/${deleteTarget.item.title}`
+            ? `${projects.find((project) => project.id === deleteTarget.item.project_id)?.name ?? "Project"}/${displayTaskTitle(deleteTarget.item.title)}`
             : deleteTarget.item.name}
           kind={deleteTarget.kind === "task" ? "ticket" : "project"}
           effects={deleteTarget.kind === "task"

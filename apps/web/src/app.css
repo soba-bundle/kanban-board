@@ -322,7 +322,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .dialog .developer-test-reminder { margin: 14px 0; }
 .ticket-section-title { margin: 0 0 8px; color: #7d879b; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; }
 .ticket-description { margin: 0; color: #b4bccd; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
-.ticket-composer textarea { width: 100%; min-width: 0; box-sizing: border-box; padding: var(--spacing-2); border: var(--border-width) solid var(--color-border); border-radius: var(--radius-md); background: transparent; color: var(--color-text); font: inherit; field-sizing: content; max-block-size: calc(var(--size-element-lg) * 3); resize: vertical; }
+.ticket-composer-input { width: 100%; min-width: 0; box-sizing: border-box; padding: var(--spacing-1) 0; border: 0; border-radius: 0; outline: none; background: transparent; color: var(--color-text); font: inherit; field-sizing: content; max-block-size: calc(var(--size-element-lg) * 3); resize: none; }
+.ticket-composer-input:focus-visible { outline: none; }
 .link-button { border: none; background: none; color: #a397ec; font-size: 11px; font-weight: 600; }
 .link-button:hover:not(:disabled) { color: #c3b8ff; text-decoration: underline; }
 .link-danger { color: #ff9ba2; }
@@ -363,13 +364,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .live-task-context { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, 0.025); }
 .live-conversation { display: flex; flex-direction: column; gap: 10px; }
 .live-message, .live-input-status { width: fit-content; max-width: 88%; min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(20, 25, 37, 0.7); }
-.live-message { width: 100%; max-width: 100%; align-self: flex-start; border: 0; padding: 5px 0; background: transparent; }
-.live-message-user, .live-input-status { align-self: flex-end; }
-.live-message-user { width: fit-content; max-width: 88%; padding: 9px 12px; border: 0; background: rgba(92, 76, 164, 0.1); }
+.live-message { display: flex; width: 100%; max-width: 100%; min-width: 0; align-self: stretch; border: 0; border-radius: 0; padding: 0; background: transparent; }
+.live-input-status { align-self: flex-end; }
 .live-message-header, .live-input-status header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #dfe3ec; font-size: 11px; }
 .live-message-header time { margin-left: auto; color: #727d92; font-size: 10px; }
 .live-message-text, .live-input-status p { margin: 8px 0 0; color: #c4cada; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
-.live-message-meta, .live-input-status small { display: block; margin-top: 8px; color: #778297; font-size: 10px; }
+.live-input-status small { display: block; margin-top: 8px; color: #778297; font-size: 10px; }
+.ticket-title-group { flex: 1; min-width: 0; }
+.ticket-title-group .ticket-title-text { min-width: 0; }
+.ticket-details-content[hidden] { display: none; }
+.ticket-details-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 .live-details { margin-top: 8px; color: #929db2; font-size: 11px; }
 .live-details summary { cursor: pointer; }
 .live-details p, .live-details pre { max-height: 220px; overflow: auto; margin: 7px 0 0; color: #9ea8bc; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -449,6 +453,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .human-request-load-error { padding: 8px 18px; color: #ff929a; font-size: 11px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 .ticket-composer { padding: var(--spacing-2) var(--spacing-4); border-top: var(--border-width) solid var(--color-border); }
+.ticket-chat-composer > div { padding: var(--spacing-2); }
 .live-todo-widget { margin-bottom: var(--spacing-1); padding: var(--spacing-2) var(--spacing-4) 0; border-block-start: var(--border-width) solid var(--color-border); }
 .live-todo-header { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-2); margin-bottom: 0; }
 .live-todo-list { gap: 0; }

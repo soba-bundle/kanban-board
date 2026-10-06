@@ -3,6 +3,10 @@ import type { ChatToolCallItem } from "@astryxdesign/core/Chat";
 import { ChatToolCalls } from "@astryxdesign/core/Chat";
 import { Collapsible } from "@astryxdesign/core/Collapsible";
 import { Button } from "@astryxdesign/core/Button";
+import { ChatComposer, ChatMessage, ChatMessageBubble, ChatMessageMetadata, useChatComposerContext } from "@astryxdesign/core/Chat";
+import { Timestamp } from "@astryxdesign/core/Timestamp";
+import { Token } from "@astryxdesign/core/Token";
+import { StatusDot } from "@astryxdesign/core/StatusDot";
 import { TabList, Tab as AstryxTab } from "@astryxdesign/core/TabList";
 import { ProgressBar } from "@astryxdesign/core/ProgressBar";
 import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList";
@@ -22,7 +26,8 @@ import { HumanRequestPanel } from "./HumanRequestPanel.js";
 import { LiveTodoWidget } from "./LiveTodoWidget.js";
 import { StartTaskDialog } from "./StartTaskDialog.js";
 import { useToast } from "./ToastContext.js";
-import { completeTask } from "../board-api.js";
+import { completeTask, stopRun } from "../board-api.js";
+import { displayTaskTitle } from "../display-task-title.js";
 import {
   type TaskSyncCheck,
   type TaskSyncRecovery,
@@ -158,27 +163,55 @@ function inputStatusLabel(status: string): string {
 
 const assistantMarkdownPlugins = [markdownSoftBreaksPlugin];
 
-// Tool results and compaction do not start a new assistant turn.
-export function assistantTurnLabels(entries: LiveHistoryEntry[]): Set<string> {
-  const labels = new Set<string>();
-  let previousAssistant: LiveHistoryEntry | undefined;
-  for (const entry of entries) {
-    if (entry.role === "user") previousAssistant = undefined;
-    if (entry.role !== "assistant") continue;
-    if (!previousAssistant || previousAssistant.run_id !== entry.run_id || previousAssistant.session_id !== entry.session_id) labels.add(entry.id);
-    previousAssistant = entry;
+function workflowStatus(state: Task["workflow_state"]) {
+  switch (state) {
+    case "TODO": return { color: "gray" as const, variant: "neutral" as const };
+    case "IN_PROGRESS": return { color: "blue" as const, variant: "accent" as const };
+    case "REQUIRES_HUMAN": return { color: "orange" as const, variant: "warning" as const };
+    case "REVIEW": return { color: "orange" as const, variant: "warning" as const };
+    case "DONE": return { color: "green" as const, variant: "success" as const };
   }
-  return labels;
 }
 
-export function LiveMessageCard({ entry, input, showMetadata = false, showAgentLabel = true, toolCalls = [], unmatchedToolCalls = [] }: {
-  entry: LiveHistoryEntry; input?: RunInput; showMetadata?: boolean; showAgentLabel?: boolean;
+function TicketComposerInput({ draft, submitDraft, isDisabled, placeholder }: {
+  draft: string; submitDraft: (value: string) => void; isDisabled: boolean; placeholder: string;
+}) {
+  const { onChange, inputControlRef } = useChatComposerContext()!;
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const control = { focus: () => inputRef.current?.focus() };
+    inputControlRef!.current = control;
+    return () => {
+      if (inputControlRef!.current === control) inputControlRef!.current = null;
+    };
+  }, [inputControlRef]);
+
+  return <textarea
+    ref={inputRef}
+    className="ticket-composer-input"
+    aria-label="Message input"
+    rows={1}
+    value={draft}
+    onChange={(event) => onChange(event.currentTarget.value)}
+    onKeyDown={(event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+        event.preventDefault();
+        submitDraft(event.currentTarget.value);
+      }
+    }}
+    placeholder={placeholder}
+    disabled={isDisabled}
+  />;
+}
+
+export function LiveMessageCard({ entry, input, showMetadata = false, toolCalls = [], unmatchedToolCalls = [] }: {
+  entry: LiveHistoryEntry; input?: RunInput; showMetadata?: boolean;
   toolCalls?: ChatToolCallItem[]; unmatchedToolCalls?: UnmatchedToolCall[];
 }) {
   const message = entry.message as { role?: string; toolName?: string; content?: unknown; details?: unknown; provider?: string; model?: string; usage?: Record<string, unknown>; stopReason?: string; isError?: boolean };
   const parts = Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [];
   const reasoning = parts.filter((part) => part.type === "thinking").map((part) => String(part.thinking ?? "")).filter(Boolean);
-  const role = entry.role === "user" ? "You" : entry.role === "assistant" ? "Agent" : `Tool: ${message.toolName ?? entry.role}`;
+  const role = `Tool: ${message.toolName ?? entry.role}`;
   const usage = message.usage ?? {};
   const tokens = [
     typeof usage.input === "number" ? `in ${usage.input}` : null,
@@ -209,37 +242,48 @@ export function LiveMessageCard({ entry, input, showMetadata = false, showAgentL
     return resultDetail === undefined ? call : { ...call, resultDetail };
   }).filter((call): call is ChatToolCallItem => call !== null);
   const runningToolCalls = renderedToolCalls.some((call) => call.status === "running");
+  const hasBubbleContent = !!textContent(entry) || reasoning.length > 0 || renderedToolCalls.length > 0 || unmatchedToolCalls.length > 0;
   const orphanToolResult = entry.role === "tool"
     ? liveOrphanToolResult(message.toolName ?? "", textContent(entry), message.details, message.isError === true)
     : undefined;
+  const toolHeader = entry.role === "tool" && <header className="live-message-header"><strong>{role}</strong></header>;
+  const inputMetadata = input && entry.role === "user" && <ChatMessageMetadata footer={
+    <span className={`input-status input-status-${input.delivery_status.toLowerCase()}`} title={input.failure_reason ?? undefined}>
+      {inputStatusLabel(input.delivery_status)}
+    </span>
+  } />;
+  const content = <>
+    {entry.role === "assistant" && textContent(entry) && <Markdown className="live-message-text" density="compact" headingLevelStart={3} plugins={assistantMarkdownPlugins}>{textContent(entry)}</Markdown>}
+    {entry.role === "user" && textContent(entry) && <p className="live-message-text">{textContent(entry)}</p>}
+    {reasoning.length > 0 && <details className="live-details"><summary>Reasoning</summary><p>{reasoning.join("\n")}</p></details>}
+    {renderedToolCalls.length > 0 && <ChatToolCalls
+      calls={renderedToolCalls}
+      className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}${runningToolCalls ? " live-tool-calls-running" : ""}`}
+      defaultIsExpanded
+    />}
+    {unmatchedToolCalls.length > 0 && <details className="live-details live-tool-unmatched">
+      <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
+      {unmatchedToolCalls.map((call, index) => <section key={call.id ?? index}>
+        <strong>{call.name}</strong><p>{call.reason}</p>
+        {call.name !== "todo" && call.arguments !== undefined && <pre>{JSON.stringify(call.arguments, null, 2)}</pre>}
+        {call.id && <code>{call.id}</code>}
+      </section>)}
+    </details>}
+  </>;
+  const assistantMetadata = showMetadata && entry.role === "assistant" && textContent(entry) && message.stopReason !== "toolUse" && <ChatMessageMetadata
+    timestamp={<Timestamp value={entry.timestamp} format="time" />}
+    footer={<Text type="supporting" color="secondary">{[message.provider, message.model, tokens].filter(Boolean).join(" · ")}{tokens ? " tokens" : ""}</Text>}
+  />;
+  if (entry.role === "tool") return <article className={`live-message live-message-${entry.role}`}>
+    {toolHeader}{content}{orphanToolResult}
+  </article>;
+  if (!hasBubbleContent) return null;
   return (
-    <article className={`live-message live-message-${entry.role}`}>
-      {(entry.role !== "assistant" || showAgentLabel) && <header className="live-message-header">
-        <strong>{role}</strong>
-        {input && <span className={`input-status input-status-${input.delivery_status.toLowerCase()}`} title={input.failure_reason ?? undefined}>{inputStatusLabel(input.delivery_status)}</span>}
-      </header>}
-      {entry.role === "assistant" && textContent(entry) && <Markdown className="live-message-text" density="compact" headingLevelStart={3} plugins={assistantMarkdownPlugins}>{textContent(entry)}</Markdown>}
-      {entry.role === "user" && textContent(entry) && <p className="live-message-text">{textContent(entry)}</p>}
-      {reasoning.length > 0 && <details className="live-details"><summary>Reasoning</summary><p>{reasoning.join("\n")}</p></details>}
-      {renderedToolCalls.length > 0 && <ChatToolCalls
-        calls={renderedToolCalls}
-        className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}${runningToolCalls ? " live-tool-calls-running" : ""}`}
-        defaultIsExpanded
-      />}
-      {unmatchedToolCalls.length > 0 && <details className="live-details live-tool-unmatched">
-        <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
-        {unmatchedToolCalls.map((call, index) => <section key={call.id ?? index}>
-          <strong>{call.name}</strong><p>{call.reason}</p>
-          {call.name !== "todo" && call.arguments !== undefined && <pre>{JSON.stringify(call.arguments, null, 2)}</pre>}
-          {call.id && <code>{call.id}</code>}
-        </section>)}
-      </details>}
-      {orphanToolResult}
-      {showMetadata && entry.role === "assistant" && textContent(entry) && message.stopReason !== "toolUse" && <footer className="live-message-meta">
-        <time dateTime={entry.timestamp}>{new Date(entry.timestamp).toLocaleTimeString()}</time>
-        {[message.provider, message.model, tokens].filter(Boolean).join(" · ")}{tokens ? " tokens" : ""}
-      </footer>}
-    </article>
+    <ChatMessage sender={entry.role === "user" ? "user" : "assistant"} density="compact" className={`live-message live-message-${entry.role}`}>
+      {entry.role === "assistant"
+        ? <ChatMessageBubble variant="ghost" metadata={assistantMetadata}>{content}</ChatMessageBubble>
+        : <ChatMessageBubble metadata={inputMetadata}>{content}</ChatMessageBubble>}
+    </ChatMessage>
   );
 }
 
@@ -261,6 +305,8 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [humanRequestError, setHumanRequestError] = useState<string | null>(null);
   const [humanRequestBusy, setHumanRequestBusy] = useState(false);
   const [tab, setTab] = useState<Tab>("live");
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  useEffect(() => setDetailsOpen(false), [task.id]);
   const [draft, setDraft] = useState("");
   const [draftInputId, setDraftInputId] = useState<string | null>(null);
   const [reuseInputId, setReuseInputId] = useState<string | null>(null);
@@ -327,6 +373,8 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     (currentCheckpointStatus.tracked_changes.length > 0 || currentCheckpointStatus.untracked_files.length > 0);
   const visibleReviewTag = ["READY_TO_MERGE", "VALIDATION_FAILED", "VALIDATION_ISSUES"].includes(task.review_tag ?? "")
     ? "WORK_COMPLETE" : task.review_tag;
+  const workflowLabel = task.workflow_state.replaceAll("_", " ");
+  const status = workflowStatus(task.workflow_state);
   const showMergeControls = task.workflow_state === "REVIEW";
   const currentSyncResult = syncResult?.taskId === task.id ? syncResult : null;
   const currentSyncCheck = syncCheckTaskId === task.id ? syncCheck : null;
@@ -793,9 +841,9 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     setStartingRun(true);
   }
 
-  function submitDraft() {
+  function submitDraft(value = draft) {
     if (busy || waitingForHuman) return;
-    const text = draft.trim();
+    const text = value.trim();
     if (!text) return;
     if (activeJob) {
       const inputId = draftInputId ?? crypto.randomUUID();
@@ -810,12 +858,10 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
       return;
     }
     if (!canStartRun) return;
+    setDraft(text);
     setStartingRun(true);
   }
 
-  const turnLabels = assistantTurnLabels(history?.entries ?? []);
-  const lastConversationEntry = history?.entries.filter((entry) => entry.role !== "tool").at(-1);
-  const provisionalNeedsLabel = lastConversationEntry?.role !== "assistant" || lastConversationEntry.run_id !== history?.active_run_id;
   const latestAssistantEntryId = liveHistory?.entries.filter((entry) => entry.role === "assistant").at(-1)?.id;
   const liveToolAdapter = adaptLiveToolCalls(liveHistory?.entries ?? [], liveHistory?.active_run_id ?? null);
   const changesReviewCard = !activeJob && canReviewAction && checkpointStatusTaskId === task.id && (
@@ -924,27 +970,50 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
 
   return (
     <div className="panel-backdrop" onClick={onClose}>
-      <aside className="ticket-panel" onClick={(event) => event.stopPropagation()} aria-label={`Ticket ${task.title}`}>
+      <aside className="ticket-panel" onClick={(event) => event.stopPropagation()} aria-label={`Ticket ${displayTaskTitle(task.title)}`}>
         <header className="ticket-panel-header">
           <VStack gap={2} className="ticket-panel-heading">
             <HStack gap={2} vAlign="center" hAlign="between">
-              <Text weight="semibold" maxLines={1}>{task.title}</Text>
-              <Text type="supporting">{task.workflow_state.replaceAll("_", " ")}</Text>
+              <HStack gap={1} vAlign="center" className="ticket-title-group">
+                <Text className="ticket-title-text" weight="semibold" maxLines={1}>{displayTaskTitle(task.title)}</Text>
+                <IconButton
+                  className="ticket-details-toggle"
+                  size="sm"
+                  variant="ghost"
+                  label={detailsOpen ? "Hide ticket details" : "Show ticket details"}
+                  tooltip={detailsOpen ? "Hide details" : "Show details"}
+                  icon={<Icon icon="chevronDown" />}
+                  aria-expanded={detailsOpen}
+                  aria-controls={`ticket-details-${task.id}`}
+                  onClick={() => setDetailsOpen((open) => !open)}
+                />
+              </HStack>
+              <Token
+                label={workflowLabel}
+                color={status.color}
+                size="sm"
+                icon={<StatusDot variant={status.variant} label={workflowLabel} />}
+              />
             </HStack>
-            <Collapsible key={task.id} trigger="Details" defaultIsOpen={false}>
-            <MetadataList label={{ position: "start" }}>
-              <MetadataListItem label="Description"><Text type="supporting">{task.description || "No description."}</Text></MetadataListItem>
-              {task.worktree_path && <MetadataListItem label="Working directory">
-                <HStack gap={1} vAlign="start">
-                  <Text type="code">{task.worktree_path}</Text>
-                  <IconButton size="sm" variant="ghost" label="Copy working directory" tooltip="Copy working directory" icon={<Icon icon="copy" size="xsm" />}
-                    onClick={() => void run(() => navigator.clipboard.writeText(task.worktree_path!), "Working directory copied")} />
-                </HStack>
-              </MetadataListItem>}
-              <MetadataListItem label="Created"><Text type="supporting"><time dateTime={task.created_at}>{new Date(task.created_at).toLocaleString()}</time></Text></MetadataListItem>
-              {visibleReviewTag && <MetadataListItem label="Workflow"><Text type="supporting">{visibleReviewTag.replaceAll("_", " ")}</Text></MetadataListItem>}
-            </MetadataList>
-            </Collapsible>
+            <VStack
+              id={`ticket-details-${task.id}`}
+              className="ticket-details-content"
+              hidden={!detailsOpen}
+              style={{ paddingBlock: "var(--spacing-2)", paddingInline: "var(--spacing-3)" }}
+            >
+              <MetadataList label={{ position: "top" }}>
+                <MetadataListItem label="Description"><Text type="supporting">{task.description || "No description."}</Text></MetadataListItem>
+                {task.worktree_path && <MetadataListItem label="Working directory">
+                  <HStack gap={1} vAlign="start">
+                    <Text type="code">{task.worktree_path}</Text>
+                    <IconButton size="sm" variant="ghost" label="Copy working directory" tooltip="Copy working directory" icon={<Icon icon="copy" size="xsm" />}
+                      onClick={() => void run(() => navigator.clipboard.writeText(task.worktree_path!), "Working directory copied")} />
+                  </HStack>
+                </MetadataListItem>}
+                <MetadataListItem label="Created"><Text type="supporting"><time dateTime={task.created_at}>{new Date(task.created_at).toLocaleString()}</time></Text></MetadataListItem>
+                {visibleReviewTag && <MetadataListItem label="Workflow"><Text type="supporting">{visibleReviewTag.replaceAll("_", " ")}</Text></MetadataListItem>}
+              </MetadataList>
+            </VStack>
           </VStack>
           <IconButton label="Close ticket" tooltip="Close ticket" icon={<Icon icon="close" />} variant="ghost" size="sm" onClick={onClose} />
         </header>
@@ -1138,7 +1207,6 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 return <LiveMessageCard
                   key={`entry:${item.entry.session_id}:${item.entry.entry_id}`}
                   entry={item.entry}
-                  showAgentLabel={turnLabels.has(item.entry.id)}
                   input={transcriptInputByEntry.get(`${item.entry.session_id}:${item.entry.entry_id}`)}
                   showMetadata={item.entry.id === latestAssistantEntryId && !runningRunId}
                   toolCalls={liveToolAdapter.callsByAssistantEntryId.get(item.entry.id)}
@@ -1146,19 +1214,20 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 />;
               })}
               {unattachedInputs.map((input) => <article className="live-input-status" key={input.id}>
-                <header><strong>You</strong><span className={`input-status input-status-${input.delivery_status.toLowerCase()}`}>{inputStatusLabel(input.delivery_status)}</span></header>
+                <header><span className={`input-status input-status-${input.delivery_status.toLowerCase()}`}>{inputStatusLabel(input.delivery_status)}</span></header>
                 <p>{input.content}</p>
                 {input.failure_reason && <small>{input.failure_reason}</small>}
                 {input.reused_from_input_id && <small>Explicitly reused from an earlier input.</small>}
                 {(["UNDELIVERED", "DELIVERY_UNKNOWN"].includes(input.delivery_status) && (activeJob || canStartRun)) &&
                   <button className="button-quiet" disabled={busy} onClick={() => reuseInput(input)}>Reuse / Send again</button>}
               </article>)}
-              {(liveLog || liveThinking || liveHistory?.provisional_truncated) && <article className="live-message live-message-assistant live-provisional">
-                {provisionalNeedsLabel && <header className="live-message-header"><strong>Agent</strong></header>}
-                {liveThinking && <details className="live-details"><summary>Reasoning</summary><p>{liveThinking}</p></details>}
-                {liveLog && <Markdown density="compact" headingLevelStart={3} isStreaming={liveLogStreaming} plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
-                {liveHistory?.provisional_truncated && <p className="live-state">Some Live events were skipped; the current response text is complete.</p>}
-              </article>}
+              {(liveLog || liveThinking || liveHistory?.provisional_truncated) && <ChatMessage sender="assistant" density="compact" className="live-message live-message-assistant live-provisional">
+                <ChatMessageBubble variant="ghost">
+                  {liveThinking && <details className="live-details"><summary>Reasoning</summary><p>{liveThinking}</p></details>}
+                  {liveLog && <Markdown className="live-message-text" density="compact" headingLevelStart={3} isStreaming={liveLogStreaming} plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
+                  {liveHistory?.provisional_truncated && <p className="live-state">Some Live events were skipped; the current response text is complete.</p>}
+                </ChatMessageBubble>
+              </ChatMessage>}
               {compactionActive && <ProgressBar label="Compacting context…" isIndeterminate />}
               {(persistedRunError || compactionError) && <p className="run-error live-state" role="alert">{persistedRunError || compactionError}</p>}
               {history && history.entries.length === 0 && unattachedInputs.length === 0 && !activeJob &&
@@ -1185,21 +1254,26 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 ? "Guidance sent now is saved to this queued run in send order."
                 : "This ticket is read-only."}
           </p>}
-          <HStack gap={2} vAlign="end">
-            <textarea aria-label="Message input" rows={1} value={draft}
-              onChange={(event) => { setDraft(event.target.value); setDraftInputId(null); setReuseInputId(null); }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  submitDraft();
-                }
-              }}
+          <ChatComposer
+            density="compact"
+            value={draft}
+            onChange={(value) => { setDraft(value); setDraftInputId(null); setReuseInputId(null); }}
+            onSubmit={submitDraft}
+            isDisabled={busy || !!waitingForHuman || (!activeJob && !canStartRun)}
+            placeholder={activeJob ? "Add guidance to this run…" : "What should the agent do?"}
+            className="ticket-chat-composer"
+            input={<TicketComposerInput
+              draft={draft}
+              submitDraft={submitDraft}
+              isDisabled={busy || !!waitingForHuman || (!activeJob && !canStartRun)}
               placeholder={activeJob ? "Add guidance to this run…" : "What should the agent do?"}
-              disabled={busy || !!waitingForHuman || (!activeJob && !canStartRun)} />
-            <IconButton size="sm" variant="primary" icon={<Text>↑</Text>} label={activeJob ? "Send guidance" : "Start run"}
-              tooltip={activeJob ? "Send guidance" : "Start run"}
-              isDisabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && !canStartRun)} onClick={submitDraft} />
-          </HStack>
+            />}
+            sendButton={<IconButton size="md" variant="primary" icon={<Icon icon="arrowUp" />}
+              label={activeJob ? "Send guidance" : "Start run"} tooltip={activeJob ? "Send guidance" : "Start run"}
+              isDisabled={busy || !!waitingForHuman || !draft.trim() || (!activeJob && !canStartRun)} onClick={() => submitDraft(draft)} />}
+            sendActions={runningRunId && <Button size="md" variant="secondary" label="Stop" isDisabled={busy}
+              onClick={() => void run(() => stopRun(runningRunId), "Run stopped")} />}
+          />
         </footer>}
         {startingRun && <StartTaskDialog
           task={task}

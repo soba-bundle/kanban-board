@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Task } from "@kanban-board/shared";
 import { ConfirmDialog } from "./ConfirmDialog.js";
 import { enqueueTask } from "../start-task-api.js";
+import { displayTaskTitle } from "../display-task-title.js";
 
 interface StartTaskDialogProps {
   task: Task;
@@ -18,6 +19,7 @@ export function StartTaskDialog({ task, initialPrompt = "", reusedFromInputId = 
   const [idempotencyKey, setIdempotencyKey] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const title = displayTaskTitle(task.title);
 
   async function start() {
     if (!prompt.trim()) return;
@@ -40,7 +42,7 @@ export function StartTaskDialog({ task, initialPrompt = "", reusedFromInputId = 
     <div className="dialog-backdrop" onClick={() => { if (!busy) onCancel(prompt); }}>
       <section className="dialog start-dialog" role="dialog" aria-modal="true" aria-labelledby="start-task-title" onClick={(event) => event.stopPropagation()}>
         <h2 id="start-task-title">Start a run</h2>
-        <p className="start-subtitle"><strong>{task.title}</strong></p>
+        <p className="start-subtitle"><strong>{title}</strong></p>
         {task.description && <p className="ticket-description">{task.description}</p>}
         <label className="start-prompt-label" htmlFor={`start-prompt-${task.id}`}>Initial prompt</label>
         <textarea
@@ -73,7 +75,7 @@ export function StartTaskDialog({ task, initialPrompt = "", reusedFromInputId = 
         <ConfirmDialog
           title="Confirm run"
           message={<>
-            <p>Queue work for “{task.title}”?</p>
+            <p>Queue work for “{title}”?</p>
             <p><strong>Your prompt:</strong> {prompt.trim()}</p>
           </>}
           confirmLabel="Confirm and queue"

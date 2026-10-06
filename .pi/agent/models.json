@@ -10,7 +10,7 @@
       },
       "models": [
         {
-          "id": "carstenuhlig/omnicoder-9b:q4_K_M",
+          "id": "kanban-omnicoder-9b-8k:latest",
           "name": "Omnicoder 9b",
           "reasoning": false,
           "input": ["text"],

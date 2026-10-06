@@ -294,12 +294,19 @@ export const LiveCompactionSummarySchema = z.object({
 });
 export type LiveCompactionSummary = z.infer<typeof LiveCompactionSummarySchema>;
 
+export const LiveProvisionalOutputSchema = z.object({
+  text: z.string(),
+  thinking: z.string(),
+});
+export type LiveProvisionalOutput = z.infer<typeof LiveProvisionalOutputSchema>;
+
 export const LiveHistorySnapshotSchema = z.object({
   task_id: z.string().min(1),
   session_id: z.string().min(1).nullable(),
   active_run_id: z.string().min(1).nullable(),
   cursor: z.number().int().nonnegative(),
   provisional_truncated: z.boolean(),
+  provisional_output: LiveProvisionalOutputSchema,
   entries: z.array(LiveHistoryEntrySchema),
   inputs: z.array(RunInputSchema),
   provisional_events: z.array(LiveEventSchema),

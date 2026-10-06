@@ -61,17 +61,7 @@ const ACTIVE_POLL_MS = 3000;
 const DEVELOPER_TEST_REMINDER = "Before merging, test the app in the task worktree and review the implemented code and diff. Check sync verifies Git state only; it does not test the app.";
 
 function formatProvisional(snapshot: LiveHistorySnapshot, thinking = false): string {
-  let provisional = "";
-  for (const event of snapshot.provisional_events) {
-    if (event.type === "auto_retry_start") {
-      provisional = "";
-      continue;
-    }
-    provisional += describeEvent(event, thinking) ?? "";
-  }
-  return snapshot.provisional_truncated && !thinking
-    ? `${provisional}\n[Some recent live output is unavailable; refresh to load persisted history.]\n`
-    : provisional;
+  return thinking ? snapshot.provisional_output.thinking : snapshot.provisional_output.text;
 }
 
 function compactionSummaryFromEvent(event: LiveEvent, afterEntryId: string | null): LiveCompactionSummary | null {
@@ -1163,10 +1153,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
                 {(["UNDELIVERED", "DELIVERY_UNKNOWN"].includes(input.delivery_status) && (activeJob || canStartRun)) &&
                   <button className="button-quiet" disabled={busy} onClick={() => reuseInput(input)}>Reuse / Send again</button>}
               </article>)}
-              {(liveLog || liveThinking) && <article className="live-message live-message-assistant live-provisional">
+              {(liveLog || liveThinking || liveHistory?.provisional_truncated) && <article className="live-message live-message-assistant live-provisional">
                 {provisionalNeedsLabel && <header className="live-message-header"><strong>Agent</strong></header>}
                 {liveThinking && <details className="live-details"><summary>Reasoning</summary><p>{liveThinking}</p></details>}
                 {liveLog && <Markdown density="compact" headingLevelStart={3} isStreaming={liveLogStreaming} plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
+                {liveHistory?.provisional_truncated && <p className="live-state">Some Live events were skipped; the current response text is complete.</p>}
               </article>}
               {compactionActive && <ProgressBar label="Compacting context…" isIndeterminate />}
               {(persistedRunError || compactionError) && <p className="run-error live-state" role="alert">{persistedRunError || compactionError}</p>}

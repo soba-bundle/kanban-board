@@ -26,7 +26,7 @@ try {
 const webRoot = fileURLToPath(new URL("../", import.meta.url));
 const emptyHistory = (taskId) => ({
   task_id: taskId, active_run_id: null, cursor: 0, entries: [], inputs: [],
-  provisional_events: [], provisional_truncated: false,
+  provisional_events: [], provisional_truncated: false, provisional_output: { text: "", thinking: "" },
 });
 
 async function mountPanel(t, requestState, fetchOverride) {

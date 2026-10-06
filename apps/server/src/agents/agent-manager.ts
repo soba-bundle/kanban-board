@@ -7,6 +7,7 @@ import {
   type LiveCompactionSummary,
   type LiveEvent,
   type LiveHistorySnapshot,
+  type LiveProvisionalOutput,
 } from "@kanban-board/shared";
 import { normalizePiEvent } from "./pi-events.js";
 import type { HumanRequestService } from "./human-requests.js";
@@ -43,14 +44,12 @@ export class AgentManager {
   private readonly sessions = new Map<string, WorkingSession>();
   private readonly activeRuns = new Map<string, string>();
   private readonly listeners = new Map<string, Set<{ runId: string; handler: LiveEventHandler }>>();
-  /**
-   * Recent events per run so a client joining Live mid-run sees prior output.
-   * In-memory only: it does not survive restart; completed messages are rebuilt
-   * from the task's Pi JSONL session branch.
-   */
+  /** Bounded event tail for WebSocket catch-up; complete partial text is stored separately. */
   private readonly replayBuffers = new Map<string, LiveEvent[]>();
   private readonly runSequences = new Map<string, number>();
   private readonly durableSequences = new Map<string, number>();
+  /** In-memory current assistant output, retained independently of the bounded event tail. */
+  private readonly provisionalOutputs = new Map<string, LiveProvisionalOutput>();
 
   constructor(
     private readonly db: Database.Database,
@@ -115,13 +114,18 @@ export class AgentManager {
     return [...(this.replayBuffers.get(runId) ?? [])];
   }
 
-  streamSnapshot(runId: string): { cursor: number; durableCursor: number; events: LiveEvent[]; oldestSequence: number | null } {
+  streamSnapshot(runId: string): {
+    cursor: number; durableCursor: number; events: LiveEvent[]; oldestSequence: number | null;
+    provisionalOutput: LiveProvisionalOutput;
+  } {
     const events = this.replay(runId);
+    const provisionalOutput = this.provisionalOutputs.get(runId) ?? { text: "", thinking: "" };
     return {
       cursor: this.runSequences.get(runId) ?? 0,
       durableCursor: this.durableSequences.get(runId) ?? 0,
       events,
       oldestSequence: events[0]?.sequence ?? null,
+      provisionalOutput: { ...provisionalOutput },
     };
   }
 
@@ -130,13 +134,30 @@ export class AgentManager {
     this.replayBuffers.delete(runId);
     this.runSequences.delete(runId);
     this.durableSequences.delete(runId);
+    this.provisionalOutputs.delete(runId);
   }
 
   private emit(event: Omit<LiveEvent, "eventId" | "sequence">): void {
     const sequence = (this.runSequences.get(event.runId) ?? 0) + 1;
     const sequenced: LiveEvent = { ...event, sequence, eventId: `${event.runId}:${sequence}` };
     this.runSequences.set(event.runId, sequence);
-    if (event.type === "entry_appended") this.durableSequences.set(event.runId, sequence);
+    if (event.type === "entry_appended") {
+      this.durableSequences.set(event.runId, sequence);
+      if (event.data.entryType === "message" && event.data.role === "assistant") {
+        this.provisionalOutputs.delete(event.runId);
+      }
+    } else if (event.type === "auto_retry_start") {
+      this.provisionalOutputs.delete(event.runId);
+    } else if (event.type === "message_update") {
+      const subtype = event.data.subtype;
+      const delta = event.data.delta;
+      if ((subtype === "text_delta" || subtype === "thinking_delta") && typeof delta === "string") {
+        const output = this.provisionalOutputs.get(event.runId) ?? { text: "", thinking: "" };
+        if (subtype === "text_delta") output.text += delta;
+        else output.thinking += delta;
+        this.provisionalOutputs.set(event.runId, output);
+      }
+    }
     const buffer = this.replayBuffers.get(event.runId) ?? [];
     buffer.push(sequenced);
     if (buffer.length > this.replayLimit) buffer.splice(0, buffer.length - this.replayLimit);
@@ -287,6 +308,7 @@ export class AgentManager {
       active_run_id: activeRun?.id ?? null,
       cursor: stream?.cursor ?? 0,
       provisional_truncated: truncated,
+      provisional_output: stream?.provisionalOutput ?? { text: "", thinking: "" },
       entries: history,
       compaction_summaries: compactionSummaries,
       inputs: inputRows as LiveHistorySnapshot["inputs"],

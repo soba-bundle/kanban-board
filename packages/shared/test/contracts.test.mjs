@@ -221,7 +221,7 @@ test("Live history contracts carry stable transcript identities and sequenced cu
       id: "s1:e1", entry_id: "e1", session_id: "s1", run_id: "r1", timestamp, role: "user",
       message: { role: "user", content: [{ type: "text", text: "hello" }] },
     }],
-    inputs: [], provisional_events: [event],
+    inputs: [], provisional_events: [event], provisional_output: { text: "hello", thinking: "" },
     compaction_summaries: [{ id: "s1:c1", timestamp, summary: "Keep the native reserve setting.", tokens_before: 4704, after_entry_id: "s1:e1" }],
   };
   assert.equal(LiveHistorySnapshotSchema.safeParse(snapshot).success, true);

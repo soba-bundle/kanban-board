@@ -61,7 +61,7 @@ function task(workflowState = "TODO", reviewTag = null) {
 function history(inputs = []) {
   return {
     task_id: "task-1", session_id: null, active_run_id: null, cursor: 0, provisional_truncated: false,
-    entries: [], inputs, provisional_events: [], compaction_summaries: [],
+    entries: [], inputs, provisional_events: [], provisional_output: { text: "", thinking: "" }, compaction_summaries: [],
   };
 }
 
@@ -1226,10 +1226,11 @@ test("Live restores existing streamed text immediately and appends only later de
   const timestamp = new Date().toISOString();
   const restored = {
     eventId: "run-1:7", sequence: 7, taskId: "task-1", runId: "run-1", timestamp,
-    type: "message_update", data: { subtype: "text_delta", delta: "Already generated text." },
+    type: "message_update", data: { subtype: "text_delta", delta: "text." },
   };
   const { testing, socket, view } = await mountPanelWithRunningSocket(t, {
-    cursor: 7, provisional_events: [restored],
+    cursor: 7, provisional_truncated: true, provisional_events: [restored],
+    provisional_output: { text: "Already generated text.", thinking: "" },
   }, () => {
     const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
     const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
@@ -1244,6 +1245,7 @@ test("Live restores existing streamed text immediately and appends only later de
   assert.match(socket.url, /after=7/);
   const markdown = () => view.container.querySelector(".live-provisional .astryx-markdown");
   assert.equal(markdown()?.textContent, "Already generated text.");
+  assert.match(view.container.textContent, /Some Live events were skipped; the current response text is complete/);
 
   testing.act(() => socket.emit({
     eventId: "run-1:8", sequence: 8, taskId: "task-1", runId: "run-1", timestamp,
@@ -1264,7 +1266,8 @@ test("Live history removes failed-attempt deltas when Pi schedules a retry", asy
     ...event, eventId: `event-${event.sequence}`, taskId: "task-1", runId: "run-1",
     timestamp: new Date().toISOString(),
   }));
-  const snapshot = { ...history(), session_id: "session-1", cursor: 3, provisional_events: events };
+  const snapshot = { ...history(), session_id: "session-1", cursor: 3, provisional_events: events,
+    provisional_output: { text: "final answer", thinking: "" } };
   globalThis.fetch = async (url) => response(url, String(url).endsWith("/live/history") ? snapshot : []);
   t.after(() => { globalThis.fetch = originalFetch; });
   const view = testing.render(createElement(ToastProvider, null,

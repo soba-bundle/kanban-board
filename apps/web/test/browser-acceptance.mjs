@@ -31,7 +31,7 @@ try {
     task_id: task.id, session_id: "session-1", active_run_id: null, cursor: 1, inputs: [], provisional_truncated: false,
     entries: [entry("u", "user", "Check retries"), entry("a", "assistant", [{ type: "text", text: "**Review**\nFirst line\nSecond line\n\n- Tests pass\n\n```ts\nconst safe = true;\n```" }]),
       entry("b", "assistant", [{ type: "text", text: "Ready for human review." }])],
-    provisional_events: [{ type: "compaction_start", data: {}, timestamp }], compaction_summaries: [],
+    provisional_events: [{ type: "compaction_start", data: {}, timestamp }], provisional_output: { text: "", thinking: "" }, compaction_summaries: [],
   };
   const requests = [];
   let running = false;

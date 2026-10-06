@@ -33,7 +33,7 @@ function seed(db) {
   }
 }
 
-function createAgents(db, sessionDir) {
+function createAgents(db, sessionDir, replayLimit = 2000) {
   const managers = new Map();
   const agents = new AgentManager(db, sessionDir, async (_cwd, manager) => {
     managers.set(manager.getSessionId(), manager);
@@ -47,7 +47,7 @@ function createAgents(db, sessionDir) {
       subscribe: () => () => {},
       dispose() {},
     };
-  });
+  }, replayLimit);
   return { agents, managers };
 }
 
@@ -175,20 +175,55 @@ test("active snapshots expose only provisional events newer than persisted trans
   t.after(() => agents.dispose("task-1"));
   const session = await agents.getOrCreateWorkingSession("task-1");
   const manager = managers.get(session.sessionId);
-  const userEntryId = appendMessage(manager, "user", "question");
+  appendMessage(manager, "user", "question");
   db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, session_id, session_file,
     transcript_start_entry_id) VALUES ('run-live', 'task-1', 'INVESTIGATION', 1, 'RUNNING', ?, ?, NULL)`)
     .run(session.sessionId, session.sessionFile);
-  agents.publish("task-1", "run-live", "message_update", { delta: "discard after history snapshot" });
-  agents.publish("task-1", "run-live", "entry_appended", { entryId: userEntryId });
-  agents.publish("task-1", "run-live", "message_update", { delta: "provisional answer" });
+  agents.publish("task-1", "run-live", "message_update", { subtype: "text_delta", delta: "discard after history snapshot" });
+  agents.publish("task-1", "run-live", "entry_appended", { entryId: "assistant-entry", entryType: "message", role: "assistant" });
+  agents.publish("task-1", "run-live", "message_update", { subtype: "text_delta", delta: "provisional answer" });
 
   const snapshot = agents.historySnapshot("task-1");
   assert.equal(snapshot.active_run_id, "run-live");
   assert.equal(snapshot.cursor, 3);
   assert.deepEqual(snapshot.provisional_events.map((event) => event.sequence), [3]);
   assert.deepEqual(snapshot.provisional_events.map((event) => event.data.delta), ["provisional answer"]);
+  assert.deepEqual(snapshot.provisional_output, { text: "provisional answer", thinking: "" });
   assert.equal(snapshot.provisional_truncated, false);
+});
+
+test("history snapshots retain complete provisional output after the replay buffer overflows", async (t) => {
+  const db = openDatabase(":memory:");
+  const sessionDir = mkdtempSync(join(tmpdir(), "kanban-live-history-"));
+  t.after(() => { db.close(); rmSync(sessionDir, { recursive: true, force: true }); });
+  seed(db);
+  const { agents } = createAgents(db, sessionDir, 2);
+  t.after(() => agents.dispose("task-1"));
+  const session = await agents.getOrCreateWorkingSession("task-1");
+  db.prepare(`INSERT INTO task_runs (id, task_id, stage, sequence, status, session_id, session_file)
+    VALUES ('run-live', 'task-1', 'WORK', 1, 'RUNNING', ?, ?)`)
+    .run(session.sessionId, session.sessionFile);
+
+  for (const delta of ["first ", "second ", "third ", "fourth"]) {
+    agents.publish("task-1", "run-live", "message_update", { subtype: "text_delta", delta });
+  }
+  const snapshot = agents.historySnapshot("task-1");
+  assert.equal(snapshot.cursor, 4);
+  assert.deepEqual(snapshot.provisional_events.map((event) => event.sequence), [3, 4]);
+  assert.deepEqual(snapshot.provisional_output, { text: "first second third fourth", thinking: "" });
+  assert.equal(snapshot.provisional_truncated, true);
+
+  agents.publish("task-1", "run-live", "auto_retry_start", { attempt: 1 });
+  agents.publish("task-1", "run-live", "message_update", { subtype: "text_delta", delta: "replacement answer" });
+  assert.deepEqual(agents.historySnapshot("task-1").provisional_output, { text: "replacement answer", thinking: "" });
+
+  agents.publish("task-1", "run-live", "entry_appended", { entryId: "assistant-entry", entryType: "message", role: "assistant" });
+  const committed = agents.historySnapshot("task-1");
+  assert.deepEqual(committed.provisional_output, { text: "", thinking: "" });
+  assert.deepEqual(committed.provisional_events, []);
+
+  agents.clearReplay("run-live");
+  assert.deepEqual(agents.streamSnapshot("run-live").provisionalOutput, { text: "", thinking: "" });
 });
 
 test("history endpoint rejects an unknown task", async (t) => {

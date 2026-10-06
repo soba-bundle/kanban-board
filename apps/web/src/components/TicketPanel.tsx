@@ -208,6 +208,13 @@ export function LiveMessageCard({ entry, input, showMetadata = false, showAgentL
         errorMessage: call.errorMessage,
       } : null;
     }
+    if (call.name === "read") {
+      const data = call.data as { resultContent?: unknown } | undefined;
+      const content = typeof data?.resultContent === "string" ? data.resultContent : "";
+      const lineCount = content ? content.split(/\r\n|\n|\r/).length - (/(\r\n|\n|\r)$/.test(content) ? 1 : 0) : 0;
+      const stats = call.status === "error" ? "Read failed" : `${lineCount} ${lineCount === 1 ? "line" : "lines"} read`;
+      return { ...call, stats, resultDetail: undefined };
+    }
     const resultDetail = liveToolResult(call);
     return resultDetail === undefined ? call : { ...call, resultDetail };
   }).filter((call): call is ChatToolCallItem => call !== null);
@@ -227,6 +234,7 @@ export function LiveMessageCard({ entry, input, showMetadata = false, showAgentL
       {renderedToolCalls.length > 0 && <ChatToolCalls
         calls={renderedToolCalls}
         className={`live-tool-calls${renderedToolCalls.length > 1 ? " live-tool-calls-grouped" : ""}${runningToolCalls ? " live-tool-calls-running" : ""}`}
+        defaultIsExpanded
       />}
       {unmatchedToolCalls.length > 0 && <details className="live-details live-tool-unmatched">
         <summary>Unmatched tool calls — review needed ({unmatchedToolCalls.length})</summary>
@@ -270,6 +278,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   const [startingRun, setStartingRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveLog, setLiveLog] = useState("");
+  const [liveLogStreaming, setLiveLogStreaming] = useState(true);
   const [liveThinking, setLiveThinking] = useState("");
   const [liveHistory, setLiveHistory] = useState<LiveHistorySnapshot | null>(null);
   const [compactionActive, setCompactionActive] = useState(false);
@@ -387,8 +396,10 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
   }, [activeJob, humanRequests, refreshHumanRequests, task.workflow_state]);
 
   function applyLiveHistorySnapshot(snapshot: LiveHistorySnapshot) {
+    const provisionalLog = formatProvisional(snapshot);
     setLiveHistory(snapshot);
-    setLiveLog(formatProvisional(snapshot));
+    setLiveLog(provisionalLog);
+    setLiveLogStreaming(!provisionalLog);
     setLiveThinking(formatProvisional(snapshot, true));
     const compaction = compactionState(snapshot);
     setCompactionActive(compaction.active);
@@ -487,6 +498,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
     let current = true;
     setLiveHistory(null);
     setLiveLog("");
+    setLiveLogStreaming(true);
     setLiveThinking("");
     setCompactionActive(false);
     setCompactionError(null);
@@ -568,7 +580,11 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
             return [...current, summary].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
           });
         }
-        if (event.type === "auto_retry_start") { setLiveLog(""); setLiveThinking(""); }
+        if (event.type === "auto_retry_start") {
+          setLiveLog("");
+          setLiveLogStreaming(true);
+          setLiveThinking("");
+        }
         const thinking = describeEvent(event, true);
         if (thinking) setLiveThinking((value) => value + thinking);
         const text = describeEvent(event);
@@ -1150,7 +1166,7 @@ export function TicketPanel({ task, queue, onClose, onChanged }: TicketPanelProp
               {(liveLog || liveThinking) && <article className="live-message live-message-assistant live-provisional">
                 {provisionalNeedsLabel && <header className="live-message-header"><strong>Agent</strong></header>}
                 {liveThinking && <details className="live-details"><summary>Reasoning</summary><p>{liveThinking}</p></details>}
-                {liveLog && <Markdown density="compact" headingLevelStart={3} isStreaming plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
+                {liveLog && <Markdown density="compact" headingLevelStart={3} isStreaming={liveLogStreaming} plugins={assistantMarkdownPlugins}>{liveLog}</Markdown>}
               </article>}
               {compactionActive && <ProgressBar label="Compacting context…" isIndeterminate />}
               {(persistedRunError || compactionError) && <p className="run-error live-state" role="alert">{persistedRunError || compactionError}</p>}

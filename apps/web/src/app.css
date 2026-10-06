@@ -373,7 +373,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .live-details { margin-top: 8px; color: #929db2; font-size: 11px; }
 .live-details summary { cursor: pointer; }
 .live-details p, .live-details pre { max-height: 220px; overflow: auto; margin: 7px 0 0; color: #9ea8bc; white-space: pre-wrap; overflow-wrap: anywhere; }
-.live-tool-result { display: grid; gap: 8px; min-width: 0; }
+.live-tool-result { display: grid; gap: 8px; min-width: 0; padding: var(--spacing-2); border: var(--border-width) solid var(--color-border); border-radius: var(--radius-md); }
 .live-tool-result-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .live-tool-output { max-block-size: calc(var(--size-element-lg) * 7); overflow: auto; margin: 0; white-space: pre; }
 .live-tool-structured-details { color: var(--color-text-secondary); }

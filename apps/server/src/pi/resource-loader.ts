@@ -1,7 +1,7 @@
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 
-const kanbanExtensionRoot = fileURLToPath(new URL("../../../../.pi/extensions", import.meta.url));
+const kanbanExtensionRoot = fileURLToPath(new URL("../../../../.pi/agent/extensions", import.meta.url));
 const kanbanAgentDir = fileURLToPath(new URL("../../../../.pi/agent", import.meta.url));
 
 export function createKanbanResourceLoader(cwd: string, agentDir = kanbanAgentDir) {

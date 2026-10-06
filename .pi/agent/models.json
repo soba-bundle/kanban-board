@@ -10,8 +10,8 @@
       },
       "models": [
         {
-          "id": "kanban-omnicoder-9b-8k:latest",
-          "name": "Kanban OmniCoder 9B 8K",
+          "id": "carstenuhlig/omnicoder-9b:q4_K_M",
+          "name": "Omnicoder 9b",
           "reasoning": false,
           "input": ["text"],
           "contextWindow": 8192,

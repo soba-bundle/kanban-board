@@ -1169,8 +1169,9 @@ async function mountPanelWithHistorySnapshot(t, snapshot, runs = []) {
   return { testing, view };
 }
 
-async function mountPanelWithRunningSocket(t) {
+async function mountPanelWithRunningSocket(t, initialSnapshot = {}, prepareDom = () => {}) {
   const testing = await setupDom(t);
+  prepareDom();
   const { TicketPanel, ToastProvider } = await loadComponents(t);
   const originalFetch = globalThis.fetch;
   const originalWebSocket = globalThis.WebSocket;
@@ -1190,7 +1191,7 @@ async function mountPanelWithRunningSocket(t) {
   }
   globalThis.WebSocket = FakeWebSocket;
   Object.defineProperty(globalThis, "location", { configurable: true, value: sharedDom.window.location });
-  let snapshot = { ...history(), session_id: "session-1", active_run_id: "run-1" };
+  let snapshot = { ...history(), ...initialSnapshot, session_id: "session-1", active_run_id: "run-1" };
   globalThis.fetch = async (url) => {
     const path = String(url);
     if (path.endsWith("/live/history")) return response(url, snapshot);
@@ -1220,6 +1221,36 @@ async function mountPanelWithRunningSocket(t) {
   await testing.waitFor(() => assert.ok(sockets.at(-1).listeners.get("message")?.size));
   return { testing, socket: sockets.at(-1), getSocket: () => sockets.at(-1), setSnapshot: (next) => { snapshot = next; }, view };
 }
+
+test("Live restores existing streamed text immediately and appends only later deltas", async (t) => {
+  const timestamp = new Date().toISOString();
+  const restored = {
+    eventId: "run-1:7", sequence: 7, taskId: "task-1", runId: "run-1", timestamp,
+    type: "message_update", data: { subtype: "text_delta", delta: "Already generated text." },
+  };
+  const { testing, socket, view } = await mountPanelWithRunningSocket(t, {
+    cursor: 7, provisional_events: [restored],
+  }, () => {
+    const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+    const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+    t.after(() => {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+      globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    });
+    globalThis.requestAnimationFrame = () => 1;
+    globalThis.cancelAnimationFrame = () => {};
+  });
+
+  assert.match(socket.url, /after=7/);
+  const markdown = () => view.container.querySelector(".live-provisional .astryx-markdown");
+  assert.equal(markdown()?.textContent, "Already generated text.");
+
+  testing.act(() => socket.emit({
+    eventId: "run-1:8", sequence: 8, taskId: "task-1", runId: "run-1", timestamp,
+    type: "message_update", data: { subtype: "text_delta", delta: " New text." },
+  }));
+  await testing.waitFor(() => assert.equal(markdown()?.textContent, "Already generated text. New text."));
+});
 
 test("Live history removes failed-attempt deltas when Pi schedules a retry", async (t) => {
   const testing = await setupDom(t);
